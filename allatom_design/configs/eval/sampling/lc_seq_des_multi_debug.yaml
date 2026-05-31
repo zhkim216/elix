@@ -74,11 +74,15 @@ featurizer_cfg:
     residue_cache_dir: /scratch/users/zhkim216/datasets/atomworks_cached_residue_data
 
 struct_pred_cfg:
-  evaluate_self_consistency: false
+  evaluate_self_consistency: true
   evaluate_docking_consistency: false
   calculate_metrics_only: false
   af3:
     runner_path: /home/users/zhkim216/code/elix/alphafold3/src/alphafold3/run_alphafold.py
+    inference_config:
+      ss:
+        num_recycles: 10
+        num_diffusion_samples: 5
 
 hydra:
   run:

@@ -1,35 +1,48 @@
 #!/usr/bin/env bash
-# Submit from Sherlock, for example:
-#   PROJECT_ROOT=/home/users/zhkim216/code/elix \
-#   MODEL_NAME=proto_allprot_external_evidence \
-#     bash scripts/sherlock_scripts/jinho/setup/wrap_sbatch_in_container_elix.sh \
-#     scripts/sherlock_scripts/jinho/eval_seq_des_training/lc_seq_des_multi/proto/lc_seq_des_multi_proto_metal_nativeval_sm_all_sweep.sbatch
 #SBATCH --job-name=lc_seq_des
 #SBATCH -p possu,bioe
-#SBATCH --array=0-6
+#SBATCH --array=0-19
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=24G
+#SBATCH --mem=16G
 #SBATCH --time=12:00:00
 #SBATCH --output=/scratch/users/zhkim216/job_output/eval_ligand_seq_des/%x_%A_%a.out
 #SBATCH --error=/scratch/users/zhkim216/job_output/eval_ligand_seq_des/%x_%A_%a.err
 
 set -euo pipefail
 
-MODEL_NAME="${MODEL_NAME:?Set MODEL_NAME, e.g. proto_allprot_external_evidence}"
 TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-8}"
 
-STEPS=(2500 12500 22500 32500 42500 52500 62500)
-if (( TASK_ID < 0 || TASK_ID >= ${#STEPS[@]} )); then
-  echo "Invalid SLURM_ARRAY_TASK_ID=${TASK_ID}; expected 0..$((${#STEPS[@]} - 1))" >&2
+MODEL_NAMES=(
+  proto_nprot1_no_filter
+  proto_nprot1_external_evidence
+  proto_allprot_no_filter
+  proto_allprot_external_evidence
+)
+STEPS=(22500 42500 62500 102500 122500)
+
+NUM_MODELS=${#MODEL_NAMES[@]}
+NUM_STEPS=${#STEPS[@]}
+NUM_TASKS=$((NUM_MODELS * NUM_STEPS))
+if (( TASK_ID < 0 || TASK_ID >= NUM_TASKS )); then
+  echo "SLURM_ARRAY_TASK_ID=${TASK_ID} is outside selected model/step tasks=${NUM_TASKS}; exiting without work."
+  exit 0
+fi
+
+MODEL_IDX=$((TASK_ID / NUM_STEPS))
+STEP_IDX=$((TASK_ID % NUM_STEPS))
+MODEL_NAME="${MODEL_NAMES[$MODEL_IDX]}"
+STEP="${STEPS[$STEP_IDX]}"
+
+if [[ -z "${MODEL_NAME}" ]]; then
+  echo "MODEL_NAMES[${MODEL_IDX}] is empty." >&2
   exit 2
 fi
-STEP="${STEPS[$TASK_ID]}"
 
 BASE_DIR="${PROJECT_ROOT:-/home/users/zhkim216/code/elix}"
-HYDRA_DIR=/scratch/users/zhkim216/hydra_outputs/eval_proto_metal_nativeval_sm_all/${MODEL_NAME}/step_${STEP}
-BASE_OUT_DIR=/scratch/users/zhkim216/out_dir/eval_ligand_seq_des
+HYDRA_DIR=/scratch/users/zhkim216/hydra_outputs/eval_proto_metal_nativeval/${MODEL_NAME}/step_${STEP}
+BASE_OUT_DIR=/scratch/users/zhkim216/out_dir/eval_ligand_seq_des/${MODEL_NAME}
 DATA_DIR=/scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs
 
 PDB_DIR="${PDB_DIR:-${DATA_DIR}/cifs}"
@@ -40,7 +53,7 @@ DENOISER_TRAIN_DIR=/scratch/users/zhkim216/out_dir/ligand_seq_des/${MODEL_NAME}
 NUM_SEQS_PER_PDB=2
 BATCH_SIZE="${BATCH_SIZE:-1}"
 VALSET_NAME=metal_nativeval_sm_all
-EXP_NAME=eval_${MODEL_NAME}_${VALSET_NAME}_seq${NUM_SEQS_PER_PDB}
+EXP_NAME=eval_proto_metal_nativeval
 
 mkdir -p /scratch/users/zhkim216/job_output/eval_ligand_seq_des "${HYDRA_DIR}" "${BASE_OUT_DIR}"
 
@@ -95,9 +108,12 @@ WANDB__SERVICE_WAIT=300 python3 allatom_design/eval/sampling/lc_seq_des_multi.py
     pdb_cfg.array_id=null \
     pdb_cfg.num_arrays=null \
     featurizer_cfg.design.residue_cache_dir="/scratch/users/zhkim216/datasets/atomworks_cached_residue_data" \
-    struct_pred_cfg.evaluate_self_consistency=false \
+    struct_pred_cfg.evaluate_self_consistency=true \
     struct_pred_cfg.evaluate_docking_consistency=false \
     struct_pred_cfg.calculate_metrics_only=false \
+    struct_pred_cfg.af3.runner_path="${BASE_DIR}/alphafold3/src/alphafold3/run_alphafold.py" \
+    struct_pred_cfg.af3.inference_config.ss.num_recycles=10 \
+    struct_pred_cfg.af3.inference_config.ss.num_diffusion_samples=5 \
     hydra.run.dir=${HYDRA_DIR}
 
-echo "Evaluation complete: model=${MODEL_NAME}, step=${STEP}, valset=${VALSET_NAME}"
+echo "Evaluation complete: model=${MODEL_NAME}, step=${STEP}, exp_name=${EXP_NAME}"
