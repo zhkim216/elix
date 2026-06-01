@@ -190,6 +190,39 @@ def _matched_metal_atom_masks(
     if not sample_by_key:
         return None, None, None, "No reference metal atoms found"
     if set(sample_by_key) != set(pred_by_key):
+        if (
+            len(metal_pn_unit_iids) == 1
+            and len(sample_indices) == 1
+            and len(pred_indices) == 1
+        ):
+            sample_idx = int(sample_indices[0])
+            pred_idx = int(pred_indices[0])
+            sample_pn_unit_iid = str(sample_atom_array.pn_unit_iid[sample_idx])
+            pred_pn_unit_iid = str(pred_atom_array.pn_unit_iid[pred_idx])
+            sample_element = _normalise_element(sample_atom_array.element[sample_idx])
+            pred_element = _normalise_element(pred_atom_array.element[pred_idx])
+            if (
+                sample_pn_unit_iid == pred_pn_unit_iid
+                and sample_pn_unit_iid == str(metal_pn_unit_iids[0])
+                and sample_element == pred_element
+            ):
+                sample_mask = np.zeros(len(sample_atom_array), dtype=bool)
+                pred_mask = np.zeros(len(pred_atom_array), dtype=bool)
+                sample_mask[sample_idx] = True
+                pred_mask[pred_idx] = True
+                return (
+                    sample_mask,
+                    pred_mask,
+                    [
+                        (
+                            sample_pn_unit_iid,
+                            str(sample_atom_array.res_name[sample_idx]),
+                            str(sample_atom_array.atom_name[sample_idx]),
+                            sample_element,
+                        )
+                    ],
+                    None,
+                )
         return None, None, None, "Reference and predicted metal atom keys do not match"
 
     matched_keys = list(sample_by_key.keys())

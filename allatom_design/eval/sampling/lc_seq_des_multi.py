@@ -24,8 +24,42 @@ from allatom_design.eval.eval_utils.folding_utils import (
 # Main
 ###########################################################
 
-@hydra.main(config_path="../../configs/eval/sampling", config_name="lc_seq_des_multi", version_base="1.3.2")
-def main(cfg: DictConfig):
+def _load_studio179_userccd_annotation(cfg: DictConfig) -> tuple[pd.DataFrame, str] | None:
+    studio179_cfg = cfg.get("studio179_userccd", None)
+    if studio179_cfg is None or not studio179_cfg.get("enabled", False):
+        return None
+
+    selected_manifest_tsv = studio179_cfg.get("selected_manifest_tsv", None)
+    user_ccd_path = studio179_cfg.get("user_ccd_path", None)
+    if not selected_manifest_tsv:
+        raise ValueError("studio179_userccd.selected_manifest_tsv must be set when enabled")
+    if not user_ccd_path:
+        raise ValueError("studio179_userccd.user_ccd_path must be set when enabled")
+
+    selected_manifest_df = pd.read_csv(selected_manifest_tsv, sep="\t", keep_default_na=False)
+    return selected_manifest_df, str(user_ccd_path)
+
+
+def _apply_studio179_userccd_annotation(
+    sample_dict: dict,
+    studio179_userccd_annotation: tuple[pd.DataFrame, str] | None,
+) -> dict:
+    if studio179_userccd_annotation is None:
+        return sample_dict
+
+    from allatom_design.eval.benchmarking.studio179.studio179_ligand_map import (
+        annotate_sample_dict_with_userccd,
+    )
+
+    selected_manifest_df, user_ccd_path = studio179_userccd_annotation
+    return annotate_sample_dict_with_userccd(
+        sample_dict=sample_dict,
+        selected_manifest_df=selected_manifest_df,
+        userccd_path=user_ccd_path,
+    )
+
+
+def run_lc_seq_des_multi(cfg: DictConfig):
     """
     Redesign sequence using native sequence or lcaliby.
     """
@@ -51,6 +85,8 @@ def main(cfg: DictConfig):
         sampling_inputs_df = pd.read_csv(cfg.sampling_inputs_csv)
     else:
         sampling_inputs_df = None
+
+    studio179_userccd_annotation = _load_studio179_userccd_annotation(cfg)
         
     # Load pos_constraint_df
     if cfg.pos_constraint_csv is not None:
@@ -85,6 +121,11 @@ def main(cfg: DictConfig):
         
         redesign_out_dir = log_dir / "samples_redesigned_with_native"        
         sample_dict = redesign_with_native(sample_dict, cfg, redesign_out_dir)
+
+        sample_dict = _apply_studio179_userccd_annotation(
+            sample_dict,
+            studio179_userccd_annotation,
+        )
                 
         # Evaluate if needed
         if cfg.struct_pred_cfg.evaluate_self_consistency:
@@ -167,6 +208,11 @@ def main(cfg: DictConfig):
             for sample_dict_per_ckpt, log_dir_per_ckpt, ckpt_info in ckpt_iter:
                 ckpt_label = f"step_{ckpt_info['global_step']}_epoch_{ckpt_info['epoch']}"
 
+                sample_dict_per_ckpt = _apply_studio179_userccd_annotation(
+                    sample_dict_per_ckpt,
+                    studio179_userccd_annotation,
+                )
+
                 if cfg.struct_pred_cfg.evaluate_self_consistency:
                     print("\n" + "="*80)
                     print(f"Phase 3a: AF3 Self-Consistency Evaluation — {ckpt_label}")
@@ -216,6 +262,11 @@ def main(cfg: DictConfig):
     print("All phases complete!")
     print(f"Results saved to {log_dir}")
     print("="*80 + "\n")
+
+
+@hydra.main(config_path="../../configs/eval/sampling", config_name="lc_seq_des_multi", version_base="1.3.2")
+def main(cfg: DictConfig):
+    run_lc_seq_des_multi(cfg)
 
 
 if __name__ == "__main__":

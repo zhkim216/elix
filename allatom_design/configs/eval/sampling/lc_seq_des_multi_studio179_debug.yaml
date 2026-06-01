@@ -1,0 +1,122 @@
+# Sherlock interactive Studio-179 lc_seq_des_multi debug config.
+# Prepare inputs first:
+#   python -m allatom_design.eval.benchmarking.studio179.prepare_lc_seq_des_inputs \
+#     --config allatom_design/configs/eval/benchmarking/debug_studio179_metal_ions_interactive.yaml
+# Then run:
+#   python allatom_design/eval/sampling/lc_seq_des_multi.py \
+#     --config-path /home/users/zhkim216/code/elix/allatom_design/configs/eval/sampling \
+#     --config-name lc_seq_des_multi_studio179_debug
+
+defaults:
+  - lc_seq_des_multi
+  - _self_
+
+wandb:
+  no_wandb: true
+  project: "debug_eval_ligand_seq_des"
+  wandb_id: "zhkim216"
+  group: "studio179_debug"
+
+debug: false
+seed: 0
+num_workers: 4
+protein_only: false
+run_seq_des: true
+
+debug_output_root: /scratch/users/zhkim216/out_dir/debug_eval_ligand_seq_des
+studio179_input_stem: studio179_debug_studio179_metal_ions_interactive
+
+exp_name: studio179_debug_metal_ions_interactive_proto_nprot1_external_evidence_step122500
+base_out_dir: ${debug_output_root}/studio179
+
+seq_des_cfg:
+  denoiser_train_dir: /scratch/users/zhkim216/out_dir/ligand_seq_des/proto_nprot1_external_evidence
+  ckpt_cfg:
+    start_step: 122500
+    end_step: 122500
+    eval_every_n_ckpts: 1
+    eval_last_ckpt: false
+    use_ema: true
+  atom_mpnn:
+    sampling_cfg: /home/users/zhkim216/code/elix/allatom_design/configs/seq_des/lc_atom_mpnn_inference.yaml
+    overrides:
+      batch_size: 1
+      num_seqs_per_pdb: 2
+      num_workers: ${num_workers}
+      use_potts_sampling: true
+
+guidance_cfg:
+  enabled: false
+
+sampling_inputs_csv: null
+pos_constraint_csv: null
+
+redesign_cfg:
+  use_native_seq: false
+  native_cif_dir: null
+
+pocket_cfg:
+  pocket_distance_for_docking_metrics: 8.0
+  n_min_ligand_atoms_for_seq_recovery: 1
+
+input_sample_is_all_atom: true
+input_sample_is_designed: true
+load_from_cache: false
+
+pdb_cfg:
+  pdb_dir: /scratch/users/zhkim216/datasets/val_cifs/DISCO_benchmark_data/disco_inference_benchmarks_release_data/studio-179/cifs
+  pdb_name_list: ${debug_output_root}/studio179_inputs/${studio179_input_stem}.txt
+  pdb_name_ext: ".cif"
+  recursive: false
+  split_by_subfolder: false
+  sample_indices: null
+  sample_lengths: null
+  array_id: null
+  num_arrays: null
+
+cif_cfg:
+  parse:
+    designed_samples:
+      add_missing_atoms: true
+      extra_fields: []
+    af3_predictions:
+      add_missing_atoms: true
+      extra_fields: []
+  save:
+    include_bonds: true
+    exclude_field_keys: []
+
+featurizer_cfg:
+  design:
+    residue_cache_dir: /scratch/users/zhkim216/datasets/atomworks_cached_residue_data
+
+struct_pred_cfg:
+  evaluate_self_consistency: true
+  evaluate_docking_consistency: false
+  calculate_metrics_only: false
+  af3:
+    runner_path: /home/users/zhkim216/code/elix/alphafold3/src/alphafold3/run_alphafold.py
+    json_config:
+      model_seeds: [42]
+      version: 4
+      user_ccd_path: /scratch/users/zhkim216/datasets/val_cifs/DISCO_benchmark_data/disco_inference_benchmarks_release_data/studio-179/conformer_cifs/studio179_all_components_userccd.cif
+    inference_config:
+      base:
+        model_dir: /scratch/users/zhkim216/model_params/af3
+        db_dir: /scratch/users/zhkim216/af3_databases
+        flash_attention_implementation: "xla"
+      ss:
+        num_recycles: 1
+        num_diffusion_samples: 2
+      tc:
+        num_recycles: 1
+        num_diffusion_samples: 2
+
+studio179_userccd:
+  enabled: true
+  selected_manifest_tsv: ${debug_output_root}/studio179_inputs/${studio179_input_stem}_manifest.tsv
+  user_ccd_path: /scratch/users/zhkim216/datasets/val_cifs/DISCO_benchmark_data/disco_inference_benchmarks_release_data/studio-179/conformer_cifs/studio179_all_components_userccd.cif
+
+hydra:
+  run:
+    dir: /scratch/users/zhkim216/hydra_outputs/debug_eval_ligand_seq_des/studio179

@@ -25,7 +25,7 @@ from atomworks.io.utils.atom_array_plus import AtomArray
 from atomworks.io.utils.selection import get_residue_starts
 from atomworks.io.utils.sequence import get_1_from_3_letter_code
 from atomworks.enums import ChainType
-from atomworks.constants import (AF3_EXCLUDED_LIGANDS, STANDARD_AA,
+from atomworks.constants import (AF3_EXCLUDED_LIGANDS, METAL_ELEMENTS, STANDARD_AA,
                                     STANDARD_DNA, STANDARD_RNA)
 
 # ============================================================================
@@ -204,6 +204,77 @@ def _run_af3_inprocess(
 # AF3 JSON Input Creation
 # ============================================================================
 
+
+def _resolve_af3_ligand_ccd_code(
+    *,
+    designed_sample_atom_array: AtomArray,
+    ligand_pn_unit_iid: str,
+    ligand_ccd_code: str,
+) -> str:
+    """Use the element symbol for single-atom metal ligands with synthetic names."""
+    raw_ccd_code = str(ligand_ccd_code).strip()
+    normalized_ccd_code = raw_ccd_code.upper()
+    if normalized_ccd_code in METAL_ELEMENTS:
+        return normalized_ccd_code
+
+    ligand_mask = designed_sample_atom_array.pn_unit_iid == ligand_pn_unit_iid
+    ligand_atom_array = designed_sample_atom_array[ligand_mask]
+    if len(ligand_atom_array) != 1:
+        return raw_ccd_code
+
+    element = str(ligand_atom_array.element[0]).strip().upper()
+    if element not in METAL_ELEMENTS:
+        return raw_ccd_code
+
+    print(
+        "Using single-atom metal element as AF3 ligand CCD: "
+        f"pn_unit_iid={ligand_pn_unit_iid}, res_name={raw_ccd_code}, element={element}"
+    )
+    return element
+
+
+def _get_json_config_value(json_config: dict | DictConfig, *keys: str, default=None):
+    for key in keys:
+        if hasattr(json_config, "get"):
+            value = json_config.get(key, None)
+            if value is not None:
+                return value
+    return default
+
+
+def _get_user_ccd_path(json_config: dict | DictConfig, pdb_chain_info: dict) -> str | None:
+    user_ccd_path = pdb_chain_info.get("af3_user_ccd_path")
+    if user_ccd_path is None:
+        user_ccd_path = _get_json_config_value(
+            json_config,
+            "user_ccd_path",
+            "userCCDPath",
+        )
+    return str(user_ccd_path) if user_ccd_path else None
+
+
+def _af3_ligand_ccd_codes_for_json(
+    *,
+    pdb_chain_info: dict,
+    ligand_pn_unit_iids: list[str],
+    ligand_ccd_codes: list[str],
+) -> tuple[list[str], bool]:
+    af3_ligand_ccd_codes = pdb_chain_info.get("af3_ligand_ccd_codes")
+    if af3_ligand_ccd_codes is None:
+        return list(ligand_ccd_codes), True
+
+    codes = [str(code).strip() for code in af3_ligand_ccd_codes]
+    if len(codes) != len(ligand_pn_unit_iids):
+        raise ValueError(
+            "af3_ligand_ccd_codes must have the same length as "
+            "ligand_pn_unit_iids: "
+            f"{len(codes)} != {len(ligand_pn_unit_iids)}"
+        )
+    if any(not code for code in codes):
+        raise ValueError("af3_ligand_ccd_codes contains an empty component ID")
+    return codes, False
+
+
 def make_af3_json(af3_ss_input_dir: str = None,
                     af3_tc_input_dir: str = None,
                     sample_dict: dict = None,
@@ -232,6 +303,7 @@ def make_af3_json(af3_ss_input_dir: str = None,
 
     Todo: need to split pn_unit_iids into separate chain iids to make af3 inputs for multi-chain ligands later
     """
+    json_config = json_config or {}
     model_seeds = list(json_config.get('model_seeds', [42]))
     version = int(json_config.get('version', 2))
 
@@ -296,6 +368,13 @@ def make_af3_json(af3_ss_input_dir: str = None,
             protein_pn_unit_iids = pdb_chain_info['protein_pn_unit_iids']
             ligand_pn_unit_iids = pdb_chain_info['ligand_pn_unit_iids']
             ligand_ccd_codes = pdb_chain_info['ligand_ccd_codes']
+            af3_ligand_ccd_codes, should_resolve_ligand_ccd = _af3_ligand_ccd_codes_for_json(
+                pdb_chain_info=pdb_chain_info,
+                ligand_pn_unit_iids=ligand_pn_unit_iids,
+                ligand_ccd_codes=ligand_ccd_codes,
+            )
+            user_ccd_path = _get_user_ccd_path(json_config, pdb_chain_info)
+            json_version = max(version, 3) if user_ccd_path else version
 
             ss_sequences = []
             tc_sequences = []
@@ -376,7 +455,13 @@ def make_af3_json(af3_ss_input_dir: str = None,
                     })
 
 
-            for ligand_pn_unit_iid, ligand_ccd_code in zip(ligand_pn_unit_iids, ligand_ccd_codes):
+            for ligand_pn_unit_iid, ligand_ccd_code in zip(ligand_pn_unit_iids, af3_ligand_ccd_codes):
+                if should_resolve_ligand_ccd:
+                    ligand_ccd_code = _resolve_af3_ligand_ccd_code(
+                        designed_sample_atom_array=designed_sample_atom_array,
+                        ligand_pn_unit_iid=ligand_pn_unit_iid,
+                        ligand_ccd_code=ligand_ccd_code,
+                    )
                 ss_sequences.append({
                     "ligand": {
                         "id": ligand_pn_unit_iid.split("_")[0],
@@ -398,8 +483,10 @@ def make_af3_json(af3_ss_input_dir: str = None,
                 "sequences": ss_sequences,
                 "modelSeeds": model_seeds,
                 "dialect": "alphafold3",
-                "version": version,
+                "version": json_version,
             }
+            if user_ccd_path:
+                sample_af3_ss_json["userCCDPath"] = user_ccd_path
 
             if make_tc_input:
                 sample_af3_tc_json = {
@@ -407,8 +494,10 @@ def make_af3_json(af3_ss_input_dir: str = None,
                     "sequences": tc_sequences,
                     "modelSeeds": model_seeds,
                     "dialect": "alphafold3",
-                    "version": version,
+                    "version": json_version,
                 }
+                if user_ccd_path:
+                    sample_af3_tc_json["userCCDPath"] = user_ccd_path
 
             # input json paths and save json files
             json_path_ss = Path(af3_ss_input_dir, f"{job_name}.json")

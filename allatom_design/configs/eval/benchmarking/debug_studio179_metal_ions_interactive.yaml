@@ -1,0 +1,15 @@
+# Sherlock interactive Studio-179 CU debug input selection.
+# This prepares 2 lengths x 3 deterministic sample indices = 6 inputs.
+
+disco_root: /scratch/users/zhkim216/datasets/val_cifs/DISCO_benchmark_data
+out_dir: /scratch/users/zhkim216/out_dir/debug_eval_ligand_seq_des/studio179_inputs
+user_ccd_manifest: /scratch/users/zhkim216/datasets/val_cifs/DISCO_benchmark_data/disco_inference_benchmarks_release_data/studio-179/conformer_cifs/studio179_userccd_manifest.tsv
+user_ccd_path: /scratch/users/zhkim216/datasets/val_cifs/DISCO_benchmark_data/disco_inference_benchmarks_release_data/studio-179/conformer_cifs/studio179_all_components_userccd.cif
+run_id: debug_studio179_metal_ions_interactive
+
+target: CU
+length: "150,250"
+sample_index: "0,1,2"
+smoke_n: null
+limit: null
+dry_run: false

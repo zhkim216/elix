@@ -140,6 +140,33 @@ def test_metal_docking_uses_reference_5a_site_for_alignment_and_plddt(tmp_path):
     assert metrics["interface_min_pae"] == pytest.approx(3.0)
 
 
+def test_single_atom_metal_docking_allows_userccd_residue_name_mismatch(tmp_path):
+    sample_atom_array, pred_atom_array, pred_plddts = _make_reference_and_pred_arrays()
+    pred_sample_path = _write_confidence_files(tmp_path, pred_plddts)
+
+    sample_atom_array.res_name[-1] = "l01"
+    sample_atom_array.atom_name[-1] = "CU1"
+    sample_atom_array.element[-1] = "CU"
+    pred_atom_array.res_name[-1] = "S179002"
+    pred_atom_array.atom_name[-1] = "CU"
+    pred_atom_array.element[-1] = "CU"
+
+    metrics = compute_docking_metrics_atomarray(
+        pred_atom_array=pred_atom_array,
+        sample_atom_array=sample_atom_array,
+        pred_sample_path=pred_sample_path,
+        pocket_distance_for_docking_metrics=5.0,
+        receptor_pn_unit_iids=["A_1"],
+        ligand_pn_unit_iids=["L_1"],
+        ligand_ccd_codes=["l01"],
+        save_aligned=False,
+    )
+
+    assert "error" not in metrics
+    assert metrics["ligand_ccd_code"] == "l01"
+    assert metrics["ligand_rmsd"] == pytest.approx(19.0, abs=1e-4)
+
+
 def test_selected_metal_pn_unit_iids_ignores_non_metal_ligands():
     sample_atom_array, _, _ = _make_reference_and_pred_arrays()
     ligand_records = [

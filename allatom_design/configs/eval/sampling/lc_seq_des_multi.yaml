@@ -50,6 +50,12 @@ sampling_inputs_csv: null
 # e.g. 2fyzA,"A1-100,B1-100","A1-100"
 pos_constraint_csv: null
 
+# Optional Studio-179 userCCD annotation before AF3 JSON creation.
+studio179_userccd:
+  enabled: false
+  selected_manifest_tsv: null
+  user_ccd_path: null
+
 # Redesign pocket sequence options
 redesign_cfg:
   use_native_seq: false #! If false, automatically redesign the pocket sequence using lcaliby
