@@ -203,6 +203,7 @@ openstructure/
 plinder/
 
 # Local test/eval/util scripts
+/tests/
 allatom_design/eval/eval_utils/sasa_utils.py
 allatom_design/eval/eval_utils/test_atom_array_loading.py
 allatom_design/eval/eval_utils/test_seq_recovery.py
