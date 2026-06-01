@@ -40,9 +40,11 @@ def get_pdb_files(pdb_dir: str | None,
                   # recursive search for nested directory structures (e.g. CCD code subfolders)
                   recursive: bool = False,
                   split_by_subfolder: bool = False,
-                  # sample index filtering (for files with pattern {CCD}_len_{L}_{IDX}_model_{M}.cif)
+                  # sample index filtering (e.g. {CCD}_len{L}_{IDX}.cif
+                  # or {PREFIX}_{IDX}_model_{M}.cif)
                   sample_indices: list[int] | None = None,
-                  # sample length filtering (for files with pattern {CCD}_len_{L}_{IDX}_model_{M}.cif)
+                  # sample length filtering (e.g. {CCD}_len{L}_{IDX}.cif
+                  # or {PREFIX}_len_{L}_{IDX}_model_{M}.cif)
                   sample_lengths: list[int] | None = None,
                   ) -> list[str]:
     """
@@ -61,11 +63,13 @@ def get_pdb_files(pdb_dir: str | None,
             instead of splitting the flat file list. Each array task gets one or more
             subfolders. Only used when recursive=True.
         sample_indices: Optional list of sample indices to keep. Filters files whose
-            filename matches pattern {PREFIX}_{IDX}_model_{M}.ext, keeping only those
-            where IDX is in sample_indices.
+            filename matches compact {PREFIX}_len{L}_{IDX}.ext or legacy
+            {PREFIX}_{IDX}_model_{M}.ext patterns, keeping only those where IDX is in
+            sample_indices.
         sample_lengths: Optional list of sample lengths to keep. Filters files whose
-            filename matches pattern {PREFIX}_len_{L}_{IDX}_model_{M}.ext, keeping only
-            those where L is in sample_lengths.
+            filename matches compact {PREFIX}_len{L}_{IDX}.ext or legacy
+            {PREFIX}_len_{L}_{IDX}_model_{M}.ext patterns, keeping only those where L
+            is in sample_lengths.
 
     Returns:
         List of PDB file paths, naturally sorted if retrieving all files
@@ -143,23 +147,39 @@ def get_pdb_files(pdb_dir: str | None,
         skip_pdb_names = set(skip_pdb_names)
         pdb_files = [f for f in pdb_files if Path(f).name not in skip_pdb_names]
 
-    # Filter by sample indices (for files with pattern {PREFIX}_{IDX}_model_{M}...)
+    # Filter by sample indices.
     if sample_indices is not None:
-        sample_idx_pattern = re.compile(r"_(\d+)_model_\d+")
+        sample_idx_patterns = [
+            re.compile(r"_(\d+)_model_\d+(?:$|_)"),
+            re.compile(r"_len\d+_(\d+)$"),
+        ]
         filtered_files = []
         for f in pdb_files:
-            match = sample_idx_pattern.search(Path(f).name)
+            stem = Path(f).stem
+            match = None
+            for pattern in sample_idx_patterns:
+                match = pattern.search(stem)
+                if match:
+                    break
             if match and int(match.group(1)) in sample_indices:
                 filtered_files.append(f)
         print(f"Filtered by sample_indices {sample_indices}: {len(pdb_files)} -> {len(filtered_files)} files")
         pdb_files = filtered_files
 
-    # Filter by sample lengths (for files with pattern {PREFIX}_len_{L}_{IDX}_model_{M}...)
+    # Filter by sample lengths.
     if sample_lengths is not None:
-        sample_len_pattern = re.compile(r"_len_(\d+)_")
+        sample_len_patterns = [
+            re.compile(r"_len_(\d+)_"),
+            re.compile(r"_len(\d+)_"),
+        ]
         filtered_files = []
         for f in pdb_files:
-            match = sample_len_pattern.search(Path(f).name)
+            stem = Path(f).stem
+            match = None
+            for pattern in sample_len_patterns:
+                match = pattern.search(stem)
+                if match:
+                    break
             if match and int(match.group(1)) in sample_lengths:
                 filtered_files.append(f)
         print(f"Filtered by sample_lengths {sample_lengths}: {len(pdb_files)} -> {len(filtered_files)} files")
