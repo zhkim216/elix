@@ -46,13 +46,13 @@ BASE_OUT_DIR=/scratch/users/zhkim216/out_dir/eval_ligand_seq_des/${MODEL_NAME}
 DATA_DIR=/scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs
 
 PDB_DIR="${PDB_DIR:-${DATA_DIR}/cifs}"
-PDB_NAME_LIST="${DATA_DIR}/metal_nativeval_sm_all.txt"
-SAMPLING_INPUTS_CSV="${DATA_DIR}/sampling_inputs_metal_nativeval_sm_all.csv"
+PDB_NAME_LIST="${DATA_DIR}/metal_nativeval.txt"
+SAMPLING_INPUTS_CSV="${DATA_DIR}/sampling_inputs_metal_nativeval.csv"
 DENOISER_TRAIN_DIR=/scratch/users/zhkim216/out_dir/ligand_seq_des/${MODEL_NAME}
 
 NUM_SEQS_PER_PDB=2
 BATCH_SIZE="${BATCH_SIZE:-1}"
-VALSET_NAME=metal_nativeval_sm_all
+VALSET_NAME=metal_nativeval
 EXP_NAME=eval_proto_metal_nativeval
 
 mkdir -p /scratch/users/zhkim216/job_output/eval_ligand_seq_des "${HYDRA_DIR}" "${BASE_OUT_DIR}"

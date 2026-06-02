@@ -10,7 +10,7 @@ wandb:
   no_wandb: true
   project: "eval_ligand_seq_des"
   wandb_id: "zhkim216"
-  group: "metal_nativeval_sm_all_debug"
+  group: "metal_nativeval_debug"
 
 debug: true
 num_debug_samples: 2
@@ -19,7 +19,7 @@ num_workers: 0
 protein_only: false
 run_seq_des: true
 
-exp_name: debug_proto_allprot_external_evidence_metal_nativeval_sm_all_seq2
+exp_name: debug_proto_allprot_external_evidence_metal_nativeval_seq2
 base_out_dir: /scratch/users/zhkim216/out_dir/debug_eval_ligand_seq_des
 
 seq_des_cfg:
@@ -44,7 +44,7 @@ seq_des_cfg:
 guidance_cfg:
   enabled: false
 
-sampling_inputs_csv: /scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs/sampling_inputs_metal_nativeval_sm_all.csv
+sampling_inputs_csv: /scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs/sampling_inputs_metal_nativeval.csv
 pos_constraint_csv: null
 
 redesign_cfg:
@@ -60,7 +60,7 @@ load_from_cache: false
 
 pdb_cfg:
   pdb_dir: /scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs/cifs
-  pdb_name_list: /scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs/metal_nativeval_sm_all.txt
+  pdb_name_list: /scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs/metal_nativeval.txt
   pdb_name_ext: ".cif"
   recursive: false
   split_by_subfolder: false
@@ -86,4 +86,4 @@ struct_pred_cfg:
 
 hydra:
   run:
-    dir: /scratch/users/zhkim216/hydra_outputs/eval_proto_metal_nativeval_sm_all_debug
+    dir: /scratch/users/zhkim216/hydra_outputs/eval_proto_metal_nativeval_debug

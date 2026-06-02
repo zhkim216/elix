@@ -422,7 +422,6 @@ class AnnotateChainTypes(Transform):
                             _, res_names = struc.get_residues(sel_atom_array)                             
                             if len(res_names) < aw_const.PEPTIDE_MAX_RESIDUES: # Same as how build_metadata_parquet_shards.py gets len(residues). Because cached structures contain nan coords (non-resolved residues)                            
                                 atom_is_peptide_chain[pn_unit_mask] = True
-                                logger.info(f"example_id: {data['example_id']}, peptide chain with {len(res_names)} residues") #!FIXME: remove                                
                             else:
                                 atom_is_protein_chain[pn_unit_mask] = True         
                         elif ct in nucleic_acid_chain_type_enums:
@@ -492,19 +491,22 @@ class FilterToQueryPNUnits(Transform):
     """Filter the atom array to the query PN units.
 
     For ``data_category == "interface"`` training examples the full complex is
-    passed through untouched after any metadata-derived BM filtering, so
-    ``CropSpatialLikeAF3`` can grow its K-nearest shell around the interface.
-    Monomer-training and validation paths still collapse to the query pn_unit
-    set.
+    passed through untouched after any metadata-derived BM filtering unless
+    ``query_pn_unit_iids_only`` is set. Monomer-training and validation paths
+    still collapse to the query pn_unit set.
     """
 
     @override
     def forward(self, data: dict[str, Any]) -> dict[str, Any]:
         atom_array = data["atom_array"]
+        query_pn_unit_iids_only = data.get("query_pn_unit_iids_only", False)
+        if isinstance(query_pn_unit_iids_only, float) and np.isnan(query_pn_unit_iids_only):
+            query_pn_unit_iids_only = False
 
         skip_filter = (
             data.get("data_category") == "interface"
             and data.get("phase") == "train"
+            and not bool(query_pn_unit_iids_only)
         )
 
         #* From atomworks.ml.datasets.parsers.GenericDFParser: "During VALIDATION, then we do not crop, and query_pn_unit_iids should be None."

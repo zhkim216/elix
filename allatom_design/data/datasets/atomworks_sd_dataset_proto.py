@@ -95,6 +95,8 @@ class ProtoSDDataset(MolecularDataset):
                 alphas_interface=self.cfg.sampling_weights["alphas_interface"],
                 cluster_col="q_pn_unit_cluster_id",
                 k_percentile=self.cfg.sampling_weights["k_percentile"],
+                single_protein_context_weight=self.cfg.sampling_weights.get("single_protein_context_weight", 1.0),
+                multi_protein_context_weight=self.cfg.sampling_weights.get("multi_protein_context_weight", 1.0),
             )
             self._validate_sampling_weights()
             self.parsed_df = self._parse_train_dfs()
@@ -286,12 +288,18 @@ class ProtoSDDataset(MolecularDataset):
             parsed["ligand_pn_unit_iids"] = list(row["ligand_pn_unit_iids"])
             parsed["protein_pn_unit_iids"] = list(row["protein_pn_unit_iids"])
             parsed["biologically_meaningful_pn_unit_iids"] = list(row["biologically_meaningful_pn_unit_iids"])
+            row_query_only = row.get("query_pn_unit_iids_only", False)
+            if isinstance(row_query_only, (float, np.floating)) and pd.isna(row_query_only):
+                row_query_only = False
+            if self.proto_cfg.get("query_pn_unit_iids_only", False) or bool(row_query_only):
+                parsed["query_pn_unit_iids_only"] = True
             for key in (
                 "query_pn_unit_iids",
                 "ligand_pn_unit_iids",
                 "protein_pn_unit_iids",
                 "crop_center_pn_unit_iids",
                 "biologically_meaningful_pn_unit_iids",
+                "query_pn_unit_iids_only",
             ):
                 parsed["extra_info"].pop(key, None)
             return parsed
@@ -426,7 +434,7 @@ def build_proto_interface_df(
     proto_cfg: dict | DictConfig,
 ) -> pd.DataFrame:
     proto_cfg = proto_cfg or {}
-    required_cols = [
+    metal_required_cols = [
         "pdb_id",
         "assembly_id",
         "path",
@@ -438,13 +446,22 @@ def build_proto_interface_df(
         "has_external_evidence",
         "q_pn_unit_cluster_id",
     ]
-    protein_required_cols = ["pdb_id", "assembly_id", "q_pn_unit_iid", "q_pn_unit_cluster_id", "q_pn_unit_is_protein"]
-    missing = [c for c in required_cols if c not in metadata_df.columns]
+    protein_required_cols = [
+        "pdb_id",
+        "assembly_id",
+        "path",
+        "q_pn_unit_iid",
+        "q_pn_unit_cluster_id",
+        "q_pn_unit_is_protein",
+        "q_pn_unit_contacting_pn_unit_iids",
+    ]
+    missing = [c for c in metal_required_cols if c not in metadata_df.columns]
     missing += [c for c in protein_required_cols if c not in protein_df.columns]
     if missing:
         raise KeyError(f"build_proto_interface_df missing required columns: {sorted(set(missing))}")
 
     min_donors = int(proto_cfg.get("min_protein_donor_atoms", 3))
+    protein_interface_distance_cutoff = float(proto_cfg.get("protein_interface_distance_cutoff", 5.0))
 
     protein_df = protein_df[protein_df["q_pn_unit_is_protein"].fillna(False).astype(bool)].copy()
     protein_lookup = {
@@ -455,7 +472,7 @@ def build_proto_interface_df(
     center_mask = _proto_center_mask(metadata_df, proto_cfg)
     center_df = metadata_df[center_mask].copy()
 
-    rows = []
+    metal_rows = []
     for center in center_df.itertuples(index=False):
         donor_count, protein_rows = _collect_metal_protein_donor_partners(center, protein_lookup)
         if donor_count < min_donors or len(protein_rows) == 0:
@@ -486,7 +503,15 @@ def build_proto_interface_df(
             row["assembly_id"],
             row["query_pn_unit_iids"],
         )
-        rows.append(row)
+        metal_rows.append(row)
+
+    protein_rows = _build_proto_protein_interface_rows(
+        protein_df=protein_df,
+        protein_lookup=protein_lookup,
+        dataset_name=dataset_name,
+        distance_cutoff=protein_interface_distance_cutoff,
+    )
+    rows = [*metal_rows, *protein_rows]
 
     output_cols = [
         "example_id",
@@ -500,7 +525,9 @@ def build_proto_interface_df(
         "protein_cluster_multiset",
         "ligand_ccd_key",
         "interface_type",
+        "query_pn_unit_iids_only",
         "n_coordinating_protein_donor_atoms",
+        "n_protein_protein_contacts",
         *[col for col in metadata_df.columns.tolist() if col != "crop_center_pn_unit_iids"],
     ]
     output_cols = list(dict.fromkeys(output_cols))
@@ -508,14 +535,124 @@ def build_proto_interface_df(
     if interface_df.empty:
         interface_df = pd.DataFrame(columns=output_cols)
     else:
-        interface_df = interface_df[output_cols]
+        interface_df = interface_df.reindex(columns=output_cols)
     interface_df.set_index("example_id", inplace=True, drop=False, verify_integrity=True)
     logger.info(
-        "Built proto interface_df with %d rows from %d metal centers.",
+        "Built proto interface_df with %d rows (%d metal-protein, %d protein-protein) "
+        "from %d metal centers.",
         len(interface_df),
+        len(metal_rows),
+        len(protein_rows),
         len(center_df),
     )
     return interface_df
+
+
+def _build_proto_protein_interface_rows(
+    protein_df: pd.DataFrame,
+    protein_lookup: dict,
+    dataset_name: str,
+    distance_cutoff: float,
+) -> list[dict]:
+    edge_contacts, neighbors_by_source = _collect_protein_interface_edges(
+        protein_df,
+        protein_lookup,
+        distance_cutoff,
+    )
+
+    rows_by_tuple = {}
+    for query in protein_df.itertuples(index=False):
+        assembly_id = str(query.assembly_id)
+        source_key = (query.pdb_id, assembly_id, query.q_pn_unit_iid)
+        neighbor_iids = neighbors_by_source.get(source_key, set())
+        protein_iids = tuple(sorted({query.q_pn_unit_iid, *neighbor_iids}))
+        if len(protein_iids) < 2:
+            continue
+
+        tuple_key = (query.pdb_id, assembly_id, protein_iids)
+        if tuple_key in rows_by_tuple:
+            continue
+
+        protein_rows = [protein_lookup[(query.pdb_id, assembly_id, iid)] for iid in protein_iids]
+        protein_clusters = tuple(row.q_pn_unit_cluster_id for row in protein_rows)
+        row = protein_rows[0]._asdict()
+        row.pop("crop_center_pn_unit_iids", None)
+        row.update(
+            {
+                "query_pn_unit_iids": list(protein_iids),
+                "ligand_pn_unit_iids": (),
+                "protein_pn_unit_iids": protein_iids,
+                "biologically_meaningful_pn_unit_iids": list(protein_iids),
+                "protein_cluster_multiset": protein_clusters,
+                "ligand_ccd_key": ("protein_interface", "none"),
+                "interface_type": "protein_protein",
+                "query_pn_unit_iids_only": True,
+                "n_protein_protein_contacts": _sum_protein_tuple_contacts(
+                    query.pdb_id,
+                    assembly_id,
+                    protein_iids,
+                    edge_contacts,
+                ),
+            }
+        )
+        row["example_id"] = generate_example_id(
+            [dataset_name, "interface"],
+            row["pdb_id"],
+            row["assembly_id"],
+            row["query_pn_unit_iids"],
+        )
+        rows_by_tuple[tuple_key] = row
+
+    return list(rows_by_tuple.values())
+
+
+def _collect_protein_interface_edges(
+    protein_df: pd.DataFrame,
+    protein_lookup: dict,
+    distance_cutoff: float,
+) -> tuple[dict, dict]:
+    edge_contacts = {}
+    neighbors_by_source = {}
+    for source in protein_df.itertuples(index=False):
+        assembly_id = str(source.assembly_id)
+        source_key = (source.pdb_id, assembly_id, source.q_pn_unit_iid)
+        contacts = _parse_partner_list(getattr(source, "q_pn_unit_contacting_pn_unit_iids"))
+        for contact in contacts:
+            if not isinstance(contact, dict) or not _contact_within_cutoff(contact, distance_cutoff):
+                continue
+            partner_rows = _resolve_partner_rows(
+                source.pdb_id,
+                source.assembly_id,
+                contact.get("pn_unit_iid"),
+                contact.get("chain_iid"),
+                protein_lookup,
+            )
+            if not partner_rows:
+                continue
+
+            contact_count = _contact_count(contact)
+            for partner in partner_rows:
+                if partner.q_pn_unit_iid == source.q_pn_unit_iid:
+                    continue
+                neighbors_by_source.setdefault(source_key, set()).add(partner.q_pn_unit_iid)
+                edge_iids = tuple(sorted((source.q_pn_unit_iid, partner.q_pn_unit_iid)))
+                edge_key = (source.pdb_id, assembly_id, edge_iids)
+                edge_contacts[edge_key] = max(edge_contacts.get(edge_key, 0), contact_count)
+    return edge_contacts, neighbors_by_source
+
+
+def _sum_protein_tuple_contacts(
+    pdb_id: str,
+    assembly_id: str,
+    protein_iids: tuple[str, ...],
+    edge_contacts: dict,
+) -> int:
+    total = 0
+    for i, source_iid in enumerate(protein_iids):
+        for partner_iid in protein_iids[i + 1 :]:
+            edge_key = (pdb_id, assembly_id, tuple(sorted((source_iid, partner_iid))))
+            total += edge_contacts.get(edge_key, 0)
+    return int(total)
 
 
 def add_proto_sampling_weights(
@@ -524,14 +661,21 @@ def add_proto_sampling_weights(
     alphas_interface: dict[str, float],
     cluster_col: str = "q_pn_unit_cluster_id",
     k_percentile: float = 100.0,
+    single_protein_context_weight: float = 1.0,
+    multi_protein_context_weight: float = 1.0,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     monomer_df = monomer_df.copy()
     interface_df = interface_df.copy()
+    single_protein_context_weight = float(single_protein_context_weight)
+    multi_protein_context_weight = float(multi_protein_context_weight)
 
     if "protein_cluster_multiset" not in interface_df.columns:
         raise ValueError("Proto interface_df must contain `protein_cluster_multiset`.")
 
-    alpha_metal = float(alphas_interface.get("alpha_protein_metal", 0.0))
+    alpha_by_interface_type = {
+        "bmm_protein": float(alphas_interface.get("alpha_protein_metal", 0.0)),
+        "protein_protein": float(alphas_interface.get("alpha_protein_protein", 0.0)),
+    }
 
     def _protein_clusters(row):
         clusters = row.get("protein_cluster_multiset", ())
@@ -542,25 +686,52 @@ def add_proto_sampling_weights(
     def _sort_key(value):
         return repr(value)
 
+    def _ligand_key(row):
+        if row.get("interface_type") == "protein_protein":
+            return ("protein_interface", "none")
+        return row.get("ligand_ccd_key", _normalize_ligand_ccd_key(row.get("q_pn_unit_non_polymer_res_names")))
+
+    def _alpha(row):
+        return alpha_by_interface_type.get(row.get("interface_type"), 0.0)
+
+    def _context_weight(row):
+        n_prot = row.get("n_prot", len(_protein_clusters(row)))
+        if pd.isna(n_prot):
+            n_prot = len(_protein_clusters(row))
+        return multi_protein_context_weight if int(n_prot) >= 2 else single_protein_context_weight
+
     if interface_df.empty:
         interface_df["pair_cluster"] = []
         interface_df["pair_cluster_size"] = []
         interface_df["alpha"] = []
+        interface_df["context_weight"] = []
         interface_df["sampling_weight"] = []
         interface_contrib = {}
         k_value = 1.0
     else:
+        unknown_types = sorted(
+            t for t in interface_df["interface_type"].dropna().unique()
+            if t not in alpha_by_interface_type
+        )
+        if unknown_types:
+            logger.warning(
+                "Unknown proto interface_type values get alpha=0: %s",
+                unknown_types,
+            )
         interface_df["pair_cluster"] = interface_df.apply(
             lambda row: (
-                row.get("ligand_ccd_key", _normalize_ligand_ccd_key(row.get("q_pn_unit_non_polymer_res_names"))),
+                _ligand_key(row),
                 tuple(sorted((("seq", c) for c in _protein_clusters(row)), key=_sort_key)),
             ),
             axis=1,
         )
         pair_cluster_sizes = interface_df["pair_cluster"].value_counts()
         interface_df["pair_cluster_size"] = interface_df["pair_cluster"].map(pair_cluster_sizes)
-        interface_df["alpha"] = alpha_metal
-        interface_df["sampling_weight"] = interface_df["alpha"] / interface_df["pair_cluster_size"]
+        interface_df["alpha"] = interface_df.apply(_alpha, axis=1)
+        interface_df["context_weight"] = interface_df.apply(_context_weight, axis=1)
+        interface_df["sampling_weight"] = (
+            interface_df["alpha"] * interface_df["context_weight"] / interface_df["pair_cluster_size"]
+        )
         interface_contrib = _compute_interface_contrib(interface_df, _protein_clusters)
 
         if interface_contrib and max(interface_contrib.values()) > 0:
@@ -590,11 +761,16 @@ def add_proto_sampling_weights(
 
     monomer_df["sampling_weight"] = monomer_df.apply(_monomer_weight, axis=1)
     logger.info(
-        "Proto sampling weights: monomer_rows=%d, interface_rows=%d, K=%.4f, alpha_metal=%.4f",
+        "Proto sampling weights: monomer_rows=%d, interface_rows=%d, K=%.4f, "
+        "alpha_metal=%.4f, alpha_protein_protein=%.4f, "
+        "single_protein_context_weight=%.4f, multi_protein_context_weight=%.4f",
         len(monomer_df),
         len(interface_df),
         k_value,
-        alpha_metal,
+        alpha_by_interface_type["bmm_protein"],
+        alpha_by_interface_type["protein_protein"],
+        single_protein_context_weight,
+        multi_protein_context_weight,
     )
     return monomer_df, interface_df
 
@@ -606,7 +782,8 @@ def add_proto_chain_counts_info(df: pd.DataFrame) -> pd.DataFrame:
         df["n_nuc"] = 0
         df["n_peptide"] = 0
         df["n_small_molecule"] = 0
-        df["n_metal"] = 1
+        interface_type = df.get("interface_type", pd.Series("", index=df.index)).fillna("")
+        df["n_metal"] = (interface_type == "bmm_protein").astype(int)
         df["n_loi"] = 0
         return df
 
@@ -745,6 +922,30 @@ def _parse_partner_list(value) -> list:
     if not isinstance(value, list):
         return []
     return value
+
+
+def _contact_within_cutoff(contact: dict, distance_cutoff: float | None) -> bool:
+    if distance_cutoff is None:
+        return True
+    distance = contact.get("min_distance")
+    if distance is None:
+        return True
+    try:
+        return float(distance) <= distance_cutoff
+    except (TypeError, ValueError):
+        return False
+
+
+def _contact_count(contact: dict) -> int:
+    for key in ("num_contacts", "count"):
+        value = contact.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return 0
 
 
 def _parse_pn_unit_iids_value(value) -> list[str]:

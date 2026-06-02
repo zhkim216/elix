@@ -3,8 +3,8 @@ dataset_impl: proto
 pdb_path: /scratch/users/zhkim216/datasets/atomworks_pdb_full_v9
 train_metadata_path: /scratch/users/zhkim216/datasets/atomworks_pdb_full_v9/metadata_ligval_seq_clustered_03_metal_evidence.parquet
 
-validation_ids_file: /scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs/metal_nativeval_sm_all.txt
-val_metadata_path: /scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs/metadata_for_training_metal_nativeval_sm_all.parquet
+validation_ids_file: /scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs/metal_nativeval.txt
+val_metadata_path: /scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs/metadata_for_training_metal_nativeval.parquet
 
 debug: ${train.debug}
 debug_num_ids: 10000
@@ -17,6 +17,7 @@ proto:
   allowed_ccd_codes: null
   min_protein_donor_atoms: 3
   min_avg_occupancy_nonpolymer: 0.5
+  query_pn_unit_iids_only: true
 
 train_filters:
   metadata_filter:

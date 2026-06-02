@@ -3,8 +3,8 @@ dataset_impl: proto
 pdb_path: /home/yjhk/model-dev/datasets/atomworks_pdb_full_v9
 train_metadata_path: /home/yjhk/model-dev/datasets/atomworks_pdb_full_v9/debug_metadata_ligval_seq_clustered_03_with_metal_evidence.parquet
 
-validation_ids_file: /home/yjhk/model-dev/datasets/val_cifs/nativeval_cifs/metal_nativeval_sm_all.txt
-val_metadata_path: /home/yjhk/model-dev/datasets/val_cifs/nativeval_cifs/metadata_for_training_metal_nativeval_sm_all.parquet
+validation_ids_file: /home/yjhk/model-dev/datasets/val_cifs/nativeval_cifs/metal_nativeval.txt
+val_metadata_path: /home/yjhk/model-dev/datasets/val_cifs/nativeval_cifs/metadata_for_training_metal_nativeval.parquet
 
 debug: ${train.debug}
 debug_num_ids: 10000
@@ -17,6 +17,7 @@ proto:
   allowed_ccd_codes: null
   min_protein_donor_atoms: 3
   min_avg_occupancy_nonpolymer: 0.5
+  query_pn_unit_iids_only: true
 
 train_filters:
   metadata_filter:
@@ -31,7 +32,8 @@ train_filters:
   interface_filter:
     "1": []
     "2":
-      - "interface_type == 'bmm_protein' and n_metal == 1"
+      - "(interface_type == 'bmm_protein' and n_metal == 1) or interface_type == 'protein_protein'"
+      - "n_prot <= 2"
 
 val_filters:
   metadata_filter: []
@@ -44,6 +46,8 @@ sampling_weights:
     alpha_protein_nuc:            0.0
     alpha_protein_nuc_lig:        0.0
     alpha_protein_peptide:        0.0
+  single_protein_context_weight: 1.0
+  multi_protein_context_weight: 1.0
   k_percentile: 90.0
   ligand_cluster_col: null
 

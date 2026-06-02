@@ -2,21 +2,21 @@
 # Submit from Sherlock:
 #   PROJECT_ROOT=/home/users/zhkim216/code/elix \
 #     bash scripts/sherlock_scripts/jinho/setup/wrap_sbatch_in_container_elix.sh \
-#     scripts/sherlock_scripts/jinho/train_seq_denoiser/experiments_after_refactor/metal_proto.sbatch
-#SBATCH --job-name=proto
+#     scripts/sherlock_scripts/jinho/train_seq_denoiser/experiments_after_refactor/metal_proto_exp2.sbatch
+#SBATCH --job-name=proto_exp2
 #SBATCH -p possu
-#SBATCH --array=0-3
+#SBATCH --array=0-7
 #SBATCH --gres=gpu:1
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=8
-#SBATCH --time=1-0:00:00
-#SBATCH --output=/scratch/users/zhkim216/job_output/train_seq_denoiser/proto_%A_%a.out
-#SBATCH --error=/scratch/users/zhkim216/job_output/train_seq_denoiser/proto_%A_%a.err
+#SBATCH --time=1-12:00:00
+#SBATCH --output=/scratch/users/zhkim216/job_output/train_seq_denoiser/proto_exp2_%A_%a.out
+#SBATCH --error=/scratch/users/zhkim216/job_output/train_seq_denoiser/proto_exp2_%A_%a.err
 
 set -euo pipefail
 
 BASE_DIR=/home/users/zhkim216/code/elix
-HYDRA_DIR=/scratch/users/zhkim216/hydra_outputs/train_seq_denoiser/proto
+HYDRA_DIR=/scratch/users/zhkim216/hydra_outputs/train_seq_denoiser/proto_exp2
 OUT_DIR=/scratch/users/zhkim216/out_dir
 JOB_OUTPUT_DIR=/scratch/users/zhkim216/job_output/train_seq_denoiser
 
@@ -25,7 +25,7 @@ mkdir -p "${JOB_OUTPUT_DIR}" "${HYDRA_DIR}" "${OUT_DIR}"
 ARRAY_JOB_ID="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-manual}}"
 ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-8}"
-export TORCHINDUCTOR_CACHE_DIR="/scratch/users/zhkim216/cache/inductor_cache_proto_${ARRAY_JOB_ID}_${ARRAY_TASK_ID}"
+export TORCHINDUCTOR_CACHE_DIR="/scratch/users/zhkim216/cache/inductor_cache_proto_exp2_${ARRAY_JOB_ID}_${ARRAY_TASK_ID}"
 mkdir -p "${TORCHINDUCTOR_CACHE_DIR}"
 
 cd "${BASE_DIR}"
@@ -35,12 +35,16 @@ WANDB_ID=zhkim216
 PROJECT=ligand_seq_des
 GROUP=training
 
-# Config name / external evidence policy / interface scope
+# Config name / external evidence policy / interface scope / query_pn_unit_iids_only / alpha_protein_protein / dropout_rate / protein noise levels / knn
 CONFIGS=(
-  "nprot1_no_filter|no_filter|nprot1"
-  "nprot1_external_evidence|external_evidence|nprot1"
-  "allprot_no_filter|no_filter|allprot"
-  "allprot_external_evidence|external_evidence|allprot"
+  "nprot1_no_filter|no_filter|nprot1|true|0.0|0.1|0.1|24"
+  "nprot1_external_evidence|external_evidence|nprot1|true|0.0|0.1|0.1|24"
+  "nprot1_external_evidence|external_evidence|nprot1|true|0.0|0.2|0.1|24"
+  "nprot1_external_evidence|external_evidence|nprot1|true|0.0|0.3|0.1|24"
+  "nprot1_external_evidence|external_evidence|nprot1|true|0.0|0.1|0.1|36"
+  "nprot1_external_evidence|external_evidence|nprot1|true|0.0|0.1|0.1|48"
+  "nprot1_external_evidence|external_evidence|nprot1|true|0.0|0.1|0.2|48"
+  "nprot1_external_evidence|external_evidence|nprot1|true|0.0|0.1|0.3|48"
 )
 IDX="${ARRAY_TASK_ID}"
 if (( IDX < 0 || IDX >= ${#CONFIGS[@]} )); then
@@ -48,15 +52,17 @@ if (( IDX < 0 || IDX >= ${#CONFIGS[@]} )); then
   exit 2
 fi
 
-IFS='|' read -r CONFIG_NAME POLICY INTERFACE_SCOPE <<< "${CONFIGS[$IDX]}"
-EXP_NAME="proto_${CONFIG_NAME}"
+CONFIG_ROW="${CONFIGS[$IDX]}"
+IFS='|' read -r CONFIG_NAME POLICY INTERFACE_SCOPE QUERY_PN_UNIT_IIDS_ONLY ALPHA_PROTEIN_PROTEIN DROPOUT_RATE PROTEIN_NOISE_LEVELS KNN <<< "${CONFIG_ROW}"
+EXP_NAME="proto_exp2_cfg${IDX}"
 
+INTERFACE_TYPE_FILTER="(interface_type == 'bmm_protein' and n_metal == 1) or interface_type == 'protein_protein'"
 case "${INTERFACE_SCOPE}" in
   nprot1)
-    INTERFACE_FILTER_OVERRIDE=("data.train_filters.interface_filter.2=[\"interface_type == 'bmm_protein' and n_metal == 1\",\"n_prot == 1\"]")
+    INTERFACE_FILTER_OVERRIDE=("data.train_filters.interface_filter.2=[\"${INTERFACE_TYPE_FILTER}\",\"n_prot == 1\"]")
     ;;
-  allprot)
-    INTERFACE_FILTER_OVERRIDE=("data.train_filters.interface_filter.2=[\"interface_type == 'bmm_protein' and n_metal == 1\"]")
+  nprot2)
+    INTERFACE_FILTER_OVERRIDE=("data.train_filters.interface_filter.2=[\"${INTERFACE_TYPE_FILTER}\",\"n_prot <= 2\"]")
     ;;
   *)
     echo "Invalid INTERFACE_SCOPE=${INTERFACE_SCOPE} in CONFIGS[${IDX}]=${CONFIGS[$IDX]}" >&2
@@ -75,8 +81,14 @@ VAL_METADATA_PATH="/scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs/meta
 DENOISER_TYPE="lc_atom_mpnn"
 
 echo "Starting ${EXP_NAME}"
+echo "  config_row: ${CONFIG_ROW}"
+echo "  config_name: ${CONFIG_NAME}"
 echo "  policy: ${POLICY}"
 echo "  interface_scope: ${INTERFACE_SCOPE}"
+echo "  query_pn_unit_iids_only: ${QUERY_PN_UNIT_IIDS_ONLY}"
+echo "  alpha_protein_protein: ${ALPHA_PROTEIN_PROTEIN}"
+echo "  dropout_rate: ${DROPOUT_RATE}"
+echo "  protein_noise_levels: ${PROTEIN_NOISE_LEVELS}"
 echo "  interface_filter_override: ${INTERFACE_FILTER_OVERRIDE[*]}"
 echo "  base_dir: ${BASE_DIR}"
 echo "  out_dir: ${OUT_DIR}"
@@ -115,17 +127,20 @@ python3 allatom_design/train_seq_denoiser.py \
     data.interface_only_training=false \
     data.samples_per_epoch=50000 \
     data.proto.external_evidence_policy="${POLICY}" \
+    data.proto.query_pn_unit_iids_only="${QUERY_PN_UNIT_IIDS_ONLY}" \
     "${INTERFACE_FILTER_OVERRIDE[@]}" \
-    data.sampling_weights.alphas_interface.alpha_protein_protein=0.0 \
+    data.sampling_weights.alphas_interface.alpha_protein_protein="${ALPHA_PROTEIN_PROTEIN}" \
     data.sampling_weights.alphas_interface.alpha_protein_small_molecule=0.0 \
     data.sampling_weights.alphas_interface.alpha_protein_metal=1.0 \
     data.sampling_weights.alphas_interface.alpha_protein_nuc=0.0 \
     data.sampling_weights.alphas_interface.alpha_protein_nuc_lig=0.0 \
     data.sampling_weights.alphas_interface.alpha_protein_peptide=0.0 \
+    data.sampling_weights.single_protein_context_weight=1.0 \
+    data.sampling_weights.multi_protein_context_weight=1.0 \
     data.sampling_weights.k_percentile=90.0 \
     data.sampling_weights.ligand_cluster_col=null \
     data.featurizer_cfg.is_inference=false \
-    data.featurizer_cfg.training_structure_noise=0.1 \
+    data.featurizer_cfg.training_structure_noise=${PROTEIN_NOISE_LEVELS} \
     data.featurizer_cfg.occupancy_threshold_protein_backbone=0.0 \
     data.featurizer_cfg.remove_unresolved_tokens=true \
     data.featurizer_cfg.max_tokens=512 \
@@ -137,12 +152,13 @@ python3 allatom_design/train_seq_denoiser.py \
     data.featurizer_cfg.pocket_n_min_ligand_atoms=1 \
     data.featurizer_cfg.use_pocket_rbf=false \
     data.featurizer_cfg.asymmetric_noise=false \
-    denoiser.mpnn.k_neighbors=24 \
+    denoiser.mpnn.k_neighbors=${KNN} \
     denoiser.mpnn.ligand_conditioning=true \
     denoiser.mpnn.token_features.use_pocket_rbf=false \
     denoiser.mpnn.token_features.protein_graph_rbf_type=ncacocb \
     denoiser.mpnn.token_features.ligand_atom_context_num=25 \
-    denoiser.mpnn.potts.k_neighbors_potts=24 \
+    denoiser.mpnn.potts.k_neighbors_potts=${KNN} \
+    denoiser.mpnn.dropout_p=${DROPOUT_RATE} \
     mask_selector.restype_masking_schedule="uniform_cosine_t" \
     logging.log_every_n_steps=100 \
     logging.wandb_watch_freq=500 \
