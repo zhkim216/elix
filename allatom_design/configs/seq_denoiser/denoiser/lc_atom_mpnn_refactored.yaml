@@ -1,4 +1,4 @@
-name: lc_atom_mpnn
+name: lc_atom_mpnn_refactored
 
 defaults:
   - _self_

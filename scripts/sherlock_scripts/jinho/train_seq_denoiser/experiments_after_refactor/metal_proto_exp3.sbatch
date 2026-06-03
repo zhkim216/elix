@@ -64,10 +64,6 @@ TRAIN_METADATA_PATH="/scratch/users/zhkim216/datasets/atomworks_pdb_full_v9/meta
 VALIDATION_IDS_FILE="/scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs/metal_nativeval.txt"
 VAL_METADATA_PATH="/scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs/metadata_for_training_metal_nativeval.parquet"
 
-# Denoiser dispatch name. The refactored implementation is selected by
-# denoiser.refactored=true from proto_refactored.yaml.
-DENOISER_TYPE="lc_atom_mpnn"
-
 echo "Starting ${EXP_NAME}"
 echo "  config_row: ${CONFIG_ROW}"
 echo "  hidden_dim: ${HIDDEN_DIM}"
@@ -100,7 +96,6 @@ python3 allatom_design/train_seq_denoiser.py \
     trainer.accumulate_grad_batches=2 \
     train.compile.compile_model=true \
     trainer.strategy="ddp_find_unused_parameters_true" \
-    denoiser.name="${DENOISER_TYPE}" \
     resume.use_current_cfg=true \
     resume.ckpt_path=null \
     loss.loss_weights.seq_loss="${SEQ_LOSS_WEIGHT}" \
