@@ -101,16 +101,9 @@ class AtomMPNN(nn.Module):
             self.parameterization = cfg.potts.parameterization
             self.num_factors = cfg.potts.num_factors
 
-            if self.cfg.potts.expand_decoder_dim:
-                self.potts_edge_proj = nn.Sequential(
-                    nn.Linear(self.hidden_dim, 3 * self.hidden_dim),
-                    nn.GELU(),
-                    nn.LayerNorm(3 * self.hidden_dim),
-                )
-
             potts_init = partial(potts.GraphPotts,
                 dim_nodes=self.hidden_dim,
-                dim_edges=self.hidden_dim * 3 if cfg.potts.expand_decoder_dim else self.hidden_dim,
+                dim_edges=self.hidden_dim,
                 num_states=self.n_tokens,
                 parameterization=self.parameterization,
                 num_factors=self.num_factors,
@@ -192,9 +185,6 @@ class AtomMPNN(nn.Module):
             h_V, h_E = layer(h_V = h_V, h_E = h_E,
                                 mask_V = protein_residue_node_mask, E_idx = E_idx,
                                 mask_attend = protein_residue_node_mask_2d, h_V_C_skip=h_V_C_skip)
-
-        if self.use_potts and self.cfg.potts.expand_decoder_dim:
-            h_E = self.potts_edge_proj(h_E)
 
         # Potts model
         if self.use_potts:
@@ -1025,10 +1015,10 @@ class Contextfeatureaggregator(nn.Module): #! (JH) self.context_encoder_layers i
         """ Parallel computation of full transformer layer """
 
         # Concatenate Y_nodes to h_E_context (add ligand node features edges)
-        h_E_context_cat = torch.cat([h_E_context, Y_nodes], -1)
+        h_E_context_cat = torch.cat([h_E_context, Y_nodes], -1) #Y_i -> E_ij. [B, L, K, 2*num_hidden]
         # concatenate h_V to h_E_context_cat (add protein node features to edges)
         h_V_expand = h_V.unsqueeze(-2).expand(-1,-1,h_E_context_cat.size(-2),-1)
-        h_EV = torch.cat([h_V_expand, h_E_context_cat], -1)
+        h_EV = torch.cat([h_V_expand, h_E_context_cat], -1) #V_i -> E_ij. [B, L, K, 3*num_hidden]
 
         # Run message passing
         h_message = self.W3(self.act(self.W2(self.act(self.W1(h_EV)))))
@@ -1052,16 +1042,16 @@ class Contextfeatureaggregator(nn.Module): #! (JH) self.context_encoder_layers i
         if self.context_edge_update and not self.is_last_layer:
             h_V_expand = h_V.unsqueeze(-2).expand(-1,-1,h_E_context_cat.size(-2),-1)
             h_EV = torch.cat([h_V_expand, h_E_context_cat], -1) #V_i -> E_ij. [B, L, K, 3*num_hidden]
-            # h_E_context_cat is not updated but h_V is updated, so we only need to update h_V
+            # h_E_context_cat is not updated but h_V is updated, so we only need to concatenate h_V to h_E_context_cat
 
             # Run message passing
             h_message = self.W13(self.act(self.W12(self.act(self.W11(h_EV)))))
-            h_E = self.norm3(h_E + self.dropout3(h_message))
+            h_E_context = self.norm3(h_E_context + self.dropout3(h_message))
 
             if mask_attend is not None:
-                h_E = mask_attend.unsqueeze(-1) * h_E
+                h_E_context = mask_attend.unsqueeze(-1) * h_E_context
 
-            return h_V, h_E
+            return h_V, h_E_context
         else:
             return h_V, None
 
