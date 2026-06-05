@@ -318,6 +318,12 @@ def get_checkpoints(design_cfg: DictConfig) -> list[dict[str, Any]]:
 
     return ckpt_infos
 
+
+def ckpt_label(ckpt_info: dict[str, Any]) -> str:
+    """Return the canonical 'step_{global_step}_epoch_{epoch}' label for a checkpoint."""
+    return f"step_{ckpt_info['global_step']}_epoch_{ckpt_info['epoch']}"
+
+
 def load_seq_des_model(cfg: DictConfig = None,
                       device: str = None,
                       ckpt_path: str | None = None,

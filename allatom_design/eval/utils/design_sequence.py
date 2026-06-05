@@ -14,12 +14,28 @@ from allatom_design.utils.sample_io_utils import save_cif_file
 from allatom_design.utils.atom_array_utils import insert_unk_residues_for_gaps_in_atom_array, clean_up_and_renumber_atom_array
 
 from allatom_design.eval.utils.cfg_utils import require_cfg_value, resolve_sampling_cfg
-from allatom_design.eval.utils.eval_setup_utils import get_checkpoints, load_seq_des_model, _parallel_context
+from allatom_design.eval.utils.eval_setup_utils import get_checkpoints, load_seq_des_model, ckpt_label, _parallel_context
 from allatom_design.eval.utils.mask_utils import initialize_sampling_masks
-from allatom_design.eval.utils.constraint_utils import parse_fixed_pos_info, parse_pos_restrict_aatype_info
+from allatom_design.eval.utils.constraint_utils import (
+    parse_fixed_pos_info,
+    parse_pos_restrict_aatype_info,
+)
 from allatom_design.eval.utils.data_utils import get_sd_batch, collect_design_outputs
 from allatom_design.eval.utils.sequence_recovery import calculate_sequence_recovery
 from allatom_design.model.seq_denoiser.sd_model import SeqDenoiser
+
+
+def _format_designed_sample_id(
+    *,
+    example_id: str,
+    sample_idx: int,
+    tag: str | None = None,
+    sample_token_prefix: str | None = None,
+) -> str:
+    sample_token = f"{sample_token_prefix}sample{sample_idx}" if sample_token_prefix else f"sample{sample_idx}"
+    if tag is None:
+        return f"{example_id}_{sample_token}"
+    return f"{example_id}_{tag}_{sample_token}"
 
 
 def design_sequence(
@@ -83,6 +99,7 @@ def design_sequence(
     # Print omitted amino acids.
     if sampling_cfg.verbose and sampling_cfg.omit_aas is not None:
         print(f"Omitting aatype sampling for: {sampling_cfg.omit_aas}")
+    sample_token_prefix = sampling_cfg.get("sample_token_prefix", None)
 
     # Process PDBs in parallel.
     parallel_context = _parallel_context(sampling_cfg.num_workers)
@@ -115,6 +132,7 @@ def design_sequence(
 
             # Restrict aatype sampling at certain positions.
             sampling_inputs = OmegaConf.to_container(sampling_cfg, resolve=True)
+            sampling_inputs.pop("sample_token_prefix", None)
             sampling_inputs["pos_restrict_aatype"] = parse_pos_restrict_aatype_info(
                 batch, pos_constraint_df, verbose=sampling_cfg.verbose
             )
@@ -154,14 +172,28 @@ def design_sequence(
                         tag = str(schedule_label_val)
                         sub_ai = tag_counter[tag]
                         tag_counter[tag] += 1
-                        designed_sample_id = f"{example_id}_{tag}_sample{sub_ai}"
+                        designed_sample_id = _format_designed_sample_id(
+                            example_id=example_id,
+                            sample_idx=sub_ai,
+                            tag=tag,
+                            sample_token_prefix=sample_token_prefix,
+                        )
                     elif gamma_val is not None:
                         tag = f"gamma{gamma_val:.2f}"
                         sub_ai = tag_counter[tag]
                         tag_counter[tag] += 1
-                        designed_sample_id = f"{example_id}_{tag}_sample{sub_ai}"
+                        designed_sample_id = _format_designed_sample_id(
+                            example_id=example_id,
+                            sample_idx=sub_ai,
+                            tag=tag,
+                            sample_token_prefix=sample_token_prefix,
+                        )
                     else:
-                        designed_sample_id = f"{example_id}_sample{ai}"
+                        designed_sample_id = _format_designed_sample_id(
+                            example_id=example_id,
+                            sample_idx=ai,
+                            sample_token_prefix=sample_token_prefix,
+                        )
                     outputs[example_id]["designed_sample_id"].append(designed_sample_id)
                     outputs[example_id]["U"].append(aux[ai]["U"])
                     outputs[example_id]["gamma"].append(gamma_val)
@@ -296,7 +328,7 @@ def iter_design_sequence_per_checkpoint(
 
     for ckpt_info in tqdm(ckpt_infos, desc="Designing sequence"):
         sd_ckpt = ckpt_info["ckpt_path"]
-        log_dir_per_ckpt = log_dir / f"step_{ckpt_info['global_step']}_epoch_{ckpt_info['epoch']}"
+        log_dir_per_ckpt = log_dir / ckpt_label(ckpt_info)
         log_dir_per_ckpt.mkdir(parents=True, exist_ok=True)
 
         L.seed_everything(seed)
