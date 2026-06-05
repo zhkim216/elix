@@ -46,7 +46,7 @@ resume:
 
 defaults:
   - _self_
-  - denoiser: lc_atom_mpnn_refactored
+  - denoiser: elix_mpnn
   - mask_selector: mask_selector
   - data: proto
 

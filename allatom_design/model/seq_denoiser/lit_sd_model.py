@@ -15,6 +15,10 @@ from allatom_design.model.ema.phema import PowerFunctionEMA
 from allatom_design.model.lr_schedule import InverseSqrtLR, NoamLR
 from allatom_design.model.seq_denoiser.sd_loss import SDLoss
 from allatom_design.model.seq_denoiser.sd_model import SeqDenoiser
+from allatom_design.utils.checkpoint_utils import (
+    elix_mpnn_config,
+    elix_mpnn_state_dict,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +26,7 @@ logger = logging.getLogger(__name__)
 class LitSeqDenoiser(L.LightningModule):
     def __init__(self, cfg: DictConfig):
         super().__init__()
+        cfg = elix_mpnn_config(cfg)
         self.cfg = cfg
         self.model = SeqDenoiser(cfg.model)
 
@@ -41,6 +46,12 @@ class LitSeqDenoiser(L.LightningModule):
         # Set up loss
         self.loss = SDLoss(cfg.loss)
         self.save_hyperparameters()
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        checkpoint["state_dict"] = elix_mpnn_state_dict(checkpoint["state_dict"])
+        hyper_parameters = checkpoint.get("hyper_parameters", {})
+        if "cfg" in hyper_parameters:
+            hyper_parameters["cfg"] = elix_mpnn_config(hyper_parameters["cfg"])
 
 
     def setup(self, stage: str):
@@ -219,4 +230,3 @@ class LitSeqDenoiser(L.LightningModule):
             if total_norm_key in grad_norms:
                 total_norm = grad_norms[total_norm_key]
                 self.log_dict({f"total_l{norm_type}_grad_norm": total_norm}, logger=has_logger)
-

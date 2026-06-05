@@ -17,7 +17,10 @@ from datetime import datetime
 
 from allatom_design.model.ema.ema import EMA, EMAModelCheckpoint, EMATrackerCheckpoint
 from allatom_design.model.seq_denoiser.lit_sd_model import LitSeqDenoiser
-from allatom_design.utils.checkpoint_utils import repair_state_dict
+from allatom_design.utils.checkpoint_utils import (
+    elix_mpnn_config,
+    repair_state_dict,
+)
 
 
 def build_sd_datamodule(data_cfg: DictConfig) -> L.LightningDataModule:
@@ -44,7 +47,7 @@ def build_sd_datamodule(data_cfg: DictConfig) -> L.LightningDataModule:
     )
 
 
-@hydra.main(config_path="configs_local/seq_denoiser", config_name="mg_proto_no_filter", version_base="1.3.2")
+@hydra.main(config_path="configs_local/seq_denoiser", config_name="proto_external_evidence", version_base="1.3.2")
 def main(cfg: DictConfig):
     """
     Script for training an sequence denoiser model.
@@ -277,7 +280,7 @@ def load_resume_config(cfg: DictConfig, resume_ckpt_path: str) -> DictConfig:
         for key, value in overrides.items():
             OmegaConf.update(cfg, key, value, merge=True)
 
-    return cfg
+    return elix_mpnn_config(cfg)
 
 
 def update_config(cfg: DictConfig) -> None:

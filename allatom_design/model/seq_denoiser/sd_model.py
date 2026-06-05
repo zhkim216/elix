@@ -1,6 +1,6 @@
 import copy
 import math
-from typing import Any, Dict, Tuple
+from typing import Any, Callable, Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -9,8 +9,8 @@ from omegaconf import DictConfig
 from torchtyping import TensorType
 
 from allatom_design.model.seq_denoiser.mask_selector import MaskSelector
-from allatom_design.model.seq_denoiser.denoisers.atom_mpnn_denoiser import \
-    AtomMPNNDenoiser
+from allatom_design.model.seq_denoiser.denoisers.elix_mpnn_denoiser import \
+    ElixMPNNDenoiser
 from allatom_design.model.seq_denoiser.denoisers.denoiser import \
     BaseSeqDenoiser
 
@@ -61,7 +61,7 @@ class SeqDenoiser(nn.Module):
 
             # Pseudo-context mask: pseudo-ligand positions + their backbone-masked neighbors.
             # Both are excluded from the protein graph (build_masks) and have restype
-            # masked to GAP (atom_mpnn forward).  # JH Changed 260416
+            # masked to GAP (elix_mpnn forward).  # JH Changed 260416
             batch["pseudo_context_mask"] = (scn_token_mask + expanded_bb_mask).clamp(max=1.0)
 
         # Denoise sequence
@@ -88,7 +88,8 @@ class SeqDenoiser(nn.Module):
 
     def sample(self,
                batch: dict[str, TensorType["b ..."]],
-               sampling_inputs: dict[str, Any]
+               sampling_inputs: dict[str, Any],
+               potts_aux_provider: Callable | None = None,
                ) -> tuple[dict[str, list[AtomArray]], dict[str, Any]]:
 
         # Handle inference noise labels
@@ -105,7 +106,11 @@ class SeqDenoiser(nn.Module):
         if sampling_inputs.get("use_mlm_sampling", False):
             id_to_atom_arrays, aux = self.denoiser.mlm_sample(batch, sampling_inputs)
         elif sampling_inputs.get("use_potts_sampling", False):
-            id_to_atom_arrays, aux = self.denoiser.potts_sample(batch, sampling_inputs)
+            id_to_atom_arrays, aux = self.denoiser.potts_sample(
+                batch,
+                sampling_inputs,
+                potts_aux_provider=potts_aux_provider,
+            )
         else:
             raise ValueError("No sampling method specified. Set use_potts_sampling=True or use_mlm_sampling=True.")
 
@@ -136,6 +141,6 @@ def get_denoiser(cfg: DictConfig,
     """
     Get the denoiser specified in the config.
     """
-    if cfg.name in {"atom_mpnn", "lc_atom_mpnn", "lc_atom_mpnn_refactored"}:
-        return AtomMPNNDenoiser(cfg, sigma_data)
+    if cfg.name == "elix_mpnn":
+        return ElixMPNNDenoiser(cfg, sigma_data)
     raise ValueError(f"Unknown denoiser: {cfg.name}")

@@ -18,6 +18,7 @@ This module contains layers for parameterizing Potts models from
 graph embeddings.
 
 Adapted from Chroma by Richard Shuai.
+Modified for Elix by Jinho Kim.
 """
 
 from typing import Any, Callable, List, Literal, Optional, Tuple, Union
@@ -31,6 +32,9 @@ from tqdm.auto import tqdm
 
 from allatom_design.model.seq_denoiser.denoisers.seq_design import \
     graph_utils as graph
+from allatom_design.model.seq_denoiser.denoisers.seq_design.potts_utils import (
+    MultiHeadFactorPotts,
+)
 
 
 class GraphPotts(nn.Module):
@@ -41,7 +45,8 @@ class GraphPotts(nn.Module):
         dim_edges (int): Hidden dimension of edge tensor.
         num_states (int): Size of the vocabulary.
         parameterization (str): Parameterization choice in
-            `{'linear', 'factor', 'factor_scale', 'score', 'score_zsum', 'score_scale'}`,
+            `{'linear', 'factor', 'multi_head_factor', 'factor_scale', 'score',
+            'score_zsum', 'score_scale'}`,
             or any of those suffixed with `_beta`, which will add in a globally
             learnable temperature scaling parameter.
         symmetric_J (bool): If True enforce symmetry of Potts model i.e.
@@ -51,6 +56,9 @@ class GraphPotts(nn.Module):
         dropout (float): Probability of per-dimension dropout on `[0,1]`.
         num_factors (int): Number of factors to use for the `factor`
             parameterization mode.
+        num_heads (int): Number of heads to use for the `multi_head_factor`
+            parameterization mode.
+        reduce (str): Reduction for `multi_head_factor`, in `{'mean', 'sqrt'}`.
         beta_init (float): Initial temperature scaling factor for parameterizations
             with the `_beta` suffix.
 
@@ -82,13 +90,16 @@ class GraphPotts(nn.Module):
         init_scale: float = 0.1,
         dropout: float = 0.0,
         num_factors: Optional[int] = None,
+        num_heads: Optional[int] = None,
+        reduce: str = "mean",
         beta_init: float = 10.0,
+        dim_multi_head: Optional[int] = None,
     ):
         super(GraphPotts, self).__init__()
         self.dim_nodes = dim_nodes
         self.dim_edges = dim_edges
         self.num_states = num_states
-
+        self.dim_multi_head = dim_multi_head
 
         # Beta parameterization support temperature learning
         self.scale_beta = False
@@ -109,6 +120,21 @@ class GraphPotts(nn.Module):
             self.W_h = nn.Linear(self.dim_nodes, self.num_states, bias=True)
             self.W_J_left = nn.Linear(self.dim_edges, self.num_states ** 2, bias=True)
             self.W_J_right = nn.Linear(self.dim_edges, self.num_states ** 2, bias=True)
+        elif self.parameterization == "multi_head_factor":
+            if num_heads is None:
+                num_heads = 1
+            self.num_heads = int(num_heads)
+            self.reduce = reduce
+            self.multi_head_factor = MultiHeadFactorPotts(
+                dim_nodes=self.dim_nodes,
+                dim_edges=self.dim_edges,
+                dim_multi_head=self.dim_multi_head,
+                num_states=self.num_states,
+                num_heads=self.num_heads,
+                reduce=self.reduce,
+                init_scale=init_scale,
+                dropout=dropout,
+            )
         elif self.parameterization == "score":
             if num_factors is None:
                 num_factors = dim_edges
@@ -196,6 +222,8 @@ class GraphPotts(nn.Module):
                 - J.mean(-2, keepdim=True)
                 + J.mean(dim=[-1, -2], keepdim=True)
             )
+        elif self.parameterization == "multi_head_factor":
+            h, J = self.multi_head_factor(node_h, edge_h, mask_i, mask_J)
         elif self.parameterization == "score":
             node_h = self.dropout(node_h)
             edge_h = self.dropout(edge_h)
