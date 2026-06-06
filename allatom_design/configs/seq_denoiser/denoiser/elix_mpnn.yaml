@@ -45,6 +45,7 @@ mpnn:
     k_neighbors_potts: 32
     max_dist_potts: null
     use_potts: true
+    norm_potts_inputs: false  # LayerNorm h_V/h_E before the Potts head
     parameterization: "factor"
     num_factors: null
     symmetric_J: true
@@ -53,4 +54,4 @@ mpnn:
       reduce: "mean" # "mean", "sqrt"
       num_heads: 4
 
-  expansion_mode: "node_concat" # node_concat, multi_head_factor
+  expansion_mode: "node_concat" # node_concat, multi_head_factor, node_concat_multi_head

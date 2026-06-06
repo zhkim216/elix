@@ -103,6 +103,7 @@ class ElixMPNN(nn.Module):
             self.num_factors = cfg.potts.num_factors
             self.num_heads = cfg.potts.get("num_heads", None)
             self.reduce = cfg.potts.get("reduce", "mean")
+            self.norm_potts_inputs = cfg.potts.get("norm_potts_inputs", False)
 
             self.dim_multi_head = None
             if self.expansion_mode == "node_concat":
@@ -121,8 +122,27 @@ class ElixMPNN(nn.Module):
                 self.dim_multi_head = cfg.potts.multi_head.get("dim_multi_head", 128)
                 self.num_heads = cfg.potts.multi_head.get("num_heads", 4)
                 self.reduce = cfg.potts.multi_head.get("reduce", "mean")
+            elif self.expansion_mode == "node_concat_multi_head":
+                if self.parameterization != "multi_head_factor":
+                    raise ValueError(
+                        "expansion_mode='node_concat_multi_head' requires "
+                        "potts.parameterization='multi_head_factor'; "
+                        f"got {self.parameterization!r}"
+                    )
+                self.dim_nodes_potts = self.hidden_dim
+                self.dim_edges_potts = self.hidden_dim * 3
+                self.dim_multi_head = cfg.potts.multi_head.get("dim_multi_head", 128)
+                self.num_heads = cfg.potts.multi_head.get("num_heads", 4)
+                self.reduce = cfg.potts.multi_head.get("reduce", "mean")
             else:
-                raise ValueError(f"Invalid expansion mode: {self.expansion_mode}. Must be 'node_concat' or 'multi_head_factor'.")
+                raise ValueError(
+                    f"Invalid expansion mode: {self.expansion_mode}. Must be "
+                    "'node_concat', 'multi_head_factor', or 'node_concat_multi_head'."
+                )
+
+            if self.norm_potts_inputs:
+                self.norm_potts_inputs_nodes = nn.LayerNorm(self.dim_nodes_potts)
+                self.norm_potts_inputs_edges = nn.LayerNorm(self.dim_edges_potts)
 
             potts_init = partial(potts.GraphPotts,
                 dim_nodes=self.dim_nodes_potts,
@@ -212,13 +232,17 @@ class ElixMPNN(nn.Module):
                                 mask_V = protein_residue_node_mask, E_idx = E_idx,
                                 mask_attend = protein_residue_node_mask_2d, h_V_C_skip=h_V_C_skip)
 
-        if self.expansion_mode == "node_concat":
+        if self.expansion_mode in ("node_concat", "node_concat_multi_head"):
             h_E = cat_neighbors_nodes(h_V, h_E, E_idx) # V_j -> E_ij # [B, L, K, 2*num_hidden]
             h_V_expand = h_V.unsqueeze(-2).expand(-1,-1,h_E.size(-2),-1) # [B, L, K, num_hidden]
             h_E = torch.cat([h_V_expand, h_E], -1) # V_i -> E_ij. [B, L, K, 3*num_hidden]
 
         # Potts model
         if self.use_potts:
+            if self.norm_potts_inputs:
+                h_V = self.norm_potts_inputs_nodes(h_V)
+                h_E = self.norm_potts_inputs_edges(h_E)
+
             if self.max_dist_potts is not None:
                 protein_residue_node_mask_2d = protein_residue_node_mask_2d * (D_neighbors <= self.max_dist_potts)  # mask out edges that are too far away
 
