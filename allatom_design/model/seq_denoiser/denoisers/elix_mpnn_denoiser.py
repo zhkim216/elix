@@ -610,11 +610,10 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-batch ligand pocket mask over token positions.
 
-        A protein residue is "in the pocket" iff its pseudo-Cβ coordinate is
+        A protein residue is "in the pocket" iff its C-alpha coordinate is
         within ``pocket_distance`` Å of any resolved ligand atom in the same
-        batch item. The pseudo-Cβ is read from
-        ``batch['noised_pseudo_cb_coords']``, which at sequence-design time
-        has zero structure noise and so matches the real pseudo-Cβ.
+        batch item. The C-alpha is read from ``batch['noised_ca_coords']``,
+        which at sequence-design time has zero structure noise.
 
         Returns:
             pocket_mask: float tensor ``[B, N_tokens]``, 1 at pocket residues,
@@ -622,7 +621,7 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
             n_protein: float tensor ``[B]``, count of valid protein residues
                 per batch item (used for whole-protein per-residue averaging).
         """
-        pcb = batch["noised_pseudo_cb_coords"]                # [B, N, 3]
+        ca = batch["noised_ca_coords"]                        # [B, N, 3]
         coords = batch["coords"]                              # [B, N_atoms, 3]
         lig_atom_mask = (
             batch["atom_is_small_molecule_chain"].bool()
@@ -630,26 +629,26 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
             & batch["atom_pad_mask"].bool()
         )                                                     # [B, N_atoms]
 
-        # Entries with zero pseudo-Cβ flag non-standard / unresolved tokens.
+        # Entries with zero C-alpha coords flag non-standard / unresolved tokens.
         # Combine with the existing protein-residue node mask to be safe.
-        pcb_valid = (
-            (pcb.norm(dim=-1) > 1e-6)
+        ca_valid = (
+            (ca.norm(dim=-1) > 1e-6)
             & batch["protein_residue_node_mask"].bool()
         )                                                     # [B, N]
-        n_protein = pcb_valid.sum(-1).float()                 # [B]
+        n_protein = ca_valid.sum(-1).float()                  # [B]
 
-        B, N, _ = pcb.shape
-        pocket = torch.zeros((B, N), device=pcb.device, dtype=torch.float32)
+        B, N, _ = ca.shape
+        pocket = torch.zeros((B, N), device=ca.device, dtype=torch.float32)
         d2_threshold = float(pocket_distance) ** 2
         for b in range(B):
             if not lig_atom_mask[b].any():
                 continue
             lig_b = coords[b][lig_atom_mask[b]]               # [L_b, 3]
-            pcb_b = pcb[b]                                    # [N, 3]
-            d2 = ((pcb_b[:, None, :] - lig_b[None, :, :]) ** 2).sum(-1)
+            ca_b = ca[b]                                      # [N, 3]
+            d2 = ((ca_b[:, None, :] - lig_b[None, :, :]) ** 2).sum(-1)
             min_d2 = d2.min(dim=1).values                     # [N]
             pocket[b] = (min_d2 < d2_threshold).float()
-        pocket = pocket * pcb_valid.float()
+        pocket = pocket * ca_valid.float()
         return pocket, n_protein
 
     @staticmethod

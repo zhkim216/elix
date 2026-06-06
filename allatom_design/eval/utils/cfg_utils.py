@@ -27,6 +27,18 @@ def resolve_input_cfgs(cfg: DictConfig) -> tuple[DictConfig, DictConfig]:
         return cfg.cif_cfg.parse.designed_samples, cfg.preprocess_cfg.designed_samples
     return cfg.cif_cfg.parse.native, cfg.preprocess_cfg.native
 
+def get_stage2_potts_only_cond(stage2_design_cfg: DictConfig) -> Any:
+    sampling_cfg = stage2_design_cfg.get("sampling_cfg", None)
+    if sampling_cfg is None:
+        return None
+    overrides = sampling_cfg.get("overrides", None)
+    if overrides is None:
+        return None
+    potts_cfg = overrides.get("potts_sampling_cfg", None)
+    if potts_cfg is None:
+        return None
+    return potts_cfg.get("potts_only_cond", None)
+
 def guidance_is_enabled(cfg: DictConfig | dict | None) -> bool:
     if cfg is None:
         return False

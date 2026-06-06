@@ -12,7 +12,7 @@ from atomworks.io.tools.rdkit import atom_array_to_rdkit
 from atomworks.ml.transforms.atom_array import apply_and_spread_residue_wise
 from atomworks.ml.utils.geometry import align_atom_arrays
 
-from allatom_design.data.transform.custom_transforms import annotate_ligand_pockets, annotate_ligand_pockets_pseudocb
+from allatom_design.data.transform.custom_transforms import annotate_ligand_pockets, annotate_ligand_pockets_calpha
 from allatom_design.utils.sample_io_utils import save_cif_file
 
 from allatom_design.eval.utils.metrics.af3_confidence import extract_af3_confidence_metrics
@@ -394,7 +394,7 @@ def _compute_small_molecule_docking_metrics_atomarray(
 ) -> dict[str, float | int | str | None]:
     # Annotate ligand pockets (binding site residues)
     if ref_sample_is_designed:
-        sample_atom_array = annotate_ligand_pockets_pseudocb(atom_array=sample_atom_array,
+        sample_atom_array = annotate_ligand_pockets_calpha(atom_array=sample_atom_array,
                                                            pocket_distance=pocket_distance_for_docking_metrics,
                                                            annotation_name="is_ligand_pocket_for_metrics",
                                                            receptor_pn_unit_iids=receptor_pn_unit_iids,
@@ -411,7 +411,7 @@ def _compute_small_molecule_docking_metrics_atomarray(
     sample_atom_array.set_annotation("is_ligand_pocket_for_metrics", sample_atom_array_pocket_mask)
 
     if ref_sample_is_designed:
-        pred_atom_array = annotate_ligand_pockets_pseudocb(atom_array=pred_atom_array,
+        pred_atom_array = annotate_ligand_pockets_calpha(atom_array=pred_atom_array,
                                                            pocket_distance=pocket_distance_for_docking_metrics,
                                                            annotation_name="is_ligand_pocket_for_metrics",
                                                            receptor_pn_unit_iids=receptor_pn_unit_iids,

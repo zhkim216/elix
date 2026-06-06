@@ -4,22 +4,10 @@ from typing import Any, Iterator
 import pandas as pd
 from omegaconf import DictConfig
 
+from allatom_design.eval.utils.cfg_utils import get_stage2_potts_only_cond
 from allatom_design.eval.utils.constraint_utils import create_pos_constraint_dict_from_pocket
 from allatom_design.eval.utils.eval_setup_utils import ckpt_label
 from allatom_design.eval.utils.design_sequence import iter_design_sequence_per_checkpoint
-
-
-def _get_stage2_potts_only_cond(stage2_design_cfg: DictConfig) -> Any:
-    sampling_cfg = stage2_design_cfg.get("sampling_cfg", None)
-    if sampling_cfg is None:
-        return None
-    overrides = sampling_cfg.get("overrides", None)
-    if overrides is None:
-        return None
-    potts_cfg = overrides.get("potts_sampling_cfg", None)
-    if potts_cfg is None:
-        return None
-    return potts_cfg.get("potts_only_cond", None)
 
 
 def _build_stage2_inputs_and_constraints(
@@ -32,7 +20,7 @@ def _build_stage2_inputs_and_constraints(
     stage2_constraint_type: str,
     stage1_model_label: str,
     pocket_distance: float,
-    use_pseudocb_for_pocket_annotation: bool,
+    use_calpha_for_pocket_annotation: bool,
 ) -> tuple[dict, pd.DataFrame, dict[str, dict[str, Any]]]:
     stage2_sample_dict: dict[str, dict[str, Any]] = {}
     constraint_rows = []
@@ -58,7 +46,7 @@ def _build_stage2_inputs_and_constraints(
                 atom_array=stage1_atom_array,
                 pocket_distance=pocket_distance,
                 constraint_type=stage2_constraint_type,
-                use_pseudocb_for_pocket_annotation=use_pseudocb_for_pocket_annotation,
+                use_calpha_for_pocket_annotation=use_calpha_for_pocket_annotation,
                 sample_path=stage1_sample_path,
                 return_ligand_mpnn_format=False,
             )
@@ -115,7 +103,7 @@ def _build_twostage_manifest_rows(
     stage2_design_cfg: DictConfig,
 ) -> list[dict[str, Any]]:
     rows = []
-    potts_only_cond = _get_stage2_potts_only_cond(stage2_design_cfg)
+    potts_only_cond = get_stage2_potts_only_cond(stage2_design_cfg)
 
     for stage1_sample_id, stage2_entry in stage2_sample_dict_per_ckpt.items():
         lineage = lineage_by_stage1_sample_id[stage1_sample_id]
@@ -167,7 +155,7 @@ def design_sequence_two_stage(
     stage1_guidance_cfg: DictConfig | None = None,
     stage2_guidance_cfg: DictConfig | None = None,
     pocket_distance: float = 5.0,
-    use_pseudocb_for_pocket_annotation: bool = False,
+    use_calpha_for_pocket_annotation: bool = False,
 ) -> Iterator[tuple[dict, Path, dict, list[dict[str, Any]]]]:
     if sample_dict is None:
         raise ValueError("sample_dict must be provided")
@@ -210,7 +198,7 @@ def design_sequence_two_stage(
                 stage2_constraint_type=stage2_constraint_type,
                 stage1_model_label=stage1_model_label,
                 pocket_distance=pocket_distance,
-                use_pseudocb_for_pocket_annotation=use_pseudocb_for_pocket_annotation,
+                use_calpha_for_pocket_annotation=use_calpha_for_pocket_annotation,
             )
         )
 

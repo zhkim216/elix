@@ -52,7 +52,7 @@ from allatom_design.data.transform.custom_transforms import (
     FilterToQueryPNUnits,
     ErrIfAllUnresolved,
     AnnotateLigandPockets,
-    AnnotateLigandPocketsPseudoCB,
+    AnnotateLigandPocketsCAlpha,
     GetNCACOAndPseudoCBCoords,
     AddTrainingRandomNoise,
     RemoveUnsupportedChainTypes,
@@ -104,7 +104,7 @@ def sd_featurizer_pocket_only(
     # ----- Spatial pre-crop around target ligand -----
     spatial_crop_radius: float = 15.0,
     # ----- Pocket annotation for model features -----    
-    # For pocket-aware RBF (pseudo-CB based pocket annotation)
+    # For pocket-aware RBF (C-alpha based pocket annotation)
     use_pocket_rbf: bool = False,
     pocket_rbf_distance: float = 5.0,
     # Center random augmentation
@@ -239,7 +239,7 @@ def sd_featurizer_pocket_only_for_design(
     # ----- Spatial pre-crop around target ligand -----
     spatial_crop_radius: float = 20.0,
     # ----- Pocket annotation for model features -----
-    use_pseudo_cb_for_pocket_annotation: bool = True,
+    use_calpha_for_pocket_annotation: bool = True,
     # ----- Padding (None = no fixed padding) -----
     max_tokens: int | None = None,
     max_atoms: int | None = None,
@@ -301,8 +301,8 @@ def sd_featurizer_pocket_only_for_design(
     # ------------------------------------------------------------------
     # Stage 2: Pocket annotation + pocket crop (no truncation)
     # ------------------------------------------------------------------
-    if use_pseudo_cb_for_pocket_annotation:
-        pocket_annotation = AnnotateLigandPocketsPseudoCB(pocket_distance=pocket_crop_distance, annotation_name="is_ligand_pocket", n_min_ligand_atoms=1)
+    if use_calpha_for_pocket_annotation:
+        pocket_annotation = AnnotateLigandPocketsCAlpha(pocket_distance=pocket_crop_distance, annotation_name="is_ligand_pocket", n_min_ligand_atoms=1)
     else:
         pocket_annotation = AnnotateLigandPockets(pocket_distance=pocket_crop_distance)
     

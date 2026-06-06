@@ -40,7 +40,7 @@ potts_sampling_cfg:
     enabled: false
     gamma_list: [0.0, 0.5, 1.0, 1.5, 2.0]   # gamma > 1 = CFG extrapolation
     uncond_mode: "protein_only"              # only mode currently implemented
-    pocket_distance: 10.0                    # Å from any ligand atom to pseudo-Cβ for the pocket mask
+    pocket_distance: 10.0                    # Å from any ligand atom to C-alpha for the pocket mask
 
 mlm_sampling_cfg:
   num_steps: 50

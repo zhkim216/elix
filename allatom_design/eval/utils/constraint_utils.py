@@ -19,7 +19,7 @@ import atomworks.enums as aw_enums
 from atomworks.ml.transforms.filters import remove_unresolved_tokens
 
 import allatom_design.data.const as const
-from allatom_design.data.transform.custom_transforms import annotate_ligand_pockets, annotate_ligand_pockets_pseudocb
+from allatom_design.data.transform.custom_transforms import annotate_ligand_pockets, annotate_ligand_pockets_calpha
 from allatom_design.utils.sample_io_utils import load_example_with_parse
 from allatom_design.eval.utils.data_utils import preprocess_input
 
@@ -452,7 +452,7 @@ def create_pos_constraint_dict_from_pocket(
     constraint_type: str = "pocket",  # "pocket" or "scaffold"
     receptor_pn_unit_iids: list[str] = None,
     ligand_pn_unit_iids: list[str] = None,
-    use_pseudocb_for_pocket_annotation: bool = False,
+    use_calpha_for_pocket_annotation: bool = False,
     sample_path: str = None,
     return_ligand_mpnn_format: bool = False,
 ) -> dict:
@@ -466,6 +466,7 @@ def create_pos_constraint_dict_from_pocket(
         constraint_type: "pocket" to constrain pocket residues, "scaffold" to constrain non-pocket residues
         receptor_pn_unit_iids: List of receptor (protein) pn_unit_iids
         ligand_pn_unit_iids: List of ligand pn_unit_iids
+        use_calpha_for_pocket_annotation: If True, use C-alpha-to-ligand distances instead of all-atom distances
         sample_path: Path to the CIF file (required if return_ligand_mpnn_format=True)
         return_ligand_mpnn_format: If True, also include LigandMPNN CSV fields (pdb_path, chains, fixed_residues)
 
@@ -474,8 +475,8 @@ def create_pos_constraint_dict_from_pocket(
         If return_ligand_mpnn_format=True, also includes pdb_path, chains, fixed_residues for LigandMPNN.
     """
     # Annotate ligand pockets
-    if use_pseudocb_for_pocket_annotation:
-        annotated_atom_array = annotate_ligand_pockets_pseudocb(
+    if use_calpha_for_pocket_annotation:
+        annotated_atom_array = annotate_ligand_pockets_calpha(
             atom_array=atom_array,
             pocket_distance=pocket_distance,
             n_min_ligand_atoms=1,

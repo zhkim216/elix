@@ -37,7 +37,6 @@ from allatom_design.eval.utils.data_utils import (
     get_sd_batch,
     preprocess_input,
 )
-from allatom_design.data.transform.custom_transforms import annotate_ligand_pockets, annotate_ligand_pockets_pseudocb
 from atomworks.ml.transforms.filters import remove_unresolved_tokens
 
 from allatom_design.model.seq_denoiser.sd_model import SeqDenoiser

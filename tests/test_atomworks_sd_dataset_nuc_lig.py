@@ -11,7 +11,7 @@ from allatom_design.data.datasets.atomworks_sd_dataset import (
     add_cluster_balanced_sampling_weights,
     build_interface_df,
 )
-from allatom_design.data.transform.custom_transforms import annotate_ligand_pockets
+from allatom_design.data.transform.custom_transforms import annotate_ligand_pockets, annotate_ligand_pockets_calpha
 from atomworks.ml.transforms.atom_array import apply_and_spread_residue_wise
 
 
@@ -243,6 +243,7 @@ def _protein_atom_array(res_names):
     pn_unit_iid = []
     is_polymer = []
     is_covalent_modification = []
+    atomize = []
 
     for i, rn in enumerate(res_names, start=1):
         base_x = float(i - 1) * 6.0
@@ -258,6 +259,7 @@ def _protein_atom_array(res_names):
             pn_unit_iid.append("A_1")
             is_polymer.append(True)
             is_covalent_modification.append(False)
+            atomize.append(False)
 
     coords.append([0.2, 0.0, 0.0])
     res_id.append(1)
@@ -270,13 +272,14 @@ def _protein_atom_array(res_names):
     pn_unit_iid.append("B_1")
     is_polymer.append(False)
     is_covalent_modification.append(False)
+    atomize.append(False)
 
     arr.coord = np.array(coords, dtype=float)
     arr.res_id = np.array(res_id)
     arr.res_name = np.array(res_name, dtype=object)
     arr.atom_name = np.array(atom_name, dtype=object)
     arr.hetero = np.array(hetero, dtype=bool)
-    arr.occupancy = np.array(occupancy, dtype=float)
+    arr.set_annotation("occupancy", np.array(occupancy, dtype=float))
     arr.chain_id = np.array(chain_id, dtype=object)
     arr.set_annotation("chain_type", np.array(chain_type, dtype=object))
     arr.set_annotation("pn_unit_iid", np.array(pn_unit_iid, dtype=object))
@@ -285,6 +288,7 @@ def _protein_atom_array(res_names):
         "is_covalent_modification",
         np.array(is_covalent_modification, dtype=bool),
     )
+    arr.set_annotation("atomize", np.array(atomize, dtype=bool))
     return arr
 
 
@@ -316,3 +320,86 @@ def test_mg_single_atom_pocket_annotation_uses_n_min_ligand_atoms():
     )
     assert int(default_residue_mask.sum()) == 0
     assert int(mg_residue_mask[mg_annotated.atom_name == "CA"].sum()) == 1
+
+
+def test_calpha_pocket_annotation_marks_near_ca_residue():
+    atom_array = _protein_atom_array(["ALA", "GLY"])
+
+    annotated = annotate_ligand_pockets_calpha(
+        atom_array.copy(),
+        pocket_distance=5.0,
+        n_min_ligand_atoms=1,
+        annotation_name="is_ligand_pocket_ca",
+    )
+
+    ca_mask = annotated.atom_name == "CA"
+    assert annotated.get_annotation("is_ligand_pocket_ca")[ca_mask].tolist() == [True, False]
+
+
+def test_calpha_pocket_annotation_does_not_cross_same_res_id_chains():
+    atom_names = ["N", "CA", "C", "O"]
+    coords = []
+    res_id = []
+    res_name = []
+    atom_name = []
+    chain_type = []
+    hetero = []
+    occupancy = []
+    chain_id = []
+    pn_unit_iid = []
+    is_polymer = []
+    is_covalent_modification = []
+    atomize = []
+
+    for chain, iid, base_x in [("A", "A_1", 0.0), ("C", "C_1", 100.0)]:
+        for atom_idx, an in enumerate(atom_names):
+            coords.append([base_x + atom_idx * 0.1, 0.0, 0.0])
+            res_id.append(1)
+            res_name.append("ALA")
+            atom_name.append(an)
+            chain_type.append(aw_enums.ChainType.POLYPEPTIDE_L)
+            hetero.append(False)
+            occupancy.append(1.0)
+            chain_id.append(chain)
+            pn_unit_iid.append(iid)
+            is_polymer.append(True)
+            is_covalent_modification.append(False)
+            atomize.append(False)
+
+    coords.append([0.1, 0.0, 0.0])
+    res_id.append(1)
+    res_name.append("MG")
+    atom_name.append("MG")
+    chain_type.append(aw_enums.ChainType.NON_POLYMER)
+    hetero.append(True)
+    occupancy.append(1.0)
+    chain_id.append("B")
+    pn_unit_iid.append("B_1")
+    is_polymer.append(False)
+    is_covalent_modification.append(False)
+    atomize.append(False)
+
+    expanded = AtomArray(len(coords))
+    expanded.coord = np.array(coords, dtype=float)
+    expanded.res_id = np.array(res_id)
+    expanded.res_name = np.array(res_name, dtype=object)
+    expanded.atom_name = np.array(atom_name, dtype=object)
+    expanded.hetero = np.array(hetero, dtype=bool)
+    expanded.set_annotation("occupancy", np.array(occupancy, dtype=float))
+    expanded.chain_id = np.array(chain_id, dtype=object)
+    expanded.set_annotation("chain_type", np.array(chain_type, dtype=object))
+    expanded.set_annotation("pn_unit_iid", np.array(pn_unit_iid, dtype=object))
+    expanded.set_annotation("is_polymer", np.array(is_polymer, dtype=bool))
+    expanded.set_annotation("is_covalent_modification", np.array(is_covalent_modification, dtype=bool))
+    expanded.set_annotation("atomize", np.array(atomize, dtype=bool))
+
+    annotated = annotate_ligand_pockets_calpha(
+        expanded,
+        pocket_distance=5.0,
+        n_min_ligand_atoms=1,
+        annotation_name="is_ligand_pocket_ca",
+    )
+
+    pocket = annotated.get_annotation("is_ligand_pocket_ca")
+    assert bool(pocket[(annotated.chain_id == "A") & (annotated.atom_name == "CA")][0])
+    assert not bool(pocket[(annotated.chain_id == "C") & (annotated.atom_name == "CA")][0])

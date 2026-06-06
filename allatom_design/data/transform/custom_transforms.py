@@ -208,7 +208,7 @@ class FeaturizeCoordsAndMasks(Transform):
         feats["atom_is_ligand_pocket"] = torch.tensor(atom_array.is_ligand_pocket).float()
         feats["token_is_ligand_pocket"] = torch.tensor(apply_token_wise(atom_array, atom_array.is_ligand_pocket, np.any)).float()
 
-        # pocket_rbf_mask (pseudo-CB based pocket annotation for pocket-aware RBF)
+        # pocket_rbf_mask (C-alpha based pocket annotation for pocket-aware RBF)
         if hasattr(atom_array, "is_pocket_rbf"):
             feats["pocket_rbf_mask"] = torch.tensor(apply_token_wise(atom_array, atom_array.is_pocket_rbf, np.any)).float()
         else:
@@ -674,22 +674,21 @@ class AnnotateLigandPockets(Transform):
         return data
     
 
-def annotate_ligand_pockets_pseudocb(
+def annotate_ligand_pockets_calpha(
     atom_array: AtomArray,
     pocket_distance: float = 5.0,
     n_min_ligand_atoms: int = 5,
-    annotation_name: str = "is_pocket_rbf",
+    annotation_name: str = "is_ligand_pocket",
     receptor_pn_unit_iids: list[str] = None,
     ligand_pn_unit_iids: list[str] = None,
 ) -> AtomArray:
     """
-    Identify protein residues whose pseudo-CB is within pocket_distance of any ligand atom.
+    Identify protein residues whose C-alpha is within pocket_distance of any ligand atom.
     Uses un-noised coordinates from atom_array.coord (original structure).
-    
+
     Unlike annotate_ligand_pockets which uses all-atom distances, this function
-    uses a single pseudo-CB representative point per residue, making it slightly
-    more conservative (fewer residues marked as pocket at the same distance).
-    
+    uses a single C-alpha representative point per residue.
+
     Args:
         atom_array: Input structure with original (un-noised) coordinates
         pocket_distance: Distance threshold for pocket identification (Angstroms)
@@ -721,75 +720,50 @@ def annotate_ligand_pockets_pseudocb(
     if len(valid_ligand_pn_unit_iids) == 0:
         atom_array.set_annotation(annotation_name, pocket_annotation)
         return atom_array
-    
-    # --- Compute pseudo-CB from un-noised backbone coords ---
-    # Get standard AA protein atoms with all backbone resolved
+
+    # Get standard protein residues represented by resolved C-alpha atoms.
     is_atomized = atom_array.atomize
     if hasattr(atom_array, "atom_is_protein_chain"):        
         standard_aa_prot_mask = ~is_atomized & atom_array.atom_is_protein_chain
     else:   
         standard_aa_prot_mask = ~is_atomized & (atom_array.chain_type == aw_enums.ChainType.POLYPEPTIDE_L)
-    
-    is_ncaco_resolved = (
-        np.isin(atom_array.atom_name, ["N", "CA", "C", "O"]) & 
-        (atom_array.occupancy > 0)
-    ) #! OXT is deleted in preprocessing
-    
-    has_all_backbone = apply_and_spread_token_wise(
-        atom_array, is_ncaco_resolved, lambda x: np.sum(x) == 4
-    )
-    valid_residue_mask = standard_aa_prot_mask & has_all_backbone
-    
-    # Extract backbone coords for valid residues
-    ca_mask = valid_residue_mask & (atom_array.atom_name == "CA")
-    n_mask = valid_residue_mask & (atom_array.atom_name == "N")
-    c_mask = valid_residue_mask & (atom_array.atom_name == "C")
-    
+
+    ca_mask = standard_aa_prot_mask & (atom_array.atom_name == "CA") & (atom_array.occupancy > 0)
     if ca_mask.sum() == 0:
         atom_array.set_annotation(annotation_name, pocket_annotation)
         return atom_array
-    
+
     ca_coords = atom_array.coord[ca_mask]  # un-noised
-    n_coords = atom_array.coord[n_mask]
-    c_coords = atom_array.coord[c_mask]
-    
-    # Compute pseudo-CB: same formula as GetNCACOAndPseudoCBCoords
-    b = ca_coords - n_coords
-    c_vec = c_coords - ca_coords
-    a = np.cross(b, c_vec)
-    pseudo_cb_coords = -0.58273431 * a + 0.56802827 * b - 0.54067466 * c_vec + ca_coords
-    
-    # Residue IDs for each pseudo-CB   
-    res_ids_for_cb = atom_array.res_id[ca_mask]
-        
-    # --- Compute distances from pseudo-CB to ligand atoms ---
+
+    # --- Compute distances from C-alpha atoms to ligand atoms ---
     all_valid_ligands_mask = np.isin(atom_array.pn_unit_iid, valid_ligand_pn_unit_iids)
     ligand_coords = atom_array.coord[all_valid_ligands_mask]
-    
+
     # Filter out NaN coordinates
     valid_ligand_coords_mask = ~np.isnan(ligand_coords).any(axis=1)
     ligand_coords = ligand_coords[valid_ligand_coords_mask]
-    
-    valid_cb_coords_mask = ~np.isnan(pseudo_cb_coords).any(axis=1)
-    
-    if len(ligand_coords) == 0 or valid_cb_coords_mask.sum() == 0:
+
+    valid_ca_coords_mask = ~np.isnan(ca_coords).any(axis=1)
+
+    if len(ligand_coords) == 0 or valid_ca_coords_mask.sum() == 0:
         atom_array.set_annotation(annotation_name, pocket_annotation)
         return atom_array
-    
+
     # Use CellList for efficient distance computation
     cell_list = struc.CellList(ligand_coords, cell_size=pocket_distance)
-    
-    # For each valid pseudo-CB, check if any ligand atom is within distance
-    valid_cb_indices = np.where(valid_cb_coords_mask)[0]
-    valid_cb_points = pseudo_cb_coords[valid_cb_indices]
-    
-    distance_mask = cell_list.get_atoms(valid_cb_points, pocket_distance, as_mask=True)
-    near_ligand = np.any(distance_mask, axis=1)  # [num_valid_cb]
-    
-    # Map back: mark all atoms in pocket residues
-    pocket_res_ids = res_ids_for_cb[valid_cb_indices[near_ligand]]
-    pocket_annotation = np.isin(atom_array.res_id, pocket_res_ids)
-    
+
+    # For each valid C-alpha, check if any ligand atom is within distance.
+    valid_ca_indices = np.where(valid_ca_coords_mask)[0]
+    valid_ca_points = ca_coords[valid_ca_indices]
+
+    distance_mask = cell_list.get_atoms(valid_ca_points, pocket_distance, as_mask=True)
+    near_ligand = np.any(distance_mask, axis=1)  # [num_valid_ca]
+
+    ca_indices = np.where(ca_mask)[0]
+    pocket_ca_annotation = np.zeros(len(atom_array), dtype=bool)
+    pocket_ca_annotation[ca_indices[valid_ca_indices[near_ligand]]] = True
+    pocket_annotation = apply_and_spread_token_wise(atom_array, pocket_ca_annotation, np.any)
+
     # Only atoms in protein chains can be pocket atoms
     if hasattr(atom_array, "atom_is_protein_chain"):        
         pocket_annotation = pocket_annotation & atom_array.atom_is_protein_chain
@@ -800,10 +774,10 @@ def annotate_ligand_pockets_pseudocb(
     return atom_array
 
 
-class AnnotateLigandPocketsPseudoCB(Transform):
-    """Identify protein residues whose pseudo-CB is near ligand atoms.
-    
-    Uses un-noised pseudo-CB coordinates for pocket definition.
+class AnnotateLigandPocketsCAlpha(Transform):
+    """Identify protein residues whose C-alpha is near ligand atoms.
+
+    Uses un-noised C-alpha coordinates for pocket definition.
     Designed for pocket-aware RBF features in the protein graph.
     """
 
@@ -811,7 +785,7 @@ class AnnotateLigandPocketsPseudoCB(Transform):
         self, 
         pocket_distance: float = 5.0, 
         n_min_ligand_atoms: int = 5, 
-        annotation_name: str = "is_pocket_rbf",
+        annotation_name: str = "is_ligand_pocket",
     ):
         self.pocket_distance = pocket_distance
         self.n_min_ligand_atoms = n_min_ligand_atoms
@@ -827,7 +801,7 @@ class AnnotateLigandPocketsPseudoCB(Transform):
                 receptor_pn_unit_iids: list[str] = None, 
                 ligand_pn_unit_iids: list[str] = None,
             ) -> dict:
-        data["atom_array"] = annotate_ligand_pockets_pseudocb(
+        data["atom_array"] = annotate_ligand_pockets_calpha(
             atom_array=data["atom_array"],
             pocket_distance=self.pocket_distance,
             n_min_ligand_atoms=self.n_min_ligand_atoms,

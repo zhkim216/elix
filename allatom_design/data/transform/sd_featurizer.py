@@ -53,7 +53,7 @@ from allatom_design.data.transform.custom_transforms import (
     ErrIfAllUnresolved,
     AddCachedResidueData,
     AnnotateLigandPockets,
-    AnnotateLigandPocketsPseudoCB,
+    AnnotateLigandPocketsCAlpha,
     GetNCACOAndPseudoCBCoords,
     AddTrainingRandomNoise,
     AddDataCategory,
@@ -106,7 +106,7 @@ def sd_featurizer(
     # For pocket annotation
     pocket_distance: float = 8.0,
     pocket_n_min_ligand_atoms: int = 1,
-    # For pocket-aware RBF (pseudo-CB based pocket annotation)
+    # For pocket-aware RBF (C-alpha based pocket annotation)
     use_pocket_rbf: bool = False,
     pocket_rbf_distance: float = 5.0,  # e.g. 3.5, 4.5, 5.5
     pocket_rbf_n_min_ligand_atoms: int = 1,
@@ -201,7 +201,7 @@ def sd_featurizer(
             pocket_distance=pocket_distance,
             n_min_ligand_atoms=pocket_n_min_ligand_atoms,
         ),
-        AnnotateLigandPocketsPseudoCB(
+        AnnotateLigandPocketsCAlpha(
             pocket_distance=pocket_rbf_distance,
             n_min_ligand_atoms=pocket_rbf_n_min_ligand_atoms,
         ) if use_pocket_rbf else Identity(),
@@ -260,7 +260,7 @@ def sd_featurizer_for_design(
     # For pocket annotation
     pocket_distance: float = 8.0,
     pocket_n_min_ligand_atoms: int = 1,
-    # For pocket-aware RBF (pseudo-CB based pocket annotation)
+    # For pocket-aware RBF (C-alpha based pocket annotation)
     use_pocket_rbf: bool = False,
     pocket_rbf_distance: float = 5.0,  # e.g. 3.5, 4.5, 5.5
     pocket_rbf_n_min_ligand_atoms: int = 1,
@@ -317,7 +317,7 @@ def sd_featurizer_for_design(
             pocket_distance=pocket_distance,
             n_min_ligand_atoms=pocket_n_min_ligand_atoms,
         ),
-        AnnotateLigandPocketsPseudoCB(
+        AnnotateLigandPocketsCAlpha(
             pocket_distance=pocket_rbf_distance,
             n_min_ligand_atoms=pocket_rbf_n_min_ligand_atoms,
         ) if use_pocket_rbf else Identity(),

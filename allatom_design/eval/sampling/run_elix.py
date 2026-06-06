@@ -244,8 +244,8 @@ def _run_two_stage_elix(
         stage1_guidance_cfg=stage1_design_cfg.sampling_cfg.get("guidance", None),
         stage2_guidance_cfg=stage2_design_cfg.sampling_cfg.get("guidance", None),
         pocket_distance=two_stage_cfg.get("pocket_distance", 5.0),
-        use_pseudocb_for_pocket_annotation=two_stage_cfg.get(
-            "use_pseudocb_for_pocket_annotation",
+        use_calpha_for_pocket_annotation=two_stage_cfg.get(
+            "use_calpha_for_pocket_annotation",
             False,
         ),
     )

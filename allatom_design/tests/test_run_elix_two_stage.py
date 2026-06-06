@@ -135,7 +135,7 @@ def test_build_stage2_inputs_and_constraints_uses_stage1_sample_ids(monkeypatch)
             stage2_constraint_type="pocket",
             stage1_model_label="pocket",
             pocket_distance=5.0,
-            use_pseudocb_for_pocket_annotation=False,
+            use_calpha_for_pocket_annotation=False,
         )
     )
 
