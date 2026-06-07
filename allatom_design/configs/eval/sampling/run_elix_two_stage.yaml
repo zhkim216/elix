@@ -6,6 +6,7 @@ two_stage:
   enabled: true
   direction: ps
   pocket_distance: 5.0
+  pocket_annotation_method: null
   use_calpha_for_pocket_annotation: false
   pocket:
     label: pocket

@@ -5,7 +5,10 @@ import pandas as pd
 from omegaconf import DictConfig
 
 from allatom_design.eval.utils.cfg_utils import get_stage2_potts_only_cond
-from allatom_design.eval.utils.constraint_utils import create_pos_constraint_dict_from_pocket
+from allatom_design.eval.utils.constraint_utils import (
+    create_pos_constraint_dict_from_pocket,
+    resolve_pocket_annotation_method,
+)
 from allatom_design.eval.utils.eval_setup_utils import ckpt_label
 from allatom_design.eval.utils.design_sequence import iter_design_sequence_per_checkpoint
 
@@ -20,6 +23,7 @@ def _build_stage2_inputs_and_constraints(
     stage2_constraint_type: str,
     stage1_model_label: str,
     pocket_distance: float,
+    pocket_annotation_method: str | None,
     use_calpha_for_pocket_annotation: bool,
 ) -> tuple[dict, pd.DataFrame, dict[str, dict[str, Any]]]:
     stage2_sample_dict: dict[str, dict[str, Any]] = {}
@@ -46,6 +50,7 @@ def _build_stage2_inputs_and_constraints(
                 atom_array=stage1_atom_array,
                 pocket_distance=pocket_distance,
                 constraint_type=stage2_constraint_type,
+                pocket_annotation_method=pocket_annotation_method,
                 use_calpha_for_pocket_annotation=use_calpha_for_pocket_annotation,
                 sample_path=stage1_sample_path,
                 return_ligand_mpnn_format=False,
@@ -71,6 +76,7 @@ def _build_stage2_inputs_and_constraints(
                 "stage1_sample_seq": stage1_sample_seq,
                 "fixed_region": stage2_constraint_type,
                 "pocket_distance": pocket_distance,
+                "pocket_annotation_method": pocket_annotation_method,
             }
 
     if len(stage2_sample_dict) == 0:
@@ -155,6 +161,7 @@ def design_sequence_two_stage(
     stage1_guidance_cfg: DictConfig | None = None,
     stage2_guidance_cfg: DictConfig | None = None,
     pocket_distance: float = 5.0,
+    pocket_annotation_method: str | None = None,
     use_calpha_for_pocket_annotation: bool = False,
 ) -> Iterator[tuple[dict, Path, dict, list[dict[str, Any]]]]:
     if sample_dict is None:
@@ -165,6 +172,10 @@ def design_sequence_two_stage(
         raise ValueError("stage2_design_cfg must be provided")
     if log_dir is None:
         raise ValueError("log_dir must be provided")
+    pocket_annotation_method = resolve_pocket_annotation_method(
+        pocket_annotation_method=pocket_annotation_method,
+        use_calpha_for_pocket_annotation=use_calpha_for_pocket_annotation,
+    )
 
     stage1_log_dir = log_dir / direction / f"stage1_{stage1_region}" / stage1_model_label
     stage1_iter = iter_design_sequence_per_checkpoint(
@@ -198,6 +209,7 @@ def design_sequence_two_stage(
                 stage2_constraint_type=stage2_constraint_type,
                 stage1_model_label=stage1_model_label,
                 pocket_distance=pocket_distance,
+                pocket_annotation_method=pocket_annotation_method,
                 use_calpha_for_pocket_annotation=use_calpha_for_pocket_annotation,
             )
         )

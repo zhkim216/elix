@@ -85,13 +85,23 @@ SAMPLING_INDICES="[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23
 SAMPLING_LENGTHS="[150,250]"
 POCKET_DISTANCE=8.0
 POCKET_DISTANCES_FOR_SEQ_RECOVERY="[6.0,8.0,10.0]"
+POCKET_ANNOTATION_METHOD="${POCKET_ANNOTATION_METHOD:-calpha}"
 USE_CALPHA_FOR_POCKET_ANNOTATION="${USE_CALPHA_FOR_POCKET_ANNOTATION:-true}"
 AF3_RECYCLES=10
 AF3_DIFFUSION_SAMPLES=5
 
+case "${POCKET_ANNOTATION_METHOD}" in
+  calpha|pseudocb|all_atom) ;;
+  *) echo "Invalid POCKET_ANNOTATION_METHOD=${POCKET_ANNOTATION_METHOD}; expected calpha, pseudocb, or all_atom" >&2; exit 2 ;;
+esac
+
 POCKET_DENOISER_TRAIN_DIR=/scratch/users/zhkim216/out_dir/ligand_seq_des/${POCKET_MODEL_NAME}
 SCAFFOLD_DENOISER_TRAIN_DIR=/scratch/users/zhkim216/out_dir/ligand_seq_des/${SCAFFOLD_MODEL_NAME}
-EXP_NAME=${POCKET_MODEL_NAME}_pocket_${SCAFFOLD_MODEL_NAME}_scaffold_${VALSET_NAME}_twostage_${DIRECTION}_${POTTS_ONLY_COND_LABEL}_nsample${NUM_SAMPLES}_pseqs${NUM_POCKET_SEQS_PER_PDB}_sseqs${NUM_SCAFFOLD_SEQS_PER_PDB}
+POCKET_ANNOTATION_METHOD_LABEL=""
+if [[ "${POCKET_ANNOTATION_METHOD}" != "calpha" ]]; then
+  POCKET_ANNOTATION_METHOD_LABEL="_pocketann_${POCKET_ANNOTATION_METHOD}"
+fi
+EXP_NAME=${POCKET_MODEL_NAME}_pocket_${SCAFFOLD_MODEL_NAME}_scaffold_${VALSET_NAME}_twostage_${DIRECTION}_${POTTS_ONLY_COND_LABEL}_nsample${NUM_SAMPLES}_pseqs${NUM_POCKET_SEQS_PER_PDB}_sseqs${NUM_SCAFFOLD_SEQS_PER_PDB}${POCKET_ANNOTATION_METHOD_LABEL}
 HYDRA_DIR=${HYDRA_ROOT}/${EXP_NAME}
 
 mkdir -p /scratch/users/zhkim216/job_output/eval_ligand_seq_des "${HYDRA_DIR}" "${BASE_OUT_DIR}"
@@ -123,7 +133,7 @@ echo "Stage1 pocket: model=${POCKET_MODEL_NAME}, step=${STEP}"
 echo "Stage2 scaffold: model=${SCAFFOLD_MODEL_NAME}, step=${STEP}, potts_only_cond=${STAGE2_POTTS_ONLY_COND}"
 echo "Stage sampling counts: pocket=${NUM_POCKET_SEQS_PER_PDB}, scaffold=${NUM_SCAFFOLD_SEQS_PER_PDB}"
 echo "Filters: STEP_FILTER=${STEP_FILTER}, POTTS_ONLY_COND_FILTER=${POTTS_ONLY_COND_FILTER}"
-echo "Pocket distance=${POCKET_DISTANCE}, use_calpha_for_pocket_annotation=${USE_CALPHA_FOR_POCKET_ANNOTATION}"
+echo "Pocket distance=${POCKET_DISTANCE}, pocket_annotation_method=${POCKET_ANNOTATION_METHOD}"
 echo "GPU compute capability: ${COMPUTE_CAP}, using flash_attention_implementation=${FLASH_ATTN_IMPL}"
 echo "PDB_DIR=${PDB_DIR}"
 echo "PDB_NAME_LIST=${PDB_NAME_LIST}"
@@ -163,6 +173,7 @@ WANDB__SERVICE_WAIT=300 python3 allatom_design/eval/sampling/run_elix.py \
     sampling_cfg.guidance.enabled=false \
     two_stage.direction=${DIRECTION} \
     two_stage.pocket_distance=${POCKET_DISTANCE} \
+    two_stage.pocket_annotation_method=${POCKET_ANNOTATION_METHOD} \
     two_stage.use_calpha_for_pocket_annotation=${USE_CALPHA_FOR_POCKET_ANNOTATION} \
     two_stage.pocket.label=${POCKET_MODEL_NAME}_pocket \
     two_stage.pocket.model_cfg.model_name=elix_mpnn \

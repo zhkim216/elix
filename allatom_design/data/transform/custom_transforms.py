@@ -774,6 +774,112 @@ def annotate_ligand_pockets_calpha(
     return atom_array
 
 
+def annotate_ligand_pockets_pseudocb(
+    atom_array: AtomArray,
+    pocket_distance: float = 5.0,
+    n_min_ligand_atoms: int = 5,
+    annotation_name: str = "is_pocket_rbf",
+    receptor_pn_unit_iids: list[str] = None,
+    ligand_pn_unit_iids: list[str] = None,
+) -> AtomArray:
+    """
+    Identify protein residues whose pseudo-CB is within pocket_distance of any ligand atom.
+    Uses un-noised coordinates from atom_array.coord (original structure).
+
+    Unlike annotate_ligand_pockets which uses all-atom distances, this function
+    uses a single pseudo-CB representative point per residue.
+    """
+
+    assert hasattr(atom_array, "pn_unit_iid"), "atom_array must have pn_unit_iid"
+
+    if (receptor_pn_unit_iids is None) or (ligand_pn_unit_iids is None):
+        ligand_mask = (~atom_array.is_covalent_modification) & (~atom_array.is_polymer)
+        ligand_pn_unit_iids, ligand_counts = np.unique(
+            atom_array.pn_unit_iid[ligand_mask], return_counts=True
+        )
+        valid_ligand_mask = ligand_counts >= n_min_ligand_atoms
+        valid_ligand_pn_unit_iids = ligand_pn_unit_iids[valid_ligand_mask]
+    else:
+        ligand_pn_unit_iids, ligand_counts = np.unique(
+            atom_array.pn_unit_iid[np.isin(atom_array.pn_unit_iid, ligand_pn_unit_iids)],
+            return_counts=True,
+        )
+        valid_ligand_mask = ligand_counts >= n_min_ligand_atoms
+        valid_ligand_pn_unit_iids = ligand_pn_unit_iids[valid_ligand_mask]
+
+    pocket_annotation = np.zeros(len(atom_array), dtype=bool)
+
+    if len(valid_ligand_pn_unit_iids) == 0:
+        atom_array.set_annotation(annotation_name, pocket_annotation)
+        return atom_array
+
+    is_atomized = atom_array.atomize
+    if hasattr(atom_array, "atom_is_protein_chain"):
+        standard_aa_prot_mask = ~is_atomized & atom_array.atom_is_protein_chain
+    else:
+        standard_aa_prot_mask = ~is_atomized & (
+            atom_array.chain_type == aw_enums.ChainType.POLYPEPTIDE_L
+        )
+
+    is_ncaco_resolved = (
+        np.isin(atom_array.atom_name, ["N", "CA", "C", "O"])
+        & (atom_array.occupancy > 0)
+    )
+    has_all_backbone = apply_and_spread_token_wise(
+        atom_array, is_ncaco_resolved, lambda x: np.sum(x) == 4
+    )
+    valid_residue_mask = standard_aa_prot_mask & has_all_backbone
+
+    ca_mask = valid_residue_mask & (atom_array.atom_name == "CA")
+    n_mask = valid_residue_mask & (atom_array.atom_name == "N")
+    c_mask = valid_residue_mask & (atom_array.atom_name == "C")
+
+    if ca_mask.sum() == 0:
+        atom_array.set_annotation(annotation_name, pocket_annotation)
+        return atom_array
+
+    ca_coords = atom_array.coord[ca_mask]
+    n_coords = atom_array.coord[n_mask]
+    c_coords = atom_array.coord[c_mask]
+
+    b = ca_coords - n_coords
+    c_vec = c_coords - ca_coords
+    a = np.cross(b, c_vec)
+    pseudo_cb_coords = -0.58273431 * a + 0.56802827 * b - 0.54067466 * c_vec + ca_coords
+
+    all_valid_ligands_mask = np.isin(atom_array.pn_unit_iid, valid_ligand_pn_unit_iids)
+    ligand_coords = atom_array.coord[all_valid_ligands_mask]
+    ligand_coords = ligand_coords[~np.isnan(ligand_coords).any(axis=1)]
+
+    valid_cb_coords_mask = ~np.isnan(pseudo_cb_coords).any(axis=1)
+
+    if len(ligand_coords) == 0 or valid_cb_coords_mask.sum() == 0:
+        atom_array.set_annotation(annotation_name, pocket_annotation)
+        return atom_array
+
+    cell_list = struc.CellList(ligand_coords, cell_size=pocket_distance)
+    valid_cb_indices = np.where(valid_cb_coords_mask)[0]
+    valid_cb_points = pseudo_cb_coords[valid_cb_indices]
+
+    distance_mask = cell_list.get_atoms(valid_cb_points, pocket_distance, as_mask=True)
+    near_ligand = np.any(distance_mask, axis=1)
+
+    ca_indices = np.where(ca_mask)[0]
+    pocket_cb_annotation = np.zeros(len(atom_array), dtype=bool)
+    pocket_cb_annotation[ca_indices[valid_cb_indices[near_ligand]]] = True
+    pocket_annotation = apply_and_spread_token_wise(atom_array, pocket_cb_annotation, np.any)
+
+    if hasattr(atom_array, "atom_is_protein_chain"):
+        pocket_annotation = pocket_annotation & atom_array.atom_is_protein_chain
+    else:
+        pocket_annotation = pocket_annotation & (
+            atom_array.chain_type == aw_enums.ChainType.POLYPEPTIDE_L
+        )
+
+    atom_array.set_annotation(annotation_name, pocket_annotation)
+    return atom_array
+
+
 class AnnotateLigandPocketsCAlpha(Transform):
     """Identify protein residues whose C-alpha is near ligand atoms.
 

@@ -14,6 +14,7 @@ from allatom_design.eval.utils.folding_utils import (
 from allatom_design.eval.utils.data_utils import prepare_sample_dict
 from allatom_design.eval.utils.misc import print_phase, load_optional_csv
 from allatom_design.eval.utils.cfg_utils import resolve_input_cfgs
+from allatom_design.eval.utils.constraint_utils import resolve_pocket_annotation_method
 from allatom_design.eval.utils.design_sequence import iter_design_sequence_per_checkpoint
 from allatom_design.eval.utils.design_sequence_two_stage import design_sequence_two_stage
 
@@ -211,6 +212,13 @@ def _run_two_stage_elix(
     stage2_design_cfg = _copy_stage_design_cfg(cfg, stage2_cfg, stage2_token_prefix)
 
     stage1_cif_parse_cfg, stage1_preprocess_cfg = resolve_input_cfgs(cfg)
+    pocket_annotation_method = resolve_pocket_annotation_method(
+        pocket_annotation_method=two_stage_cfg.get("pocket_annotation_method", None),
+        use_calpha_for_pocket_annotation=two_stage_cfg.get(
+            "use_calpha_for_pocket_annotation",
+            False,
+        ),
+    )
 
     print_phase("Phase 2: Two-stage sequence design")
     ckpt_iter = design_sequence_two_stage(
@@ -244,6 +252,7 @@ def _run_two_stage_elix(
         stage1_guidance_cfg=stage1_design_cfg.sampling_cfg.get("guidance", None),
         stage2_guidance_cfg=stage2_design_cfg.sampling_cfg.get("guidance", None),
         pocket_distance=two_stage_cfg.get("pocket_distance", 5.0),
+        pocket_annotation_method=pocket_annotation_method,
         use_calpha_for_pocket_annotation=two_stage_cfg.get(
             "use_calpha_for_pocket_annotation",
             False,

@@ -61,6 +61,7 @@ two_stage:
   enabled: false
   direction: ps  # ps: pocket -> scaffold; sp: scaffold -> pocket
   pocket_distance: 5.0
+  pocket_annotation_method: null  # null uses use_calpha_for_pocket_annotation; otherwise calpha, pseudocb, or all_atom
   use_calpha_for_pocket_annotation: false
   pocket:
     label: null

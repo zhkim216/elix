@@ -2,27 +2,31 @@
 # Submit from Sherlock:
 #   PROJECT_ROOT=/home/users/zhkim216/code/elix \
 #     bash scripts/sherlock_scripts/jinho/setup/wrap_sbatch_in_container_elix.sh \
-#     scripts/sherlock_scripts/jinho/eval/denovoval/eval_proto_exp5_metal_ions_two_stage.sbatch
-#SBATCH --job-name=eval_proto_exp5_ts_metals
+#     scripts/sherlock_scripts/jinho/eval/denovoval/eval_proto_exp5_metal_ions_two_stage_re.sbatch
+#SBATCH --job-name=eval_proto_exp5_ts_re_metals
 #SBATCH -p possu,bioe
-#SBATCH --array=0-59
+#SBATCH --array=0-179
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 #SBATCH --time=4:00:00
-#SBATCH --output=/scratch/users/zhkim216/job_output/eval_ligand_seq_des/run_elix_denovoval_metals_twostage_%A_%a.out
-#SBATCH --error=/scratch/users/zhkim216/job_output/eval_ligand_seq_des/run_elix_denovoval_metals_twostage_%A_%a.err
+#SBATCH --output=/scratch/users/zhkim216/job_output/eval_ligand_seq_des/run_elix_denovoval_metals_twostage_re_%A_%a.out
+#SBATCH --error=/scratch/users/zhkim216/job_output/eval_ligand_seq_des/run_elix_denovoval_metals_twostage_re_%A_%a.err
 
 set -euo pipefail
 
 STEP_FILTER="${STEP_FILTER:-all}"
 POCKET_MODEL_FILTER="${POCKET_MODEL_FILTER:-all}"
+POCKET_DISTANCE_FILTER="${POCKET_DISTANCE_FILTER:-all}"
+POCKET_ANNOTATION_METHOD_FILTER="${POCKET_ANNOTATION_METHOD_FILTER:-all}"
 TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-8}"
 
 # Stage1 pocket model is swept over the configs below; stage2 scaffold is fixed.
-POCKET_MODEL_NAMES=(proto_exp5_cfg0 proto_exp5_cfg1 proto_exp5_cfg2 proto_exp5_cfg3 proto_exp5_cfg4 proto_exp5_cfg5)
+POCKET_MODEL_NAMES=(proto_exp5_cfg0 proto_exp5_cfg1 proto_exp5_cfg2)
 POCKET_STEPS=(22500 42500 62500 82500 102500)
+POCKET_DISTANCES=(6.0 8.0 10.0)
+POCKET_ANNOTATION_METHODS=(calpha pseudocb)
 SCAFFOLD_MODEL_NAME=proto_exp5_cfg7
 SCAFFOLD_STEP=42500
 DIRECTION=ps
@@ -33,6 +37,8 @@ STAGE2_POTTS_ONLY_COND=true
 print_valid_filters() {
   echo "Valid STEP_FILTER values: all ${POCKET_STEPS[*]}" >&2
   echo "Valid POCKET_MODEL_FILTER values: all ${POCKET_MODEL_NAMES[*]}" >&2
+  echo "Valid POCKET_DISTANCE_FILTER values: all ${POCKET_DISTANCES[*]}" >&2
+  echo "Valid POCKET_ANNOTATION_METHOD_FILTER values: all ${POCKET_ANNOTATION_METHODS[*]}" >&2
 }
 
 COMBOS=()
@@ -44,13 +50,23 @@ for CANDIDATE_POCKET_MODEL in "${POCKET_MODEL_NAMES[@]}"; do
     if [[ "${STEP_FILTER}" != "all" && "${STEP_FILTER}" != "${CANDIDATE_POCKET_STEP}" ]]; then
       continue
     fi
-    COMBOS+=("${CANDIDATE_POCKET_MODEL}:${CANDIDATE_POCKET_STEP}")
+    for CANDIDATE_POCKET_DISTANCE in "${POCKET_DISTANCES[@]}"; do
+      if [[ "${POCKET_DISTANCE_FILTER}" != "all" && "${POCKET_DISTANCE_FILTER}" != "${CANDIDATE_POCKET_DISTANCE}" ]]; then
+        continue
+      fi
+      for CANDIDATE_POCKET_ANNOTATION_METHOD in "${POCKET_ANNOTATION_METHODS[@]}"; do
+        if [[ "${POCKET_ANNOTATION_METHOD_FILTER}" != "all" && "${POCKET_ANNOTATION_METHOD_FILTER}" != "${CANDIDATE_POCKET_ANNOTATION_METHOD}" ]]; then
+          continue
+        fi
+        COMBOS+=("${CANDIDATE_POCKET_MODEL}:${CANDIDATE_POCKET_STEP}:${CANDIDATE_POCKET_DISTANCE}:${CANDIDATE_POCKET_ANNOTATION_METHOD}")
+      done
+    done
   done
 done
 
 NUM_COMBOS=${#COMBOS[@]}
 if [[ "${NUM_COMBOS}" -eq 0 ]]; then
-  echo "No combinations selected by POCKET_MODEL_FILTER=${POCKET_MODEL_FILTER}, STEP_FILTER=${STEP_FILTER}." >&2
+  echo "No combinations selected by POCKET_MODEL_FILTER=${POCKET_MODEL_FILTER}, STEP_FILTER=${STEP_FILTER}, POCKET_DISTANCE_FILTER=${POCKET_DISTANCE_FILTER}, POCKET_ANNOTATION_METHOD_FILTER=${POCKET_ANNOTATION_METHOD_FILTER}." >&2
   print_valid_filters
   exit 2
 fi
@@ -66,15 +82,14 @@ fi
 COMBO_IDX=$((TASK_ID / NUM_CHUNKS))
 CHUNK_IDX=$((TASK_ID % NUM_CHUNKS))
 COMBO=${COMBOS[$COMBO_IDX]}
-POCKET_MODEL_NAME=${COMBO%%:*}
-POCKET_STEP=${COMBO##*:}
+IFS=: read -r POCKET_MODEL_NAME POCKET_STEP POCKET_DISTANCE POCKET_ANNOTATION_METHOD <<< "${COMBO}"
 POTTS_ONLY_COND_LABEL=potts_only_cond_false
 if [[ "${STAGE2_POTTS_ONLY_COND}" == "true" ]]; then
   POTTS_ONLY_COND_LABEL=potts_only_cond_true
 fi
 
 BASE_DIR="${PROJECT_ROOT:-/home/users/zhkim216/code/elix}"
-HYDRA_ROOT=/scratch/users/zhkim216/hydra_outputs/eval_proto_exp5_metal_ions_two_stage
+HYDRA_ROOT=/scratch/users/zhkim216/hydra_outputs/eval_proto_exp5_metal_ions_two_stage_re
 BASE_OUT_DIR=/scratch/users/zhkim216/out_dir/eval_ligand_seq_des
 VALSET_NAME=denovoval_metal_ions
 PDB_DIR=/scratch/users/zhkim216/datasets/val_cifs/denovoval_cifs
@@ -87,24 +102,19 @@ NUM_SCAFFOLD_SEQS_PER_PDB=1
 NUM_SAMPLES=50
 SAMPLING_INDICES="[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49]"
 SAMPLING_LENGTHS="[150,250]"
-POCKET_DISTANCE=10.0
 POCKET_DISTANCES_FOR_SEQ_RECOVERY="[6.0,8.0,10.0]"
-POCKET_ANNOTATION_METHOD="${POCKET_ANNOTATION_METHOD:-calpha}"
 AF3_RECYCLES=10
 AF3_DIFFUSION_SAMPLES=5
 
 case "${POCKET_ANNOTATION_METHOD}" in
-  calpha|pseudocb|all_atom) ;;
-  *) echo "Invalid POCKET_ANNOTATION_METHOD=${POCKET_ANNOTATION_METHOD}; expected calpha, pseudocb, or all_atom" >&2; exit 2 ;;
+  calpha|pseudocb) ;;
+  *) echo "Invalid POCKET_ANNOTATION_METHOD=${POCKET_ANNOTATION_METHOD}; expected calpha or pseudocb" >&2; exit 2 ;;
 esac
 
 POCKET_DENOISER_TRAIN_DIR=/scratch/users/zhkim216/out_dir/ligand_seq_des/${POCKET_MODEL_NAME}
 SCAFFOLD_DENOISER_TRAIN_DIR=/scratch/users/zhkim216/out_dir/ligand_seq_des/${SCAFFOLD_MODEL_NAME}
-POCKET_ANNOTATION_METHOD_LABEL=""
-if [[ "${POCKET_ANNOTATION_METHOD}" != "calpha" ]]; then
-  POCKET_ANNOTATION_METHOD_LABEL="_pocketann_${POCKET_ANNOTATION_METHOD}"
-fi
-EXP_NAME=${POCKET_MODEL_NAME}_pocket_${SCAFFOLD_MODEL_NAME}_scaffold_${VALSET_NAME}_twostage_${DIRECTION}_${POTTS_ONLY_COND_LABEL}_nsample${NUM_SAMPLES}_pseqs${NUM_POCKET_SEQS_PER_PDB}_sseqs${NUM_SCAFFOLD_SEQS_PER_PDB}${POCKET_ANNOTATION_METHOD_LABEL}
+POCKET_ANNOTATION_METHOD_LABEL="_pocketann_${POCKET_ANNOTATION_METHOD}"
+EXP_NAME=${POCKET_MODEL_NAME}_pocket_${SCAFFOLD_MODEL_NAME}_scaffold_${VALSET_NAME}_twostage_re_${DIRECTION}_${POTTS_ONLY_COND_LABEL}_pd${POCKET_DISTANCE}_nsample${NUM_SAMPLES}_pseqs${NUM_POCKET_SEQS_PER_PDB}_sseqs${NUM_SCAFFOLD_SEQS_PER_PDB}${POCKET_ANNOTATION_METHOD_LABEL}
 HYDRA_DIR=${HYDRA_ROOT}/${EXP_NAME}
 
 mkdir -p /scratch/users/zhkim216/job_output/eval_ligand_seq_des "${HYDRA_DIR}" "${BASE_OUT_DIR}"
@@ -135,7 +145,7 @@ echo "Starting two-stage denovoval metal-ion eval: task=${TASK_ID}/${NUM_TASKS},
 echo "Stage1 pocket: model=${POCKET_MODEL_NAME}, pocket_step=${POCKET_STEP}"
 echo "Stage2 scaffold: model=${SCAFFOLD_MODEL_NAME}, step=${SCAFFOLD_STEP}, potts_only_cond=${STAGE2_POTTS_ONLY_COND}"
 echo "Stage sampling counts: pocket=${NUM_POCKET_SEQS_PER_PDB}, scaffold=${NUM_SCAFFOLD_SEQS_PER_PDB}"
-echo "Filters: POCKET_MODEL_FILTER=${POCKET_MODEL_FILTER}, STEP_FILTER=${STEP_FILTER}"
+echo "Filters: POCKET_MODEL_FILTER=${POCKET_MODEL_FILTER}, STEP_FILTER=${STEP_FILTER}, POCKET_DISTANCE_FILTER=${POCKET_DISTANCE_FILTER}, POCKET_ANNOTATION_METHOD_FILTER=${POCKET_ANNOTATION_METHOD_FILTER}"
 echo "Pocket distance=${POCKET_DISTANCE}, pocket_annotation_method=${POCKET_ANNOTATION_METHOD}"
 echo "GPU compute capability: ${COMPUTE_CAP}, using flash_attention_implementation=${FLASH_ATTN_IMPL}"
 echo "PDB_DIR=${PDB_DIR}"
@@ -226,4 +236,4 @@ WANDB__SERVICE_WAIT=300 python3 allatom_design/eval/sampling/run_elix.py \
     struct_pred_cfg.af3.inference_config.ss.num_diffusion_samples=${AF3_DIFFUSION_SAMPLES} \
     hydra.run.dir=${HYDRA_DIR}
 
-echo "Evaluation complete: pocket_model=${POCKET_MODEL_NAME}, pocket_step=${POCKET_STEP}, chunk=${CHUNK_IDX}/${NUM_CHUNKS}, stage2_potts_only_cond=${STAGE2_POTTS_ONLY_COND}, pocket_seqs=${NUM_POCKET_SEQS_PER_PDB}, scaffold_seqs=${NUM_SCAFFOLD_SEQS_PER_PDB}"
+echo "Evaluation complete: pocket_model=${POCKET_MODEL_NAME}, pocket_step=${POCKET_STEP}, pocket_distance=${POCKET_DISTANCE}, pocket_annotation_method=${POCKET_ANNOTATION_METHOD}, chunk=${CHUNK_IDX}/${NUM_CHUNKS}, stage2_potts_only_cond=${STAGE2_POTTS_ONLY_COND}, pocket_seqs=${NUM_POCKET_SEQS_PER_PDB}, scaffold_seqs=${NUM_SCAFFOLD_SEQS_PER_PDB}"

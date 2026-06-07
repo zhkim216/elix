@@ -8,6 +8,7 @@ from allatom_design.eval.sampling.run_elix import (
     _stage_cfg,
     _two_stage_regions,
 )
+from allatom_design.eval.utils.constraint_utils import resolve_pocket_annotation_method
 from allatom_design.eval.utils import design_sequence as design_sequence_utils
 from allatom_design.eval.utils import design_sequence_two_stage as two_stage_utils
 
@@ -63,6 +64,14 @@ def test_stage_cfg_requires_checkpoint_source() -> None:
         _stage_cfg(cfg, "pocket")
 
 
+def test_resolve_pocket_annotation_method_prefers_enum_and_keeps_boolean_fallback() -> None:
+    assert resolve_pocket_annotation_method(None, False) == "all_atom"
+    assert resolve_pocket_annotation_method(None, True) == "calpha"
+    assert resolve_pocket_annotation_method("pseudocb", True) == "pseudocb"
+    with pytest.raises(ValueError, match="pocket_annotation_method"):
+        resolve_pocket_annotation_method("cbeta", False)
+
+
 def test_copy_stage_design_cfg_sets_sampling_prefix_and_resolves_interpolation() -> None:
     cfg = OmegaConf.create({
         "model_cfg": {"model_name": "elix_mpnn"},
@@ -96,7 +105,10 @@ def test_copy_stage_design_cfg_sets_sampling_prefix_and_resolves_interpolation()
 
 
 def test_build_stage2_inputs_and_constraints_uses_stage1_sample_ids(monkeypatch) -> None:
+    captured_kwargs = []
+
     def fake_create_pos_constraint_dict_from_pocket(**kwargs):
+        captured_kwargs.append(kwargs)
         return {
             "pdb_key": kwargs["pdb_key"],
             "fixed_pos_seq": "A1-3",
@@ -135,6 +147,7 @@ def test_build_stage2_inputs_and_constraints_uses_stage1_sample_ids(monkeypatch)
             stage2_constraint_type="pocket",
             stage1_model_label="pocket",
             pocket_distance=5.0,
+            pocket_annotation_method="pseudocb",
             use_calpha_for_pocket_annotation=False,
         )
     )
@@ -146,3 +159,5 @@ def test_build_stage2_inputs_and_constraints_uses_stage1_sample_ids(monkeypatch)
     assert pos_constraint_df["pdb_key"].tolist() == ["orig_twostage_ps_psample0"]
     assert pos_constraint_df["fixed_pos_seq"].tolist() == ["A1-3"]
     assert lineage["orig_twostage_ps_psample0"]["original_sample_id"] == "orig"
+    assert captured_kwargs[0]["pocket_annotation_method"] == "pseudocb"
+    assert lineage["orig_twostage_ps_psample0"]["pocket_annotation_method"] == "pseudocb"

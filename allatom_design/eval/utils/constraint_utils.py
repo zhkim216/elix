@@ -19,9 +19,32 @@ import atomworks.enums as aw_enums
 from atomworks.ml.transforms.filters import remove_unresolved_tokens
 
 import allatom_design.data.const as const
-from allatom_design.data.transform.custom_transforms import annotate_ligand_pockets, annotate_ligand_pockets_calpha
+from allatom_design.data.transform.custom_transforms import (
+    annotate_ligand_pockets,
+    annotate_ligand_pockets_calpha,
+    annotate_ligand_pockets_pseudocb,
+)
 from allatom_design.utils.sample_io_utils import load_example_with_parse
 from allatom_design.eval.utils.data_utils import preprocess_input
+
+POCKET_ANNOTATION_METHODS = {"all_atom", "calpha", "pseudocb"}
+
+
+def resolve_pocket_annotation_method(
+    pocket_annotation_method: str | None = None,
+    use_calpha_for_pocket_annotation: bool = False,
+) -> str:
+    if pocket_annotation_method is None:
+        return "calpha" if use_calpha_for_pocket_annotation else "all_atom"
+
+    method = str(pocket_annotation_method).lower()
+    if method not in POCKET_ANNOTATION_METHODS:
+        valid = ", ".join(sorted(POCKET_ANNOTATION_METHODS))
+        raise ValueError(
+            f"pocket_annotation_method must be one of {valid}; got {pocket_annotation_method!r}"
+        )
+    return method
+
 
 def parse_fixed_pos_info(
     batch: dict[str, TensorType["b ..."]], pos_constraint_df: pd.DataFrame | None, verbose: bool = False
@@ -452,6 +475,7 @@ def create_pos_constraint_dict_from_pocket(
     constraint_type: str = "pocket",  # "pocket" or "scaffold"
     receptor_pn_unit_iids: list[str] = None,
     ligand_pn_unit_iids: list[str] = None,
+    pocket_annotation_method: str | None = None,
     use_calpha_for_pocket_annotation: bool = False,
     sample_path: str = None,
     return_ligand_mpnn_format: bool = False,
@@ -466,6 +490,8 @@ def create_pos_constraint_dict_from_pocket(
         constraint_type: "pocket" to constrain pocket residues, "scaffold" to constrain non-pocket residues
         receptor_pn_unit_iids: List of receptor (protein) pn_unit_iids
         ligand_pn_unit_iids: List of ligand pn_unit_iids
+        pocket_annotation_method: "all_atom", "calpha", or "pseudocb". If None, uses the deprecated
+            use_calpha_for_pocket_annotation boolean for backward compatibility.
         use_calpha_for_pocket_annotation: If True, use C-alpha-to-ligand distances instead of all-atom distances
         sample_path: Path to the CIF file (required if return_ligand_mpnn_format=True)
         return_ligand_mpnn_format: If True, also include LigandMPNN CSV fields (pdb_path, chains, fixed_residues)
@@ -475,12 +501,27 @@ def create_pos_constraint_dict_from_pocket(
         If return_ligand_mpnn_format=True, also includes pdb_path, chains, fixed_residues for LigandMPNN.
     """
     # Annotate ligand pockets
-    if use_calpha_for_pocket_annotation:
+    pocket_annotation_method = resolve_pocket_annotation_method(
+        pocket_annotation_method=pocket_annotation_method,
+        use_calpha_for_pocket_annotation=use_calpha_for_pocket_annotation,
+    )
+    if pocket_annotation_method == "calpha":
         annotated_atom_array = annotate_ligand_pockets_calpha(
             atom_array=atom_array,
             pocket_distance=pocket_distance,
             n_min_ligand_atoms=1,
+            receptor_pn_unit_iids=receptor_pn_unit_iids,
+            ligand_pn_unit_iids=ligand_pn_unit_iids,
             annotation_name="is_ligand_pocket"
+        )
+    elif pocket_annotation_method == "pseudocb":
+        annotated_atom_array = annotate_ligand_pockets_pseudocb(
+            atom_array=atom_array,
+            pocket_distance=pocket_distance,
+            n_min_ligand_atoms=1,
+            receptor_pn_unit_iids=receptor_pn_unit_iids,
+            ligand_pn_unit_iids=ligand_pn_unit_iids,
+            annotation_name="is_ligand_pocket",
         )
     else:
         annotated_atom_array = annotate_ligand_pockets(
