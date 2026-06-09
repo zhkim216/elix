@@ -14,6 +14,7 @@ from omegaconf import DictConfig
 from allatom_design.data.utils.pn_unit import (
     _normalize_ccd_codes,
     parse_partner_list,
+    parse_pn_unit_iids_value,
     series_has_any_exact_ccd,
 )
 
@@ -56,6 +57,7 @@ def metal_center_mask(metadata_df: pd.DataFrame, cfg: dict | DictConfig) -> pd.S
 def small_molecule_center_mask(metadata_df: pd.DataFrame, cfg: dict | DictConfig) -> pd.Series:
     cfg = cfg or {}
     min_contacts = cfg.get("min_contacting_protein_atoms_small_molecule", 20)
+    min_contact_ratio = cfg.get("min_contacting_protein_atom_ratio_small_molecule", None)
     min_occupancy = cfg.get("min_avg_occupancy_nonpolymer_small_molecule", 0.5)
     max_missing_fraction = cfg.get("max_missing_atom_fraction_small_molecule", 0.2)
     evidence_policy = cfg.get(
@@ -89,6 +91,11 @@ def small_molecule_center_mask(metadata_df: pd.DataFrame, cfg: dict | DictConfig
     # Apply quality thresholds
     if min_contacts is not None:
         mask = mask & (_small_molecule_contacting_protein_atoms(metadata_df) >= int(min_contacts))
+    if min_contact_ratio is not None:
+        mask = mask & (
+            _small_molecule_contacting_protein_atom_ratio(metadata_df).fillna(-np.inf)
+            >= float(min_contact_ratio)
+        )
     if min_occupancy is not None:
         mask = mask & (
             metadata_df["q_pn_unit_avg_occupancy_nonpolymer"].fillna(-np.inf) >= float(min_occupancy)
@@ -103,6 +110,13 @@ def small_molecule_center_mask(metadata_df: pd.DataFrame, cfg: dict | DictConfig
 
 def _small_molecule_contacting_protein_atoms(metadata_df: pd.DataFrame) -> pd.Series:
     return metadata_df["q_pn_unit_per_partner_contacts_to_protein_small_molecule"].apply(_sum_contact_counts)
+
+
+def _small_molecule_contacting_protein_atom_ratio(metadata_df: pd.DataFrame) -> pd.Series:
+    contacts = _small_molecule_contacting_protein_atoms(metadata_df).astype(float)
+    expected = pd.to_numeric(metadata_df["q_pn_unit_expected_heavy_atoms_non_polymer"], errors="coerce")
+    denom = expected.where(expected > 0, np.nan)
+    return contacts / denom
 
 
 def _sum_contact_counts(value) -> int:

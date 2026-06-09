@@ -1,21 +1,21 @@
 task: ${model.task}
 dataset_impl: atomworks_sd
-pdb_path: /scratch/users/zhkim216/datasets/atomworks_pdb_full_v9
-train_metadata_path: /scratch/users/zhkim216/datasets/atomworks_pdb_full_v9/metadata_ligval_seq_clustered_external_evidence_ver5.parquet
+pdb_path: /home/yjhk/model-dev/datasets/atomworks_pdb_full_v9
+train_metadata_path: /home/yjhk/model-dev/datasets/atomworks_pdb_full_v9/debug_metadata_ligval_seq_clustered_external_evidence_ver5.parquet
 
 validation_ids_file: null
-val_metadata_path: /scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs/metadata_for_training_nativeval_sm_metal.parquet
+val_metadata_path: /home/yjhk/model-dev/datasets/val_cifs/nativeval_cifs/metadata_for_training_nativeval_sm_metal.parquet
 
 debug: ${train.debug}
 debug_num_ids: 10000
 save_failed_examples_to_dir: ${out_dir}/failed_examples
-residue_cache_dir: /scratch/users/zhkim216/datasets/atomworks_cached_residue_data
+residue_cache_dir: /home/yjhk/model-dev/datasets/atomworks_cached_residue_data
 exclude_val_cluster: true
 
 # --- protein-cluster column selection ---
 # Cluster column used for cluster-balanced sampling weights and protein_cluster_multiset.
 # Choose among: q_pn_unit_cluster_{03,04,05,06,07}_id, q_pn_unit_cluster_foldseek_id.
-cluster_id_col: q_pn_unit_cluster_03_id
+cluster_id_col: q_pn_unit_cluster_04_id
 # Cluster column used to remove train/val overlap (sequence-identity leakage). Fixed to seq cluster 0.3.
 val_exclusion_cluster_id_col: q_pn_unit_cluster_03_id
 
@@ -32,7 +32,7 @@ min_protein_donor_atoms: 3
 min_avg_occupancy_nonpolymer: 0.5
 
 # --- small-molecule-specific filters ---
-small_molecule_artifact_list_path: /scratch/users/zhkim216/datasets/artifact_lists/artifact_sources_by_ccd_JH_ver2.tsv
+small_molecule_artifact_list_path: /home/yjhk/model-dev/datasets/artifact_lists/artifact_sources_by_ccd_JH_ver2.tsv
 small_molecule_artifact_external_evidence_policy: filter_all_artifacts
 min_contacting_protein_atoms_small_molecule: 20
 min_contacting_protein_atom_ratio_small_molecule: 1.0

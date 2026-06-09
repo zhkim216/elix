@@ -219,6 +219,45 @@ def test_split_metal_and_small_molecule_policies_are_independent():
     assert small_molecule_center_mask(df, cfg).tolist() == [False, False, True, False]
 
 
+def test_small_molecule_contact_atom_ratio_filter_uses_expected_heavy_atoms():
+    df = pd.DataFrame(
+        [
+            _row("P_1", chain_type=6, cluster_id=100, is_protein=True),
+            _row(
+                "PASS_1",
+                chain_type=3,
+                cluster_id=10,
+                contacts=_contacts(("P_1", 4.0)),
+                is_small_molecule=True,
+            ),
+            _row(
+                "LOW_1",
+                chain_type=3,
+                cluster_id=11,
+                contacts=_contacts(("P_1", 4.0)),
+                is_small_molecule=True,
+            ),
+            _row(
+                "ZERO_1",
+                chain_type=3,
+                cluster_id=12,
+                contacts=_contacts(("P_1", 4.0)),
+                is_small_molecule=True,
+            ),
+        ]
+    )
+    df.loc[df["q_pn_unit_iid"] == "PASS_1", "q_pn_unit_expected_heavy_atoms_non_polymer"] = 25
+    df.loc[df["q_pn_unit_iid"] == "LOW_1", "q_pn_unit_expected_heavy_atoms_non_polymer"] = 50
+    df.loc[df["q_pn_unit_iid"] == "ZERO_1", "q_pn_unit_expected_heavy_atoms_non_polymer"] = 0
+    cfg = _interface_cfg(
+        min_contacting_protein_atoms_small_molecule=None,
+        min_contacting_protein_atom_ratio_small_molecule=1.0,
+        max_missing_atom_fraction_small_molecule=None,
+    )
+
+    assert small_molecule_center_mask(df, cfg).tolist() == [False, True, False, False]
+
+
 def test_add_derived_flags_reconstructs_missing_nucleic_acid_group_columns():
     df = pd.DataFrame(
         [

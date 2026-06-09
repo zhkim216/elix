@@ -121,6 +121,7 @@ python3 allatom_design/train_seq_denoiser.py \
     data.samples_per_epoch=50000 \
     data.metal_external_evidence_policy="external_evidence" \
     data.small_molecule_artifact_external_evidence_policy="filter_all_artifacts" \
+    data.min_contacting_protein_atom_ratio_small_molecule=1.0 \
     data.query_pn_unit_iids_only=true \
     "${INTERFACE_FILTER_OVERRIDE[@]}" \
     data.sampling_weights.alphas_interface.alpha_protein_protein=0.0 \
