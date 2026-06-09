@@ -38,6 +38,48 @@ That guide covers the full flow:
 The previous Sherlock setup is intentionally not documented here because it used
 a different AlphaFold3 dependency set.
 
+### AF3 Databases On Sherlock
+
+AlphaFold3 requires a local genetic database directory. During Sherlock setup,
+fetch the AF3 databases once into scratch:
+
+```bash
+export REPO="${REPO:-$HOME/code/elix}"
+export AF3_DB_DIR="${AF3_DB_DIR:-$SCRATCH/af3_databases}"
+
+cd "$REPO/alphafold3"
+bash fetch_databases.sh "$AF3_DB_DIR"
+```
+
+Run this in `tmux`, `screen`, or an sbatch job. The full database download and
+decompression is large and can take a long time.
+
+After the fetch completes, verify the expected AF3 v3 database layout:
+
+```bash
+for f in \
+  bfd-first_non_consensus_sequences.fasta \
+  mgy_clusters_2022_05.fa \
+  uniref90_2022_05.fa \
+  uniprot_all_2021_04.fa \
+  pdb_seqres_2022_09_28.fasta \
+  rnacentral_active_seq_id_90_cov_80_linclust.fasta \
+  nt_rna_2023_02_23_clust_seq_id_90_cov_80_rep_seq.fasta \
+  rfam_14_9_clust_seq_id_90_cov_80_rep_seq.fasta; do
+  test -s "$AF3_DB_DIR/$f" || echo "MISSING $f"
+done
+test -d "$AF3_DB_DIR/mmcif_files" || echo "MISSING mmcif_files"
+```
+
+If AF3 self-consistency fails with a missing `${DB_DIR}/...` database path,
+rerun the fetch command above or verify that
+`struct_pred_cfg.af3.inference_config.base.db_dir` points to `$AF3_DB_DIR`.
+Before rerunning a failed sample, remove any partial AF3 prediction directory:
+
+```bash
+rm -rf "$RUN_DIR"/step_*/af3_ss_preds/"$DESIGNED_SAMPLE_ID"
+```
+
 ## Local Desktop Setup
 
 The local desktop environment uses a uv-managed Python 3.12 virtual environment
