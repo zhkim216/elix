@@ -1,4 +1,4 @@
-# Sherlock interactive smoke config for proto metal nativeval run_elix.
+# Sherlock interactive smoke config for elix_exp1 nativeval sm-metal run_elix.
 # Run from /home/users/zhkim216/code/elix:
 #   python3 allatom_design/eval/sampling/run_elix.py --config-name debug_run_elix
 
@@ -10,21 +10,21 @@ wandb:
   no_wandb: true
   project: "eval_ligand_seq_des"
   wandb_id: "zhkim216"
-  group: "metal_nativeval_debug"
+  group: "nativeval_sm_metal_debug"
 
 debug: true
-num_debug_samples: 2
+num_debug_samples: 1
 seed: 0
 num_workers: 0
 protein_only: false
 run_seq_des: true
 
-exp_name: debug_proto_allprot_external_evidence_metal_nativeval_seq2
+exp_name: elix_exp1_cfg0_nativeval_sm_metal_numseqs1_debug
 base_out_dir: /scratch/users/zhkim216/out_dir/debug_eval_ligand_seq_des
 
 model_cfg:
   model_name: "elix_mpnn"
-  denoiser_train_dir: /scratch/users/zhkim216/out_dir/ligand_seq_des/proto_allprot_external_evidence
+  denoiser_train_dir: /scratch/users/zhkim216/out_dir/ligand_seq_des/elix_exp1_cfg0
   ckpt_cfg:
     start_step: 2500
     end_step: 2500
@@ -35,7 +35,7 @@ sampling_cfg:
   base_cfg_path: /home/users/zhkim216/code/elix/allatom_design/configs/seq_des/elix_mpnn_inference.yaml
   overrides:
     batch_size: 1
-    num_seqs_per_pdb: 2
+    num_seqs_per_pdb: 1
     use_potts_sampling: true
     potts_sampling_cfg:
       potts_sweeps: 50
@@ -44,11 +44,14 @@ sampling_cfg:
   guidance:
     enabled: false
 
-sampling_inputs_csv: /scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs/sampling_inputs_metal_nativeval.csv
+sampling_inputs_csv: /scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs/sampling_inputs_sm_metal.csv
 pos_constraint_csv: null
 
 pocket_cfg:
+  pocket_distances_for_seq_recovery: [4.0, 6.0, 8.0, 10.0]
+  pocket_distance_bins: [[0.0, 4.0], [4.0, 6.0], [6.0, 8.0], [8.0, 10.0]]
   n_min_ligand_atoms_for_seq_recovery: 1
+  pocket_distance_for_docking_metrics: 8.0
 
 input_sample_is_all_atom: true
 input_sample_is_designed: false
@@ -56,7 +59,7 @@ load_from_cache: false
 
 pdb_cfg:
   pdb_dir: /scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs/cifs
-  pdb_name_list: /scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs/metal_nativeval.txt
+  pdb_name_list: /scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs/nativeval_sm_metal.txt
   pdb_name_ext: ".cif"
   recursive: false
   split_by_subfolder: false
@@ -69,6 +72,10 @@ featurizer_cfg:
   design:
     residue_cache_dir: /scratch/users/zhkim216/datasets/atomworks_cached_residue_data
 
+cif_cfg:
+  save:
+    include_bonds: false
+
 struct_pred_cfg:
   evaluate_self_consistency: true
   evaluate_docking_consistency: false
@@ -77,9 +84,9 @@ struct_pred_cfg:
     runner_path: /home/users/zhkim216/code/elix/alphafold3/src/alphafold3/run_alphafold.py
     inference_config:
       ss:
-        num_recycles: 10
-        num_diffusion_samples: 5
+        num_recycles: 1
+        num_diffusion_samples: 1
 
 hydra:
   run:
-    dir: /scratch/users/zhkim216/hydra_outputs/eval_proto_metal_nativeval_debug
+    dir: /scratch/users/zhkim216/hydra_outputs/eval_elix_exp1_nativeval_sm_metal_debug

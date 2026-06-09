@@ -12,7 +12,7 @@ from omegaconf import DictConfig, OmegaConf
 from joblib import Parallel, delayed
 import copy
 
-from allatom_design.data.datasets.atomworks_sd_dataset import sd_collator
+from allatom_design.data.datasets.atomworks_sd import sd_collator
 from allatom_design.data.transform.preprocess import preprocess_transform, preprocess_transform_designed_samples
 from allatom_design.data.transform.sd_featurizer import (
     featurizer_af3_prediction,
