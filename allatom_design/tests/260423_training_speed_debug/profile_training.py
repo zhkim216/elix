@@ -66,7 +66,7 @@ from allatom_design.model.seq_denoiser.lit_sd_model import LitSeqDenoiser
 # ----------------------------------------------------------------------------
 # Overrides shared by reduced + full
 _EXP43_COMMON_OVERRIDES = [
-    "denoiser=lc_atom_mpnn",
+    "denoiser=elix_mpnn",
     "train.debug=false",
     "wandb.no_wandb=true",
     "loss.main_seq_loss_pocket_only=false",
@@ -166,8 +166,6 @@ def setup_data(cfg: DictConfig):
 def setup_model(cfg: DictConfig, device: torch.device):
     """Build LitSeqDenoiser, set scale factors, move to device, return (lit_model, optimizer)."""
     lit_model = LitSeqDenoiser(cfg)
-    bb_std, scn_std = cfg.model.sigma_data
-    lit_model.model.set_scale_factors({"bb": (0.0, bb_std), "scn": (0.0, scn_std)})
     lit_model = lit_model.to(device)
     lit_model.train()
 

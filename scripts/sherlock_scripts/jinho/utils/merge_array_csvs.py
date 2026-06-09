@@ -35,10 +35,13 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-from natsort import natsorted
 
 
 SHARD_RE = re.compile(r"^(.+)_array_(\d+)\.csv$")
+
+
+def _natural_key(value: str | Path) -> list[int | str]:
+    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", str(value))]
 
 
 def _format_stat(path: Path) -> str:
@@ -72,7 +75,7 @@ def merge_array_csvs(
 
     Returns ``True`` on success, ``False`` if any strict check failed.
     """
-    array_csvs = natsorted(glob.glob(str(results_dir / "*_array_*.csv")))
+    array_csvs = sorted(glob.glob(str(results_dir / "*_array_*.csv")), key=_natural_key)
 
     if not array_csvs:
         print(f"  No array CSV files found in {results_dir}")
@@ -185,8 +188,9 @@ def merge_all(
     """
     root = Path(root_dir)
 
-    step_dirs = natsorted(
-        [d for d in root.iterdir() if d.is_dir() and d.name.startswith("step_")]
+    step_dirs = sorted(
+        [d for d in root.iterdir() if d.is_dir() and d.name.startswith("step_")],
+        key=_natural_key,
     )
 
     overall_ok = True

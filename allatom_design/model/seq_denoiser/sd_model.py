@@ -24,17 +24,7 @@ class SeqDenoiser(nn.Module):
         self.cfg = cfg
         self.task = cfg.task
 
-        # Data scaling parameters
-        # scale sidechains separately from the backbone
-        self.register_buffer("bb_std", torch.tensor(1.0))
-        self.register_buffer("bb_mean", torch.tensor(0.0))
-
-        self.register_buffer("scn_mean", torch.tensor(0.0))
-        self.register_buffer("scn_std", torch.tensor(1.0))
-
-        self.sigma_data = (self.bb_std, self.scn_std)
-
-        self.denoiser = get_denoiser(cfg.denoiser, self.sigma_data)
+        self.denoiser = get_denoiser(cfg.denoiser)
 
         # Mask selector
         self.mask_selector = MaskSelector(cfg.mask_selector)
@@ -57,12 +47,9 @@ class SeqDenoiser(nn.Module):
         with torch.no_grad():
             # Sample sequence and atom conditioning masks
             batch["seq_cond_mask"] = self.mask_selector.sample_seq_cond_mask(batch, t)  # 1 if we should condition on the restype, 0 otherwise
-            batch["atom_cond_mask"], scn_token_mask, expanded_bb_mask = self.mask_selector.sample_atom_cond_mask(batch)  # JH Changed 260415
-
-            # Pseudo-context mask: pseudo-ligand positions + their backbone-masked neighbors.
-            # Both are excluded from the protein graph (build_masks) and have restype
-            # masked to GAP (elix_mpnn forward).  # JH Changed 260416
-            batch["pseudo_context_mask"] = (scn_token_mask + expanded_bb_mask).clamp(max=1.0)
+            batch["atom_cond_mask"], scn_token_mask, scn_atom_mask = self.mask_selector.sample_atom_cond_mask(batch)
+            batch["sidechain_context_atom_mask"] = scn_atom_mask
+            batch["seq_cond_mask"] = (batch["seq_cond_mask"] + scn_token_mask).clamp(max=1.0)
 
         # Denoise sequence
         _, aux_preds = self.denoiser(batch)
@@ -71,19 +58,6 @@ class SeqDenoiser(nn.Module):
         outputs.update(aux_preds)
 
         return outputs
-
-
-    def set_scale_factors(self,
-                          scale_factors: dict[str, tuple[float, float]]):
-        bb_mean, bb_std = scale_factors["bb"]
-        self.bb_mean.data = torch.tensor(bb_mean)
-        self.bb_std.data = torch.tensor(bb_std)
-        print(f"Setting bb_mean: {bb_mean}, bb_std: {bb_std}")
-
-        scn_mean, scn_std = scale_factors["scn"]
-        self.scn_mean.data = torch.tensor(scn_mean)
-        self.scn_std.data = torch.tensor(scn_std)
-        print(f"Setting scn_mean: {scn_mean}, scn_std: {scn_std}")
 
 
     def sample(self,
@@ -135,12 +109,10 @@ class SeqDenoiser(nn.Module):
         return potts_decoder_aux, batch
 
 
-def get_denoiser(cfg: DictConfig,
-                 sigma_data: TensorType[(), float]
-                 ) -> BaseSeqDenoiser:
+def get_denoiser(cfg: DictConfig) -> BaseSeqDenoiser:
     """
     Get the denoiser specified in the config.
     """
     if cfg.name == "elix_mpnn":
-        return ElixMPNNDenoiser(cfg, sigma_data)
+        return ElixMPNNDenoiser(cfg)
     raise ValueError(f"Unknown denoiser: {cfg.name}")

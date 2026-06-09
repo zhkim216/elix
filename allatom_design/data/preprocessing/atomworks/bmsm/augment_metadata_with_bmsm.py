@@ -82,7 +82,7 @@ from allatom_design.data.preprocessing.atomworks.bmsm.smiles_cache import (
     load_smiles_cache,
     run_atomworks_smiles_fallback,
 )
-from allatom_design.utils.metadata_utils import (
+from allatom_design.data.utils.nucleic_acid_groups import (
     DEFAULT_NUCLEIC_ACID_GROUP_DISTANCE_CUTOFF,
     add_nucleic_acid_group_columns,
 )

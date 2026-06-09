@@ -240,16 +240,9 @@ claude-code-best-practice/
 # locations are retired in favor of .claude/tasks/{date}/{task_name}/ and
 # .claude/tests/{date}/{task_name}/ — see project CLAUDE.md.
 
-# Codex harness local raw payloads: keep papers/results local unless explicitly curated.
-.codex/raw/**
-!.codex/raw/
-!.codex/raw/README.md
-!.codex/raw/papers/
-!.codex/raw/papers/**/
-!.codex/raw/papers/**/.gitkeep
-!.codex/raw/notes/
-!.codex/raw/notes/**/
-!.codex/raw/notes/**/.gitkeep
-!.codex/raw/results/
-!.codex/raw/results/**/
-!.codex/raw/results/**/.gitkeep
+# Local Codex/agent harness files
+AGENTS.md
+PLANS.md
+code_review.md
+.agents/
+.codex/

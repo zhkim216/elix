@@ -46,7 +46,7 @@ PDB_PATH="/scratch/users/zhkim216/datasets/atomworks_pdb_full_v3"
 # cfg1: enc-dec + no seq_loss (potts-only gradient)
 # cfg2: encoder-only + seq_loss
 # cfg3: encoder-only + no seq_loss (potts-only gradient)
-DENOISER_TYPE="lc_atom_mpnn"
+DENOISER_TYPE="elix_mpnn"
 
 TRAIN_METADATA_PATH="/scratch/users/zhkim216/datasets/atomworks_pdb_full_v3/metadata_seq_clustered_04_filtered_grouped_250205.parquet"
 

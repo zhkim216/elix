@@ -65,7 +65,7 @@ from allatom_design.eval.eval_utils.potts_utils import (
     compute_potts_deltas,
     map_token_to_residue_info,
 )
-from allatom_design.eval.eval_utils.sd_data_utils import get_sd_batch
+from allatom_design.eval.utils.data_utils import get_sd_batch
 from allatom_design.model.seq_denoiser.lit_sd_model import LitSeqDenoiser
 
 

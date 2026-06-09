@@ -43,7 +43,7 @@ source scripts/local_scripts/jinho/setup/activate_elix_local.sh
 
 ### 3. Test Run
 ```bash
-python allatom_design/train_seq_denoiser.py --config-path configs_local/seq_denoiser --config-name debug_seq_denoiser_local.yaml
+python allatom_design/train_seq_denoiser.py --config-path configs_local/seq_denoiser --config-name debug_elix.yaml
 ```
 
 ## Environment Configuration
@@ -96,7 +96,7 @@ Instead of installing the `boltz` package directly, necessary utility functions 
 - Other geometry functions
 
 ### Import Path Updates
-- `allatom_design/model/seq_denoiser/denoisers/seq_design/atom_mpnn.py`
+- `allatom_design/model/seq_denoiser/denoisers/seq_design/elix_mpnn.py`
 - `allatom_design/data/feature/seq_des_featurizer.py`
 - `allatom_design/data/feature/motif_featurizer.py`
 

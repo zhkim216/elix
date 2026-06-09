@@ -11,6 +11,7 @@ from allatom_design.data.datasets.atomworks_sd_dataset_proto import (
     add_proto_sampling_weights,
     build_proto_interface_df,
     collect_external_evidence,
+    _add_proto_modality_columns,
     _proto_center_mask,
 )
 from allatom_design.train_seq_denoiser import build_sd_datamodule
@@ -43,13 +44,23 @@ def _row(
     *,
     is_protein=False,
     is_metal=False,
+    is_small_molecule=False,
     ccd=None,
     cluster_id=1,
     contacts="[]",
     protein_contacts="[]",
+    sm_protein_contacts="[]",
     medba_evidence=False,
     pubmed_evidence=False,
+    binding_evidence=False,
+    procog_evidence=False,
+    rellig_present=False,
+    avg_occupancy=None,
+    resolved_atoms=10,
+    expected_atoms=10,
 ):
+    if avg_occupancy is None:
+        avg_occupancy = 1.0 if is_metal or is_small_molecule else np.nan
     return {
         "pdb_id": "1abc",
         "assembly_id": "1",
@@ -64,14 +75,27 @@ def _row(
         "q_pn_unit_is_metal": is_metal,
         "q_pn_unit_is_polymer": is_protein,
         "q_pn_unit_is_halide": False,
+        "q_pn_unit_is_small_molecule": is_small_molecule,
         "q_pn_unit_non_polymer_res_names": ccd,
-        "q_pn_unit_avg_occupancy_nonpolymer": 1.0 if is_metal else np.nan,
+        "q_pn_unit_avg_occupancy_nonpolymer": avg_occupancy,
         "q_pn_unit_per_partner_contacts_metal": contacts,
         "q_pn_unit_contacting_pn_unit_iids": protein_contacts,
+        "q_pn_unit_per_partner_contacts_to_protein_small_molecule": sm_protein_contacts,
+        "q_pn_unit_expected_heavy_atoms_non_polymer": expected_atoms,
+        "q_pn_unit_num_resolved_atoms": resolved_atoms,
         "q_pn_unit_cluster_id": cluster_id,
+        "q_pn_unit_external_binding_relevance_evidence": binding_evidence,
+        "q_pn_unit_procoggraph_cognate_ligand_evidence": procog_evidence,
+        "q_pn_unit_rellig_source_row_present": rellig_present,
         "metal_medba_evidence": medba_evidence,
         "metal_pubmed_evidence": pubmed_evidence,
     }
+
+
+def _artifact_tsv(tmp_path, *codes):
+    path = tmp_path / "artifact_sources_by_ccd_JH_ver2.tsv"
+    path.write_text("ccd_code\n" + "\n".join(codes) + "\n")
+    return path
 
 
 def test_collect_external_evidence_ors_medba_and_pubmed_for_metal_rows_only():
@@ -131,6 +155,97 @@ def test_proto_center_mask_supports_all_metal_default_ccd_filter_and_external_ev
 
     with pytest.raises(ValueError, match="allowed_ccd_codes"):
         _proto_center_mask(df, {"allowed_ccd_codes": []})
+
+
+def test_proto_center_mask_applies_artifact_evidence_gate_and_physical_sm_filters(tmp_path):
+    artifact_path = _artifact_tsv(tmp_path, "BME", "PEG", "SO4")
+    df = pd.DataFrame(
+        [
+            _row("B_1", is_small_molecule=True, ccd="BME", sm_protein_contacts=_contacts(("P_1", 25))),
+            _row(
+                "P_1",
+                is_small_molecule=True,
+                ccd="PEG",
+                sm_protein_contacts=_contacts(("P_1", 25)),
+                procog_evidence=True,
+            ),
+            _row("A_1", is_small_molecule=True, ccd="ADP", sm_protein_contacts=_contacts(("P_1", 25))),
+            _row(
+                "R_1",
+                is_small_molecule=True,
+                ccd="SO4",
+                sm_protein_contacts=_contacts(("P_1", 25)),
+                rellig_present=True,
+            ),
+            _row(
+                "C_1",
+                is_small_molecule=True,
+                ccd="SO4",
+                sm_protein_contacts=_contacts(("P_1", 5)),
+                binding_evidence=True,
+            ),
+            _row(
+                "O_1",
+                is_small_molecule=True,
+                ccd="SO4",
+                sm_protein_contacts=_contacts(("P_1", 25)),
+                binding_evidence=True,
+                avg_occupancy=0.25,
+            ),
+            _row(
+                "M_1",
+                is_small_molecule=True,
+                ccd="SO4",
+                sm_protein_contacts=_contacts(("P_1", 25)),
+                binding_evidence=True,
+                resolved_atoms=7,
+                expected_atoms=10,
+            ),
+            _row("Z_1", is_metal=True, ccd="ZN", contacts=_contacts(("P_1", 3)), pubmed_evidence=True),
+        ]
+    )
+    df = collect_external_evidence(df)
+
+    mask = _proto_center_mask(
+        df,
+        {
+            "external_evidence_policy": "external_evidence",
+            "small_molecule_artifact_list_path": str(artifact_path),
+            "small_molecule_external_evidence_policy": "binding_or_procog",
+            "min_contacting_protein_atoms_small_molecule": 20,
+            "min_avg_occupancy_nonpolymer_small_molecule": 0.5,
+            "max_missing_atom_fraction_small_molecule": 0.2,
+        },
+    )
+
+    assert mask.tolist() == [False, True, True, False, False, False, False, True]
+
+
+def test_add_proto_modality_columns_marks_artifact_ccds_from_configured_list(tmp_path):
+    artifact_path = _artifact_tsv(tmp_path, "bme", "PEG")
+    df = pd.DataFrame(
+        [
+            _row("B_1", is_small_molecule=True, ccd="BME"),
+            _row("A_1", is_small_molecule=True, ccd="ADP"),
+            _row("P_1", is_protein=True),
+            _row("X_1", is_small_molecule=True, ccd="ATP, PEG"),
+        ]
+    )
+
+    out = _add_proto_modality_columns(
+        df,
+        {"small_molecule_artifact_list_path": str(artifact_path)},
+    )
+
+    assert out["q_pn_unit_is_artifact"].tolist() == [True, False, False, True]
+
+
+def test_add_proto_modality_columns_defaults_artifact_flag_false_without_list():
+    df = pd.DataFrame([_row("B_1", is_small_molecule=True, ccd="BME")])
+
+    out = _add_proto_modality_columns(df, {})
+
+    assert out["q_pn_unit_is_artifact"].tolist() == [False]
 
 
 def test_filter_metadata_to_proto_scope_keeps_protein_monomers_and_selected_metals():
@@ -195,6 +310,61 @@ def test_build_proto_interface_df_includes_multi_protein_metal_interfaces_and_ac
     assert row["protein_cluster_multiset"] == (100, 101)
     assert row["ligand_ccd_key"] == ("ccd", "ZN")
     assert row["n_coordinating_protein_donor_atoms"] == 4
+
+
+def test_build_proto_interface_df_adds_artifact_gated_small_molecule_interfaces(tmp_path):
+    artifact_path = _artifact_tsv(tmp_path, "BME", "PEG")
+    metadata_df = pd.DataFrame(
+        [
+            _row("P_1", is_protein=True, cluster_id=100),
+            _row("P_2", is_protein=True, cluster_id=101),
+            _row(
+                "B_1",
+                is_small_molecule=True,
+                ccd="BME",
+                cluster_id=200,
+                sm_protein_contacts=_contacts(("P_1", 12), ("P_2", 13)),
+                binding_evidence=True,
+            ),
+            _row(
+                "A_1",
+                is_small_molecule=True,
+                ccd="ADP",
+                cluster_id=201,
+                sm_protein_contacts=_contacts(("P_1", 21)),
+            ),
+            _row(
+                "X_1",
+                is_small_molecule=True,
+                ccd="PEG",
+                cluster_id=202,
+                sm_protein_contacts=_contacts(("P_1", 30)),
+            ),
+        ]
+    )
+    metadata_df = collect_external_evidence(metadata_df)
+
+    interface_df = build_proto_interface_df(
+        metadata_df,
+        protein_df=metadata_df[metadata_df["q_pn_unit_is_protein"]].copy(),
+        dataset_name="toy",
+        proto_cfg={
+            "min_protein_donor_atoms": 3,
+            "min_avg_occupancy_nonpolymer": 0.5,
+            "small_molecule_artifact_list_path": str(artifact_path),
+        },
+    )
+
+    sm_df = interface_df[interface_df["interface_type"] == "bmsm_protein"].sort_values("q_pn_unit_iid")
+    assert sm_df["q_pn_unit_iid"].tolist() == ["A_1", "B_1"]
+
+    bme = sm_df[sm_df["q_pn_unit_iid"] == "B_1"].iloc[0]
+    assert bme["query_pn_unit_iids"] == ["B_1", "P_1", "P_2"]
+    assert bme["ligand_pn_unit_iids"] == ("B_1",)
+    assert bme["protein_pn_unit_iids"] == ("P_1", "P_2")
+    assert bme["protein_cluster_multiset"] == (100, 101)
+    assert bme["ligand_ccd_key"] == ("ccd", "BME")
+    assert bme["n_contacting_protein_atoms"] == 25
 
 
 def test_build_proto_interface_df_adds_unique_protein_interface_tuples_with_contact_sum():
@@ -358,7 +528,7 @@ def test_add_proto_sampling_weights_uses_actual_metal_ccd_key():
     assert weighted_interface.loc["fe_iface", "pair_cluster"][0] == ("ccd", "FE")
 
 
-def test_add_proto_sampling_weights_uses_interface_type_alpha_for_ppi():
+def test_add_proto_sampling_weights_uses_interface_type_alpha_for_ppi_and_small_molecule():
     monomer_df = pd.DataFrame(
         [
             {"q_pn_unit_cluster_id": 100},
@@ -378,8 +548,13 @@ def test_add_proto_sampling_weights_uses_interface_type_alpha_for_ppi():
                 "interface_type": "protein_protein",
                 "ligand_ccd_key": ("protein_interface", "none"),
             },
+            {
+                "protein_cluster_multiset": (200,),
+                "interface_type": "bmsm_protein",
+                "ligand_ccd_key": ("ccd", "ADP"),
+            },
         ],
-        index=["metal_iface", "ppi_iface"],
+        index=["metal_iface", "ppi_iface", "sm_iface"],
     )
 
     _, weighted_interface = add_proto_sampling_weights(
@@ -387,6 +562,7 @@ def test_add_proto_sampling_weights_uses_interface_type_alpha_for_ppi():
         interface_df,
         alphas_interface={
             "alpha_protein_metal": 3.0,
+            "alpha_protein_small_molecule": 4.0,
             "alpha_protein_protein": 2.0,
         },
         k_percentile=100.0,
@@ -394,6 +570,7 @@ def test_add_proto_sampling_weights_uses_interface_type_alpha_for_ppi():
 
     assert weighted_interface.loc["metal_iface", "alpha"] == 3.0
     assert weighted_interface.loc["ppi_iface", "alpha"] == 2.0
+    assert weighted_interface.loc["sm_iface", "alpha"] == 4.0
     assert weighted_interface.loc["ppi_iface", "pair_cluster"][0] == ("protein_interface", "none")
 
 
@@ -461,16 +638,25 @@ def test_add_proto_chain_counts_info_marks_ppi_without_metal():
                 "protein_cluster_multiset": (100,),
                 "interface_type": "bmm_protein",
             },
+            {
+                "protein_cluster_multiset": (101,),
+                "interface_type": "bmsm_protein",
+            },
         ],
-        index=["ppi", "metal"],
+        index=["ppi", "metal", "sm"],
     )
 
     counted = add_proto_chain_counts_info(interface_df)
 
     assert counted.loc["ppi", "n_prot"] == 3
     assert counted.loc["ppi", "n_metal"] == 0
+    assert counted.loc["ppi", "n_small_molecule"] == 0
     assert counted.loc["metal", "n_prot"] == 1
     assert counted.loc["metal", "n_metal"] == 1
+    assert counted.loc["metal", "n_small_molecule"] == 0
+    assert counted.loc["sm", "n_prot"] == 1
+    assert counted.loc["sm", "n_metal"] == 0
+    assert counted.loc["sm", "n_small_molecule"] == 1
 
 
 def test_getitem_leaves_cached_atom_array_filtering_to_featurizer():

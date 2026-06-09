@@ -463,30 +463,6 @@ class DropOutNonProteinChains(Transform):
             data["atom_array"] = atom_array
         return data
 
-class FilterToBiologicallyMeaningfulChains(Transform):
-    """Filter atom array to metadata-derived biologically meaningful PN units.
-
-    This is intentionally separate from ``FilterToQueryPNUnits``: train
-    interface examples should keep a BM-filtered assembly for spatial cropping,
-    after excluding non-BM non-polymer clutter.
-    """
-
-    @override
-    def forward(self, data: dict[str, Any]) -> dict[str, Any]:
-        bm_pn_unit_iids = data.get("biologically_meaningful_pn_unit_iids", None)
-        if bm_pn_unit_iids is None:
-            return data
-
-        if isinstance(bm_pn_unit_iids, np.ndarray):
-            bm_pn_unit_iids = bm_pn_unit_iids.tolist()
-        elif isinstance(bm_pn_unit_iids, tuple):
-            bm_pn_unit_iids = list(bm_pn_unit_iids)
-
-        atom_array = data["atom_array"]
-        data["atom_array"] = filter_to_specified_pn_units(atom_array, bm_pn_unit_iids)
-        return data
-
-
 class FilterToQueryPNUnits(Transform):
     """Filter the atom array to the query PN units.
 

@@ -49,7 +49,7 @@ def test_make_af3_json_uses_userccd_component_ids_without_metal_rewrite(tmp_path
         json_config={
             "model_seeds": [42],
             "version": 4,
-            "user_ccd_path": "/tmp/studio179_all_components_userccd.cif",
+            "user_ccd_path": "/tmp/example_components_userccd.cif",
         },
     )
 
@@ -57,5 +57,5 @@ def test_make_af3_json_uses_userccd_component_ids_without_metal_rewrite(tmp_path
     ligand_entries = [entry["ligand"] for entry in payload["sequences"] if "ligand" in entry]
 
     assert payload["version"] == 4
-    assert payload["userCCDPath"] == "/tmp/studio179_all_components_userccd.cif"
+    assert payload["userCCDPath"] == "/tmp/example_components_userccd.cif"
     assert ligand_entries == [{"id": "B", "ccdCodes": ["S179002"]}]

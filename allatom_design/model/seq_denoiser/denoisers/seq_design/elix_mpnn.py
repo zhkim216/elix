@@ -188,9 +188,6 @@ class ElixMPNN(nn.Module):
         #! (JH) During sampling, seq_cond_mask is also 1 for padded tokens
         #! (JH) So padded parts are also considered as gaps here, but I guess it's okay.
         restype = torch.where(batch["seq_cond_mask"].unsqueeze(-1).bool(), batch["restype"], masked)
-        # Pseudo-context positions: always mask to GAP (identity hidden from protein graph)  # JH Changed 260416
-        pseudo_context_mask = batch.get("pseudo_context_mask", torch.zeros_like(batch["seq_cond_mask"]))
-        restype = torch.where(pseudo_context_mask.unsqueeze(-1).bool(), masked, restype)
         h_S = self.W_s(restype) #! (JH) different from the original lmpnn (zero-initialized)
 
         # Build graph and get edge features
@@ -323,7 +320,6 @@ class TokenFeatures(nn.Module):
         self.protein_edge_embedding = nn.Linear(protein_graph_edge_in, self.hidden_dim, bias=False)
         self.norm_protein_edges = nn.LayerNorm(self.hidden_dim)
 
-        # Context-related parameters  # JH Changed 260415 — removed use_sidechain_context / sidechain_context_token_num (pseudo-ligand sidechains now flow through Y)
         self.use_multichain_encoding = cfg.get("use_multichain_encoding", True)
         self.ligand_conditioning = cfg.ligand_conditioning
         self.use_ligand_context = cfg.get("use_ligand_context", True)
@@ -431,19 +427,18 @@ class TokenFeatures(nn.Module):
             protein_residue_node_mask = batch["protein_residue_node_mask"]
             atom_is_standard_aa_protein = batch["protein_residue_node_mask"].gather(dim=-1, index=batch["atom_to_token_map"]) * batch["atom_pad_mask"] * batch["atom_resolved_mask"]
 
-            # JH Changed 260415 — Pseudo-ligand sidechain atoms now enter Y via ligand_mask
-            # (protein_residue_node_mask=0 for pseudo-ligand tokens → atom_is_standard_aa_protein=0 → ligand_mask=1)
-            # Removed separate sidechain context gathering (use_sidechain_context / E_idx_sub / R/R_m/R_t)
-            # and the subsequent concatenation + second top-K. Y from _get_nearest_ligand_atoms already
-            # contains pseudo-ligand sidechain atoms and is K-nearest selected.
-
-            ##### Context-related tensors (ligand + pseudo-ligand sidechain atoms)
+            ##### Context-related tensors (non-protein atoms + selected protein sidechains)
             atom_is_not_standard_aa_protein = (1 - atom_is_standard_aa_protein) * batch["atom_pad_mask"] * batch["atom_resolved_mask"]
-            ligand_mask = atom_is_not_standard_aa_protein * batch["atom_cond_mask"]
+            sidechain_context_atom_mask = batch.get(
+                "sidechain_context_atom_mask",
+                torch.zeros_like(batch["atom_resolved_mask"]),
+            )
+            context_atom_mask = (atom_is_not_standard_aa_protein + sidechain_context_atom_mask).clamp(max=1.0)
+            ligand_mask = context_atom_mask * batch["atom_cond_mask"]
             noised_ligand_coords = noised_coords * ligand_mask.unsqueeze(-1)
             ligand_atomic_number = batch["atomic_number"] * ligand_mask
 
-            ## Get nearest context atoms (ligand + pseudo-ligand sidechain)
+            ## Get nearest context atoms
             if self.use_ligand_context:
                 Y, Y_t, Y_m, D_XY = self._get_nearest_ligand_atoms(CB = noised_pseudo_cb_coords,
                                                                 mask = protein_residue_node_mask,

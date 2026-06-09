@@ -1,9 +1,9 @@
 """
-Smoke test for the context / encoder edge-update refactor in atom_mpnn.py.
+Smoke test for the context / encoder edge-update refactor in elix_mpnn.py.
 
 Covers:
   (1) ContextModule forward/backward shape + grad flow under both
-      context_feature_edge_update = False / True.
+      context_edge_update = False / True.
   (2) EncLayer forward/backward under is_last_layer = False / True
       (exercises the encoder_edge_update flag path).
 
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import torch
 
-from allatom_design.model.seq_denoiser.denoisers.seq_design.atom_mpnn import (
+from allatom_design.model.seq_denoiser.denoisers.seq_design.elix_mpnn import (
     ContextModule,
     EncLayer,
 )
@@ -28,7 +28,7 @@ def _check_grad_for_keywords(module: torch.nn.Module, required_keywords: list[st
             assert param.grad.abs().sum() > 0, f"zero grad on {name}"
 
 
-def test_context_module(context_feature_edge_update: bool) -> None:
+def test_context_module(context_edge_update: bool) -> None:
     torch.manual_seed(0)
     B, L, M, C = 2, 6, 4, 32  # batch, protein tokens, ligand atoms, hidden
 
@@ -37,7 +37,8 @@ def test_context_module(context_feature_edge_update: bool) -> None:
         dropout_p=0.1,
         num_processor_layers=2,
         num_aggregator_layers=2,
-        context_feature_edge_update=context_feature_edge_update,
+        context_edge_update=context_edge_update,
+        use_context_skip_connection=False,
     )
 
     h_V = torch.randn(B, L, C, requires_grad=True)
@@ -48,7 +49,7 @@ def test_context_module(context_feature_edge_update: bool) -> None:
     Y_m = torch.ones(B, L, M)
     prot_mask = torch.ones(B, L)
 
-    out = module(
+    out, h_V_C_skip = module(
         h_V=h_V,
         h_E=h_E,
         V=V,
@@ -59,6 +60,7 @@ def test_context_module(context_feature_edge_update: bool) -> None:
     )
 
     assert out.shape == h_V.shape, f"ContextModule output shape {tuple(out.shape)} != input {tuple(h_V.shape)}"
+    assert h_V_C_skip is None
     assert not torch.isnan(out).any(), "ContextModule output contains NaN"
 
     loss = out.sum()
@@ -67,7 +69,7 @@ def test_context_module(context_feature_edge_update: bool) -> None:
     # V_C / V_C_norm must always receive gradient (residual channel to the protein track).
     _check_grad_for_keywords(module, ["V_C"])
 
-    if context_feature_edge_update:
+    if context_edge_update:
         # W11/W12/W13/norm3 are exercised only when edge update is ON.
         _check_grad_for_keywords(
             module,
@@ -76,17 +78,17 @@ def test_context_module(context_feature_edge_update: bool) -> None:
                 "context_feature_aggregator.0.W11", "context_feature_aggregator.0.W13",
             ],
         )
-    print(f"[OK] ContextModule context_feature_edge_update={context_feature_edge_update} out.shape={tuple(out.shape)}")
+    print(f"[OK] ContextModule context_edge_update={context_edge_update} out.shape={tuple(out.shape)}")
 
 
 def test_enclayer(is_last_layer: bool) -> None:
     torch.manual_seed(0)
     B, L, K, C = 2, 6, 4, 32
 
-    # EncLayer is constructed with num_in = 2*C (since the message concatenates
+    # EncLayer is constructed with num_in = 3*C (since the message concatenates
     # h_V_expand + cat_neighbors_nodes(h_V, h_E) = h_V_i + h_V_j + h_E).
-    # The h_E input itself lives in hidden_dim (after W_e projection in AtomMPNN).
-    layer = EncLayer(C, C * 2, dropout=0.1, is_last_layer=is_last_layer)
+    # The h_E input itself lives in hidden_dim (after W_e projection in ElixMPNN).
+    layer = EncLayer(C, C * 3, dropout=0.1, is_last_layer=is_last_layer)
     layer.eval()
 
     h_V = torch.randn(B, L, C, requires_grad=True)
@@ -111,8 +113,8 @@ def test_enclayer(is_last_layer: bool) -> None:
 
 
 def main() -> None:
-    test_context_module(context_feature_edge_update=False)
-    test_context_module(context_feature_edge_update=True)
+    test_context_module(context_edge_update=False)
+    test_context_module(context_edge_update=True)
     test_enclayer(is_last_layer=False)
     test_enclayer(is_last_layer=True)
     print("All smoke tests passed.")

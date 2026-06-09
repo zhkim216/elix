@@ -89,13 +89,10 @@ def _get_timesteps_from_schedule(
 
 
 class ElixMPNNDenoiser(BaseSeqDenoiser):
-    def __init__(self,
-                 cfg: DictConfig,
-                 sigma_data: tuple[TensorType[(), float], TensorType[(), float]]):
+    def __init__(self, cfg: DictConfig):
         super().__init__()
 
         self.cfg = cfg
-        self.bb_sigma_data, self.scn_sigma_data = sigma_data
         self.task = cfg.task
 
         # Sequence design model: ElixMPNN
@@ -158,13 +155,8 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
         atomwise_hetero_mask = batch.get("atomwise_hetero_mask", torch.ones_like(batch["atom_resolved_mask"]))
 
         if not is_sampling:
-            # Exclude pseudo-context positions (pseudo-ligands + backbone-masked neighbors)
-            # from the protein residue graph.  # JH Changed 260416
-            pseudo_context_mask = batch.get("pseudo_context_mask", torch.zeros_like(batch["token_pad_mask"]))
-
             batch["protein_residue_node_mask"] = (
                 batch["token_is_prot_std_aa"] *
-                (1 - pseudo_context_mask) *
                 batch["token_exists_mask"] *
                 batch["token_pad_mask"]
             )

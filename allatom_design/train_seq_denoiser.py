@@ -17,16 +17,13 @@ from datetime import datetime
 
 from allatom_design.model.ema.ema import EMA, EMAModelCheckpoint, EMATrackerCheckpoint
 from allatom_design.model.seq_denoiser.lit_sd_model import LitSeqDenoiser
-from allatom_design.utils.checkpoint_utils import (
-    elix_mpnn_config,
-    repair_state_dict,
-)
+from allatom_design.utils.checkpoint_utils import repair_state_dict
 
 
 def build_sd_datamodule(data_cfg: DictConfig) -> L.LightningDataModule:
     dataset_impl = data_cfg.get("dataset_impl", "atomworks_sd")
-    if dataset_impl == "atomworks_sd":
-        from allatom_design.data.datasets.atomworks_sd_dataset import AtomworksSDDataModule
+    if dataset_impl in {"atomworks_sd", "proto"}:
+        from allatom_design.data.datasets.atomworks_sd import AtomworksSDDataModule
 
         return AtomworksSDDataModule(data_cfg)
     if dataset_impl == "mg_proto":
@@ -35,19 +32,13 @@ def build_sd_datamodule(data_cfg: DictConfig) -> L.LightningDataModule:
         )
 
         return AtomworksSDMGProtoDataModule(data_cfg)
-    if dataset_impl == "proto":
-        from allatom_design.data.datasets.atomworks_sd_dataset_proto import (
-            AtomworksSDProtoDataModule,
-        )
-
-        return AtomworksSDProtoDataModule(data_cfg)
     raise ValueError(
         f"Unknown data.dataset_impl={dataset_impl!r}. "
         "Supported values: 'atomworks_sd', 'mg_proto', 'proto'."
     )
 
 
-@hydra.main(config_path="configs_local/seq_denoiser", config_name="proto_external_evidence", version_base="1.3.2")
+@hydra.main(config_path="configs_local/seq_denoiser", config_name="elix", version_base="1.3.2")
 def main(cfg: DictConfig):
     """
     Script for training an sequence denoiser model.
@@ -209,12 +200,6 @@ def main(cfg: DictConfig):
         lr_monitor = LearningRateMonitor(logging_interval="step")
         callbacks.append(lr_monitor)
 
-    # Set sigma data in model
-    bb_std, scn_std = cfg.model.sigma_data
-    bb_mean, scn_mean = 0.0, 0.0  # unused; for backwards compatibility
-    scale_factors = {"bb": (bb_mean, bb_std), "scn": (scn_mean, scn_std),}
-    lit_model.model.set_scale_factors(scale_factors)
-
     # Train
     trainer = L.Trainer(logger=logger,
                         default_root_dir=cfg.logging.log_dir,
@@ -280,7 +265,7 @@ def load_resume_config(cfg: DictConfig, resume_ckpt_path: str) -> DictConfig:
         for key, value in overrides.items():
             OmegaConf.update(cfg, key, value, merge=True)
 
-    return elix_mpnn_config(cfg)
+    return cfg
 
 
 def update_config(cfg: DictConfig) -> None:

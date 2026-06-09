@@ -32,7 +32,7 @@ from tqdm.auto import tqdm
 
 from allatom_design.model.seq_denoiser.denoisers.seq_design import \
     graph_utils as graph
-from allatom_design.model.seq_denoiser.denoisers.seq_design.potts_utils import (
+from allatom_design.model.seq_denoiser.denoisers.seq_design.multi_head_potts import (
     MultiHeadFactorPotts,
 )
 

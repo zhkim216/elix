@@ -2,7 +2,7 @@ import unittest
 import torch
 from torchtyping import TensorType
 from typing import Any, Dict
-from allatom_design.model.seq_denoiser.denoisers.atom_mpnn_denoiser import _aggregate_potts_params
+from allatom_design.model.seq_denoiser.denoisers.elix_mpnn_denoiser import _aggregate_potts_params
 
 
 class TestPottsAggregation(unittest.TestCase):
@@ -31,7 +31,7 @@ class TestPottsAggregation(unittest.TestCase):
             "unique_ids": torch.tensor([0], device=self.device),
         }
         
-        result = _aggregate_potts_params(potts_decoder_aux, tied_sampling_inputs)
+        result = _aggregate_potts_params(potts_decoder_aux, tied_sampling_inputs, use_mean=False)
         
         # Expected outputs
         expected_h = h[0] + h[1]
@@ -75,7 +75,7 @@ class TestPottsAggregation(unittest.TestCase):
             "unique_ids": torch.tensor([0], device=self.device),
         }
         
-        result = _aggregate_potts_params(potts_decoder_aux, tied_sampling_inputs)
+        result = _aggregate_potts_params(potts_decoder_aux, tied_sampling_inputs, use_mean=False)
 
         # Expected h: Node 2 is masked, so its h should be the sum but the mask will be 0.
         expected_h = h[0] + h[1] 
@@ -119,7 +119,7 @@ class TestPottsAggregation(unittest.TestCase):
             "unique_ids": torch.tensor([0, 1], device=self.device),
         }
         
-        result = _aggregate_potts_params(potts_decoder_aux, tied_sampling_inputs)
+        result = _aggregate_potts_params(potts_decoder_aux, tied_sampling_inputs, use_mean=False)
         
         # Expected outputs
         expected_h_grp0 = h[0] + h[2]
@@ -160,7 +160,7 @@ class TestPottsAggregation(unittest.TestCase):
             "unique_ids": torch.tensor([0, 1], device=self.device),
         }
         
-        result = _aggregate_potts_params(potts_decoder_aux, tied_sampling_inputs)
+        result = _aggregate_potts_params(potts_decoder_aux, tied_sampling_inputs, use_mean=False)
         
         # Expected outputs
         expected_h_grp0 = h[0] + h[2]
@@ -213,7 +213,7 @@ class TestPottsAggregation(unittest.TestCase):
             "unique_ids": torch.tensor([0], device=self.device),
         }
 
-        result = _aggregate_potts_params(potts_decoder_aux, tied_sampling_inputs)
+        result = _aggregate_potts_params(potts_decoder_aux, tied_sampling_inputs, use_mean=False)
 
         # Hardcode the expected J_new by summing contributions for each edge (i,j)
         expected_J = torch.zeros(1, N, N, C, C, device=self.device, dtype=self.dtype)

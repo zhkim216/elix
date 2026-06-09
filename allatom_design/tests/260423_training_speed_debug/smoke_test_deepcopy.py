@@ -67,8 +67,9 @@ class SeqDenoiserShallow(SeqDenoiser):
 
         with torch.no_grad():
             batch["seq_cond_mask"] = self.mask_selector.sample_seq_cond_mask(batch, t)
-            batch["atom_cond_mask"], scn_token_mask, expanded_bb_mask = self.mask_selector.sample_atom_cond_mask(batch)
-            batch["pseudo_context_mask"] = (scn_token_mask + expanded_bb_mask).clamp(max=1.0)
+            batch["atom_cond_mask"], scn_token_mask, scn_atom_mask = self.mask_selector.sample_atom_cond_mask(batch)
+            batch["sidechain_context_atom_mask"] = scn_atom_mask
+            batch["seq_cond_mask"] = (batch["seq_cond_mask"] + scn_token_mask).clamp(max=1.0)
 
         _, aux_preds = self.denoiser(batch)
         outputs.update(aux_preds)
@@ -85,7 +86,7 @@ def build_cfg(args) -> DictConfig:
         cfg = compose(
             config_name="seq_denoiser.yaml",
             overrides=[
-                "denoiser=lc_atom_mpnn",
+                "denoiser=elix_mpnn",
                 f"train.batch_size={args.batch_size}",
                 "train.compile.compile_model=false",
                 "train.debug=false",
@@ -304,8 +305,6 @@ def main():
 
     # --- Build model (random init) ---
     lit_model = LitSeqDenoiser(cfg)
-    lit_model.model.set_scale_factors({"bb": (0.0, cfg.model.sigma_data[0]),
-                                       "scn": (0.0, cfg.model.sigma_data[1])})
     stock_model = lit_model.model.to(device).eval()
 
     # Build shallow variant on the same weights
@@ -385,7 +384,7 @@ def main():
         rationale = (
             "All output tensors are bit-identical, and no tensor in the original batch "
             "is modified in place by the shallow-copy variant. New keys added to the "
-            "shallow copy (seq_cond_mask/atom_cond_mask/pseudo_context_mask) leak back "
+            "shallow copy (seq_cond_mask/atom_cond_mask/sidechain_context_atom_mask) leak back "
             "into the caller's batch, but the caller (LitSeqDenoiser.training_step) does "
             "not read those keys after forward, so this is harmless."
             if any_mutation else

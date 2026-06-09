@@ -6,7 +6,7 @@ direction: "ortho_to_allo"   # { "allo_to_active" | "ortho_to_allo" }
 
 # Model checkpoint (Sherlock path)
 ckpt_path: /oak/stanford/groups/possu/jinho/out_dir/ligand_seq_des/exp35_cfg2/checkpoints/ema/sd-step82500-epoch52-ema0.99.ckpt
-sampling_cfg_path: /oak/stanford/groups/possu/jinho/allatom-design/allatom_design/configs/seq_des/lc_atom_mpnn_inference.yaml
+sampling_cfg_path: /oak/stanford/groups/possu/jinho/allatom-design/allatom_design/configs/seq_des/elix_mpnn_inference.yaml
 
 # AlloBench inputs (Sherlock paths)
 allobench_csv: /oak/stanford/groups/possu/jinho/allobench/AlloBench.csv

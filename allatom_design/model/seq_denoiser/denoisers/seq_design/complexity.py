@@ -14,7 +14,7 @@
 
 """Local sequence-complexity regularization helpers.
 
-Adapted from Chroma's complexity utilities so AtomMPNN sampling no longer
+Adapted from Chroma's complexity utilities so ElixMPNN sampling no longer
 depends on the root-level ``chroma`` package.
 """
 
