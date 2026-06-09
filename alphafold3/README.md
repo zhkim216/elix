@@ -3,9 +3,10 @@
 # AlphaFold 3
 
 This package provides an implementation of the inference pipeline of AlphaFold
-3. See below for how to access the model parameters. You may only use AlphaFold
-3 model parameters if received directly from Google. Use is subject to these
-[terms of use](https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md).
+
+1.  See below for how to access the model parameters. You may only use AlphaFold
+    3 model parameters if received directly from Google. Use is subject to these
+    [terms of use](https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md).
 
 Any publication that discloses findings arising from using this source code, the
 model parameters or outputs produced by those should [cite](#citing-this-work)
@@ -67,14 +68,14 @@ docker run -it \
     --volume <DATABASES_DIR>:/root/public_databases \
     --gpus all \
     alphafold3 \
-    python -m alphafold3.run_alphafold \
+    python run_alphafold.py \
     --json_path=/root/af_input/fold_input.json \
     --model_dir=/root/models \
     --output_dir=/root/af_output
 ```
 
-There are various flags that you can pass to the `alphafold3.run_alphafold` command, to
-list them all run `python -m alphafold3.run_alphafold --help`. Two fundamental flags that
+There are various flags that you can pass to the `run_alphafold.py` command, to
+list them all run `python run_alphafold.py --help`. Two fundamental flags that
 control which parts AlphaFold 3 will run are:
 
 *   `--run_data_pipeline` (defaults to `true`): whether to run the data
@@ -172,11 +173,10 @@ Copyright 2024 DeepMind Technologies Limited.
 
 ### AlphaFold 3 Source Code and Model Parameters
 
-The AlphaFold 3 source code is licensed under the Creative Commons
-Attribution-Non-Commercial ShareAlike International License, Version 4.0
-(CC-BY-NC-SA 4.0) (the "License"); you may not use this file except in
-compliance with the License. You may obtain a copy of the License at
-[https://github.com/google-deepmind/alphafold3/blob/main/LICENSE](https://github.com/google-deepmind/alphafold3/blob/main/LICENSE).
+AlphaFold 3 source code is licensed under the Apache License, Version 2.0 (the
+"License"); you may not use its source code except in compliance with the
+License. You may obtain a copy of the License at
+http://www.apache.org/licenses/LICENSE-2.0.
 
 The AlphaFold 3 model parameters are made available under the
 [AlphaFold 3 Model Parameters Terms of Use](https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md)

@@ -357,6 +357,7 @@ def make_af3_json(af3_ss_input_dir: str = None,
 
             designed_sample_atom_array = subsample_dict['designed_sample_atom_array'][dsidx]
             pdb_chain_info = subsample_dict['pdb_chain_info']
+            native_res_name_by_chain_res_id = subsample_dict.get("native_res_name_by_chain_res_id") or {}
 
             if make_tc_input:
                 template_sample_path = subsample_dict['designed_sample_path_for_af3_tc'][dsidx]
@@ -388,6 +389,12 @@ def make_af3_json(af3_ss_input_dir: str = None,
                 # This method only fills in the gaps between the actual residues, not the gaps at the beginning or end of the chain
                 full_length = np.max(_res_ids) - np.min(_res_ids) + 1
                 chain_seq_with_gaps = np.full(full_length, "UNK")
+                chain_id = protein_pn_unit_iid.split("_")[0]
+                min_res_id = int(np.min(_res_ids))
+                for offset, res_id in enumerate(range(min_res_id, min_res_id + full_length)):
+                    native_res_name = native_res_name_by_chain_res_id.get((chain_id, res_id))
+                    if native_res_name is not None:
+                        chain_seq_with_gaps[offset] = native_res_name
 
                 # Replace residues with actual sequence
                 chain_seq = designed_sample_atom_array[chain_mask].res_name[_res_starts]

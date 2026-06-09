@@ -11,7 +11,10 @@ import gc
 
 from atomworks.io.utils import non_rcsb
 from allatom_design.utils.sample_io_utils import save_cif_file
-from allatom_design.utils.atom_array_utils import insert_unk_residues_for_gaps_in_atom_array, clean_up_and_renumber_atom_array
+from allatom_design.utils.atom_array_utils import (
+    clean_up_and_renumber_atom_array,
+    insert_unk_residues_for_gaps_in_atom_array,
+)
 
 from allatom_design.eval.utils.cfg_utils import require_cfg_value, resolve_sampling_cfg
 from allatom_design.eval.utils.eval_setup_utils import get_checkpoints, load_seq_des_model, ckpt_label, _parallel_context
@@ -159,6 +162,10 @@ def design_sequence(
                 if example_id not in outputs:
                     outputs[example_id] = defaultdict(list)
                 aux = id_to_aux[example_id]
+                batch_idx = example_id_to_batch_idx[example_id]
+                input_atom_array = batch["atom_array"][batch_idx]
+                native_res_name_by_chain_res_id = batch["native_res_name_by_chain_res_id"][batch_idx]
+                outputs[example_id]["native_res_name_by_chain_res_id"] = native_res_name_by_chain_res_id
 
                 # Per-(schedule, gamma) counter so that tagged sample ids reset
                 # within each schedule run (e.g. ramp_up_t0.5_sample0,
@@ -228,8 +235,11 @@ def design_sequence(
                     # atom_array with gaps for af3 template conditioning
                     designed_atom_array_with_gaps = designed_atom_array.copy()
 
-                    # Insert UNK atoms for gaps in protein backbone atom array
-                    designed_atom_array_with_gaps = insert_unk_residues_for_gaps_in_atom_array(designed_atom_array_with_gaps)
+                    # Fill AF3 template-conditioning gaps with native residue names when available.
+                    designed_atom_array_with_gaps = insert_unk_residues_for_gaps_in_atom_array(
+                        designed_atom_array_with_gaps,
+                        missing_res_name_by_chain_res_id=native_res_name_by_chain_res_id,
+                    )
 
                     # Save designed atom array to cif file
                     out_file = f"{sample_out_dir}/{designed_sample_id}.cif"
@@ -240,8 +250,6 @@ def design_sequence(
                     out_file_for_af3_tc = f"{sample_out_dir_for_af3_tc}/{designed_sample_id}.cif"
                     save_cif_file(designed_atom_array_with_gaps, out_file_for_af3_tc, cif_save_cfg=cif_save_cfg)
                     outputs[example_id]["designed_sample_path_for_af3_tc"].append(out_file_for_af3_tc)
-
-                    input_atom_array = batch["atom_array"][example_id_to_batch_idx[example_id]]
 
                     # Calculate sequence recovery metrics
                     seq_recovery_metrics = calculate_sequence_recovery(input_atom_array, designed_atom_array,

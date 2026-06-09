@@ -97,23 +97,42 @@ def _joint_resolved_receptor_ca_masks(
     sample_ca_mask_initial = sample_receptor_mask & (sample_atom_array.atom_name == "CA") & (sample_atom_array.res_name != "UNK")
     pred_ca_mask_initial = pred_receptor_mask & (pred_atom_array.atom_name == "CA") & (pred_atom_array.res_name != "UNK")
 
-    if sample_ca_mask_initial.sum() != pred_ca_mask_initial.sum():
-        return None, None, "Number of CA atoms in sample and pred must match"
-
     if sample_ca_mask_initial.sum() == 0:
         return None, None, "No CA atoms found"
 
-    sample_ca_resolved_mask = ~np.isnan(sample_atom_array[sample_ca_mask_initial].coord[:, 0])
-    pred_ca_resolved_mask = ~np.isnan(pred_atom_array[pred_ca_mask_initial].coord[:, 0])
+    def _ca_by_pn_unit_res_offset(atom_array: AtomArray, ca_mask: np.ndarray) -> dict[tuple[str, int], int]:
+        ca_indices = np.where(ca_mask)[0]
+        pn_unit_min_res_id = {}
+        for idx in ca_indices:
+            pn_unit_iid = str(atom_array.pn_unit_iid[idx])
+            res_id = int(atom_array.res_id[idx])
+            pn_unit_min_res_id[pn_unit_iid] = min(res_id, pn_unit_min_res_id.get(pn_unit_iid, res_id))
+        return {
+            (
+                str(atom_array.pn_unit_iid[idx]),
+                int(atom_array.res_id[idx]) - pn_unit_min_res_id[str(atom_array.pn_unit_iid[idx])],
+            ): idx
+            for idx in ca_indices
+        }
+
+    sample_ca_by_key = _ca_by_pn_unit_res_offset(sample_atom_array, sample_ca_mask_initial)
+    pred_ca_by_key = _ca_by_pn_unit_res_offset(pred_atom_array, pred_ca_mask_initial)
+    common_keys = [key for key in sample_ca_by_key if key in pred_ca_by_key]
+    if len(common_keys) == 0:
+        return None, None, "No common receptor CA residue offsets found"
+
+    sample_ca_indices_initial = np.array([sample_ca_by_key[key] for key in common_keys])
+    pred_ca_indices_initial = np.array([pred_ca_by_key[key] for key in common_keys])
+
+    sample_ca_resolved_mask = ~np.isnan(sample_atom_array[sample_ca_indices_initial].coord[:, 0])
+    pred_ca_resolved_mask = ~np.isnan(pred_atom_array[pred_ca_indices_initial].coord[:, 0])
     ca_resolved_mask = sample_ca_resolved_mask & pred_ca_resolved_mask
 
-    sample_ca_indices = np.where(sample_ca_mask_initial)[0]
     sample_ca_mask = np.zeros(len(sample_atom_array), dtype=bool)
-    sample_ca_mask[sample_ca_indices[ca_resolved_mask]] = True
+    sample_ca_mask[sample_ca_indices_initial[ca_resolved_mask]] = True
 
-    pred_ca_indices = np.where(pred_ca_mask_initial)[0]
     pred_ca_mask = np.zeros(len(pred_atom_array), dtype=bool)
-    pred_ca_mask[pred_ca_indices[ca_resolved_mask]] = True
+    pred_ca_mask[pred_ca_indices_initial[ca_resolved_mask]] = True
 
     if sample_ca_mask.sum() == 0:
         return None, None, "No resolved CA atoms found"

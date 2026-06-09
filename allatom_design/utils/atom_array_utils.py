@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import numpy as np
 from biotite.structure import AtomArray, get_residue_starts
 import atomworks.enums as aw_enums
@@ -29,9 +31,21 @@ def get_valid_standard_aa_residue_mask(atom_array: AtomArray) -> np.ndarray:
     return standard_aa_prot_mask & has_all_backbone
 
 
-def insert_unk_residues_for_gaps_in_atom_array(atom_array: AtomArray) -> AtomArray:
+def get_res_name_by_chain_res_id(atom_array: AtomArray) -> dict[tuple[str, int], str]:
+    """Return residue names keyed by chain ID and residue ID."""
+    res_starts = get_residue_starts(atom_array)
+    return {
+        (str(atom_array.chain_id[idx]), int(atom_array.res_id[idx])): str(atom_array.res_name[idx])
+        for idx in res_starts
+    }
+
+
+def insert_unk_residues_for_gaps_in_atom_array(
+    atom_array: AtomArray,
+    missing_res_name_by_chain_res_id: Mapping[tuple[str, int], str] | None = None,
+) -> AtomArray:
     """
-    Insert UNK/CA atoms at residue index gaps (non-consecutive res_id within a chain) in atom array of protein chains.    
+    Insert CA atoms at residue index gaps (non-consecutive res_id within a chain) in atom array of protein chains.
     """
     annotations = atom_array.get_annotation_categories()
     annot_categories_to_include = [
@@ -110,8 +124,16 @@ def insert_unk_residues_for_gaps_in_atom_array(atom_array: AtomArray) -> AtomArr
         start_res_id = res_ids[gap_idx]
         end_res_id = res_ids[gap_idx + 1]
         template_atom_idx = res_starts[gap_idx]
+        chain_id = str(chain_ids[gap_idx])
 
         for missing_res_id in range(start_res_id + 1, end_res_id):
+            missing_res_name = "UNK"
+            if missing_res_name_by_chain_res_id is not None:
+                missing_res_name = missing_res_name_by_chain_res_id.get(
+                    (chain_id, int(missing_res_id)),
+                    "UNK",
+                )
+
             unk_atom = AtomArray(1)
             unk_atom.coord[0] = [0.0, 0.0, 0.0]
 
@@ -119,7 +141,7 @@ def insert_unk_residues_for_gaps_in_atom_array(atom_array: AtomArray) -> AtomArr
                 if annot == "res_id":
                     unk_atom.set_annotation(annot, np.array([missing_res_id]))
                 elif annot == "res_name":
-                    unk_atom.set_annotation(annot, np.array(["UNK"]))
+                    unk_atom.set_annotation(annot, np.array([missing_res_name]))
                 elif annot in ("atom_name", "alt_atom_id"):
                     unk_atom.set_annotation(annot, np.array(["CA"]))
                 elif annot == "atom_id":

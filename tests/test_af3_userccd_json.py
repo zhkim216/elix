@@ -4,9 +4,14 @@ import json
 from pathlib import Path
 
 import numpy as np
-from biotite.structure import AtomArray
+from biotite.structure import AtomArray, get_residue_starts
 
-from allatom_design.eval.eval_utils.folding_utils import make_af3_json
+import atomworks.enums as aw_enums
+from allatom_design.eval.utils.folding_utils import make_af3_json
+from allatom_design.utils.atom_array_utils import (
+    get_res_name_by_chain_res_id,
+    insert_unk_residues_for_gaps_in_atom_array,
+)
 
 
 def _make_protein_metal_atom_array() -> AtomArray:
@@ -27,6 +32,55 @@ def _make_protein_metal_atom_array() -> AtomArray:
     atom_array.coord = np.array([record[6] for record in records], dtype=np.float32)
     atom_array.set_annotation("pn_unit_iid", np.array([record[7] for record in records]))
     return atom_array
+
+
+def _make_gap_protein_atom_array(residue_names: dict[int, str]) -> AtomArray:
+    res_ids = sorted(residue_names)
+    atom_array = AtomArray(len(res_ids))
+    atom_array.chain_id = np.array(["A"] * len(res_ids))
+    atom_array.res_id = np.array(res_ids)
+    atom_array.res_name = np.array([residue_names[res_id] for res_id in res_ids])
+    atom_array.atom_name = np.array(["CA"] * len(res_ids))
+    atom_array.element = np.array(["C"] * len(res_ids))
+    atom_array.coord = np.array([[float(res_id), 0.0, 0.0] for res_id in res_ids], dtype=np.float32)
+    atom_array.hetero = np.zeros(len(res_ids), dtype=bool)
+    atom_array.occupancy = np.ones(len(res_ids), dtype=float)
+    atom_array.b_factor = np.zeros(len(res_ids), dtype=float)
+
+    atom_array.set_annotation("alt_atom_id", np.array(["CA"] * len(res_ids)))
+    atom_array.set_annotation("atom_id", np.arange(1, len(res_ids) + 1))
+    atom_array.set_annotation("stereo", np.array(["S"] * len(res_ids)))
+    atom_array.set_annotation("is_aromatic", np.zeros(len(res_ids), dtype=bool))
+    atom_array.set_annotation("is_backbone_atom", np.ones(len(res_ids), dtype=bool))
+    atom_array.set_annotation("is_polymer", np.ones(len(res_ids), dtype=bool))
+    atom_array.set_annotation("charge", np.zeros(len(res_ids), dtype=int))
+    atom_array.set_annotation("atomic_number", np.full(len(res_ids), 6, dtype=int))
+    atom_array.set_annotation("atomize", np.ones(len(res_ids), dtype=bool))
+    atom_array.set_annotation("is_covalent_modification", np.zeros(len(res_ids), dtype=bool))
+    atom_array.set_annotation("uses_alt_atom_id", np.zeros(len(res_ids), dtype=bool))
+    atom_array.set_annotation("ins_code", np.array([""] * len(res_ids)))
+    atom_array.set_annotation("pn_unit_id", np.array(["A"] * len(res_ids)))
+    atom_array.set_annotation("molecule_id", np.zeros(len(res_ids), dtype=int))
+    atom_array.set_annotation("chain_entity", np.array(["1"] * len(res_ids)))
+    atom_array.set_annotation("pn_unit_entity", np.array(["1"] * len(res_ids)))
+    atom_array.set_annotation("molecule_entity", np.array(["1"] * len(res_ids)))
+    atom_array.set_annotation("transformation_id", np.array(["1"] * len(res_ids)))
+    atom_array.set_annotation("chain_iid", np.array(["A_1"] * len(res_ids)))
+    atom_array.set_annotation("pn_unit_iid", np.array(["A_1"] * len(res_ids)))
+    atom_array.set_annotation("molecule_iid", np.zeros(len(res_ids), dtype=int))
+    atom_array.set_annotation(
+        "chain_type",
+        np.full(len(res_ids), int(aw_enums.ChainType.POLYPEPTIDE_L), dtype=int),
+    )
+    return atom_array
+
+
+def _res_names_by_id(atom_array: AtomArray) -> dict[int, str]:
+    starts = get_residue_starts(atom_array)
+    return {
+        int(atom_array.res_id[idx]): str(atom_array.res_name[idx])
+        for idx in starts
+    }
 
 
 def test_make_af3_json_uses_userccd_component_ids_without_metal_rewrite(tmp_path: Path) -> None:
@@ -59,3 +113,79 @@ def test_make_af3_json_uses_userccd_component_ids_without_metal_rewrite(tmp_path
     assert payload["version"] == 4
     assert payload["userCCDPath"] == "/tmp/example_components_userccd.cif"
     assert ligand_entries == [{"id": "B", "ccdCodes": ["S179002"]}]
+
+
+def test_insert_gap_residues_defaults_to_unk_without_native_lookup() -> None:
+    atom_array = _make_gap_protein_atom_array({1: "ALA", 4: "TYR"})
+
+    with_gaps = insert_unk_residues_for_gaps_in_atom_array(atom_array)
+
+    assert _res_names_by_id(with_gaps) == {
+        1: "ALA",
+        2: "UNK",
+        3: "UNK",
+        4: "TYR",
+    }
+
+
+def test_insert_gap_residues_uses_native_lookup_when_available() -> None:
+    atom_array = _make_gap_protein_atom_array({1: "ALA", 4: "TYR"})
+    native_lookup = {
+        ("A", 1): "ALA",
+        ("A", 2): "GLY",
+        ("A", 3): "SER",
+        ("A", 4): "VAL",
+    }
+
+    with_gaps = insert_unk_residues_for_gaps_in_atom_array(
+        atom_array,
+        missing_res_name_by_chain_res_id=native_lookup,
+    )
+
+    assert _res_names_by_id(with_gaps) == {
+        1: "ALA",
+        2: "GLY",
+        3: "SER",
+        4: "TYR",
+    }
+
+
+def test_make_af3_json_fills_missing_gap_sequence_from_native_lookup(tmp_path: Path) -> None:
+    designed_atom_array = _make_gap_protein_atom_array({1: "ALA", 4: "TYR"})
+    native_atom_array = _make_gap_protein_atom_array({1: "ALA", 2: "GLY", 3: "SER", 4: "VAL"})
+    ss_dir = tmp_path / "ss"
+    tc_dir = tmp_path / "tc"
+    ss_dir.mkdir()
+    tc_dir.mkdir()
+    template_path = tmp_path / "template.cif"
+    template_path.write_text("")
+    sample_dict = {
+        "sample": {
+            "designed_sample_id": ["sample0"],
+            "designed_sample_atom_array": [designed_atom_array],
+            "designed_sample_path_for_af3_tc": [str(template_path)],
+            "native_res_name_by_chain_res_id": get_res_name_by_chain_res_id(native_atom_array),
+            "pdb_chain_info": {
+                "protein_pn_unit_iids": ["A_1"],
+                "ligand_pn_unit_iids": [],
+                "ligand_ccd_codes": [],
+            },
+        }
+    }
+
+    make_af3_json(
+        af3_ss_input_dir=ss_dir,
+        af3_tc_input_dir=tc_dir,
+        sample_dict=sample_dict,
+        json_config={"model_seeds": [42], "version": 2},
+        make_tc_input=True,
+    )
+
+    ss_payload = json.loads((ss_dir / "sample0.json").read_text())
+    protein_entry = ss_payload["sequences"][0]["protein"]
+    assert protein_entry["sequence"] == "AGSY"
+
+    tc_payload = json.loads((tc_dir / "sample0.json").read_text())
+    tc_protein_entry = tc_payload["sequences"][0]["protein"]
+    assert tc_protein_entry["sequence"] == "AGSY"
+    assert tc_protein_entry["templates"][0]["queryIndices"] == [0, 3]

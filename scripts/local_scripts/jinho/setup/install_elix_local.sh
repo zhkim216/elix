@@ -11,7 +11,7 @@
 #
 # Prerequisite:
 #   export MAMBA_ROOT_PREFIX=/home/yjhk/model-dev/envs/micromamba
-#   micromamba create -n elix_local python=3.10 openstructure zlib uv -c bioconda -c conda-forge -y
+#   micromamba create -n elix_local python=3.12 zlib uv -c conda-forge -y
 #   micromamba activate elix_local
 #
 # Usage: bash scripts/local_scripts/jinho/setup/install_elix_local.sh
@@ -36,6 +36,14 @@ if [ "$CONDA_DEFAULT_ENV" != "$ENV_NAME" ]; then
     echo "Please run: micromamba activate $ENV_NAME"
     exit 1
 fi
+
+python - <<'PY'
+import sys
+if sys.version_info < (3, 12):
+    raise SystemExit(
+        f"Error: AlphaFold3 requires Python >=3.12, got {sys.version.split()[0]}"
+    )
+PY
 
 echo "Starting AF3AD desktop environment setup (Hybrid Mode)..."
 echo "Configuration:"
@@ -69,11 +77,12 @@ UV_CACHE_DIR="$UV_CACHE_DIR" uv pip install \
 UV_CACHE_DIR="$UV_CACHE_DIR" uv pip install -r "$REPO_DIR/requirements_split/local/pip-only-torch.txt"
 echo "✓ PyTorch installed"
 
-# Step 3: Install JAX
-echo "Step 3: Installing JAX 0.4.34+cuda12..."
-UV_CACHE_DIR="$UV_CACHE_DIR" uv pip install jax==0.4.34
-UV_CACHE_DIR="$UV_CACHE_DIR" uv pip install --upgrade jax[cuda12]==0.4.34 -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-echo "✓ JAX installed"
+# Step 3: Install AlphaFold3 build tools. Runtime deps, including JAX, are
+# installed from alphafold3/pyproject.toml in Step 5.
+echo "Step 3: Installing AlphaFold3 build tools..."
+UV_CACHE_DIR="$UV_CACHE_DIR" uv pip install \
+    scikit_build_core pybind11 "cmake>=3.28" ninja setuptools_scm
+echo "✓ AlphaFold3 build tools installed"
 
 # Step 4: Install HMMER from source with seq_limit patch
 echo "Step 4: Installing HMMER from source..."
@@ -124,8 +133,8 @@ echo "Step 5: Installing AlphaFold3..."
 # Go back to allatom-design root
 cd "$REPO_DIR"
 
-UV_CACHE_DIR="$UV_CACHE_DIR" uv pip install -r "$REPO_DIR/requirements_split/local/af3-dev-requirements.txt"
-UV_CACHE_DIR="$UV_CACHE_DIR" uv pip install -e ./alphafold3 --no-deps
+UV_CACHE_DIR="$UV_CACHE_DIR" uv pip install \
+    -e ./alphafold3 --no-build-isolation --index-strategy unsafe-best-match
 if command -v build_data &> /dev/null; then
     build_data
 fi
@@ -168,6 +177,10 @@ cd "$REPO_DIR"
 # currently targets Python 3.12, so ignore Requires-Python for this local env.
 python -m pip install -e . --no-deps --ignore-requires-python
 echo "✓ allatom_design installed"
+
+# JAX 0.9.1 requires newer cuDNN than the exact torch 2.7.0 metadata pin.
+UV_CACHE_DIR="$UV_CACHE_DIR" uv pip install \
+    nvidia-cudnn-cu12==9.22.0.52 --index-strategy unsafe-best-match
 
 # Step 8: Cleanup
 echo "Step 8: Cleaning up..."

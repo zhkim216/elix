@@ -20,6 +20,7 @@ from allatom_design.data.transform.sd_featurizer import (
 )
 from allatom_design.eval.utils.eval_setup_utils import get_pdb_files
 from allatom_design.eval.utils.cfg_utils import guidance_is_enabled
+from allatom_design.utils.atom_array_utils import get_res_name_by_chain_res_id
 from allatom_design.utils.sample_io_utils import load_example_with_parse
 from allatom_design.utils.tensor_utils import to
 
@@ -118,7 +119,13 @@ def get_sd_batch(
             for pdb_path in pdb_paths
         )
 
+    native_res_name_by_chain_res_id = [
+        example.pop("native_res_name_by_chain_res_id")
+        for example in batch_examples
+    ]
+
     batch = sd_collator(batch_examples)
+    batch["native_res_name_by_chain_res_id"] = native_res_name_by_chain_res_id
     batch = to(batch, device)
     return batch
 
@@ -145,6 +152,7 @@ def get_sd_example(
         preprocess_cfg=preprocess_cfg,
         sample_is_designed=sample_is_designed,
     )
+    native_res_name_by_chain_res_id = get_res_name_by_chain_res_id(example["atom_array"])
 
     pdb_id = Path(pdb_path).stem.split("_")[0]
     example["query_pn_unit_iids"] = resolve_query_pn_unit_iids(
@@ -156,7 +164,9 @@ def get_sd_example(
     featurizer_cfg = OmegaConf.to_container(featurizer_cfg, resolve=True)
     featurizer = sd_featurizer_for_design(**featurizer_cfg, sample_is_designed=sample_is_designed)
 
-    return featurizer(example)
+    featurized = featurizer(example)
+    featurized["native_res_name_by_chain_res_id"] = native_res_name_by_chain_res_id
+    return featurized
 
 def preprocess_input(
     example: dict[str, Any],
@@ -326,6 +336,10 @@ def collect_design_outputs(
         sample_dict_per_ckpt[example_id]["designed_sample_seq"] = output["designed_sample_seq"]
         sample_dict_per_ckpt[example_id]["designed_sample_path"] = output["designed_sample_path"]
         sample_dict_per_ckpt[example_id]["designed_sample_path_for_af3_tc"] = output["designed_sample_path_for_af3_tc"]
+        if "native_res_name_by_chain_res_id" in output:
+            sample_dict_per_ckpt[example_id]["native_res_name_by_chain_res_id"] = output[
+                "native_res_name_by_chain_res_id"
+            ]
 
     for example_id in sample_dict_per_ckpt.keys():
         pdb_chain_info = defaultdict(list)

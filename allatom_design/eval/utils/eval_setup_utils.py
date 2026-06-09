@@ -19,7 +19,7 @@ except ImportError:
     natsorted = sorted
 
 from allatom_design.model.seq_denoiser.lit_sd_model import LitSeqDenoiser
-from allatom_design.utils.checkpoint_utils import get_cfg_from_ckpt
+from allatom_design.utils.checkpoint_utils import get_cfg_from_ckpt, repair_state_dict
 from allatom_design.eval.utils.cfg_utils import require_cfg_value, resolve_sampling_cfg
 
 
@@ -342,9 +342,18 @@ def load_seq_des_model(cfg: DictConfig = None,
     if resolved_ckpt_path is None:
         raise ValueError("model_cfg.ckpt_path is required unless ckpt_path is passed explicitly")
 
-    # Load the model from checkpoint
-    lit_sd_model = LitSeqDenoiser.load_from_checkpoint(str(resolved_ckpt_path)).eval()
-    ckpt_model_cfg, _ = get_cfg_from_ckpt(str(resolved_ckpt_path))
+    # Load the model from checkpoint. Evaluation runs use eager modules and
+    # repair torch.compile() checkpoint keys when needed.
+    ckpt_model_cfg, checkpoint = get_cfg_from_ckpt(str(resolved_ckpt_path))
+    if ckpt_model_cfg.get("train", {}).get("compile", {}).get("compile_model", False):
+        ckpt_model_cfg.train.compile.compile_model = False
+    state_dict = repair_state_dict(checkpoint["state_dict"])
+    for obsolete_key in ("model.bb_std", "model.bb_mean", "model.scn_mean", "model.scn_std"):
+        state_dict.pop(obsolete_key, None)
+    lit_sd_model = LitSeqDenoiser(ckpt_model_cfg).eval()
+    lit_sd_model.load_state_dict(state_dict, strict=True)
+    if device is not None:
+        lit_sd_model = lit_sd_model.to(device)
     data_cfg = hydra.utils.instantiate(ckpt_model_cfg.data)
 
     seq_des_model["model"] = lit_sd_model.model
