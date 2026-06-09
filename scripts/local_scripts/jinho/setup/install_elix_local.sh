@@ -6,8 +6,8 @@
 # This script sets up the complete environment for allatom-design on the lab
 # desktop RTX 2080 Ti
 # using a hybrid approach:
-# 1. Mamba (Conda) for OpenStructure (complex C++ dependencies)
-# 2. UV for everything else (fast, clean Python package management)
+# 1. Mamba (Conda) for Python, uv, and C/C++ build headers such as zlib
+# 2. UV for Python package management and editable installs
 #
 # Prerequisite:
 #   export MAMBA_ROOT_PREFIX=/home/yjhk/model-dev/envs/micromamba
@@ -65,7 +65,7 @@ export CMAKE_ARGS="${CMAKE_ARGS:--DCMAKE_PREFIX_PATH=$CONDA_PREFIX -DZLIB_ROOT=$
 # Step 1: Install pip & build tools via UV
 echo "Step 1: Updating pip and build tools..."
 UV_CACHE_DIR="$UV_CACHE_DIR" uv pip install --upgrade pip setuptools wheel
-# Install exceptiongroup for Python 3.10 compatibility (needed for atomworks)
+# Install exceptiongroup because some AtomWorks dependency paths still import it.
 UV_CACHE_DIR="$UV_CACHE_DIR" uv pip install exceptiongroup
 echo "✓ Basic tools updated (including exceptiongroup)"
 
@@ -166,15 +166,15 @@ UV_CACHE_DIR="$UV_CACHE_DIR" uv pip install "openbabel-wheel==3.1.1.22" pathspec
 echo "Step 7.2: Installing atomworks..."
 if [ -d "atomworks" ]; then
     cd atomworks
-    # Note: We already patched __init__.py and pyproject.toml for Python 3.10 support
+    # Keep the AlphaFold3 dependency set; AtomWorks is installed without deps.
     UV_CACHE_DIR="$UV_CACHE_DIR" uv pip install -e . --no-deps
 fi
 echo "✓ atomworks installed"
 
 echo "Step 7.3: Installing allatom_design..."
 cd "$REPO_DIR"
-# elix_local uses Python 3.10 for OpenStructure; the repository metadata
-# currently targets Python 3.12, so ignore Requires-Python for this local env.
+# Dependencies were installed explicitly above; keep the editable project install
+# from changing the AF3-compatible dependency set.
 python -m pip install -e . --no-deps --ignore-requires-python
 echo "✓ allatom_design installed"
 
@@ -192,7 +192,6 @@ echo "AF3AD Desktop Environment Setup Complete!"
 echo "============================================================================="
 echo "Environment: $ENV_NAME"
 echo "Python Version: $(python --version)"
-echo "OpenStructure: $(python -c 'import ost; print("Installed")' 2>/dev/null || echo "Not Found")"
 echo ""
 echo "To activate environment variables for the RTX 2080 Ti desktop:"
 echo "  source scripts/local_scripts/jinho/setup/activate_elix_local.sh"

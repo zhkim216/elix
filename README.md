@@ -161,6 +161,16 @@ python -c 'import jax, torch, rdkit, alphafold3, atomworks, allatom_design; prin
 python -m pytest alphafold3/tests/test_runner_module.py -q
 ```
 
+## Evaluation Notes
+
+AF3 template/input gap residues are filled from native residue names when those
+names are available in the evaluation sample metadata. Missing lookup entries
+still fall back to `UNK`.
+
+AF3 v3.0.3 summary confidence JSON may not include `interface_min_pae`. The
+Elix metric code records that field as missing when absent; this warning alone
+does not mean AF3 prediction failed.
+
 Expected `pip check` metadata conflicts:
 
 - `atomworks` declares `rdkit<2025.9`, while AlphaFold3-new uses

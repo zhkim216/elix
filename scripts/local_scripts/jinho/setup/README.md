@@ -9,10 +9,12 @@ desktop with an RTX 2080 Ti.
 Complete environment installation script that performs:
 - Installs packages into the active `elix_local` micromamba environment
 - Installs PyTorch 2.7.0+cu126 and matching PyG wheels
-- Installs JAX 0.4.34+cuda12
+- Installs AlphaFold3 build tools and AlphaFold3 runtime dependencies from
+  `alphafold3/pyproject.toml`, including JAX 0.9.1
 - Builds HMMER 3.4 from source (with seq_limit patch)
-- Installs AlphaFold3 (editable mode, no-deps)
+- Installs AlphaFold3 in editable mode with `--no-build-isolation`
 - Installs allatom_design dependencies
+- Installs AtomWorks in editable mode with `--no-deps`
 - Installs allatom_design in editable mode
 - Configures RTX 2080 Ti / Turing compatibility environment variables
 
@@ -29,7 +31,7 @@ Script for setting RTX 2080 Ti compatibility environment variables.
 ```bash
 # Run from allatom-design root directory
 export MAMBA_ROOT_PREFIX=/home/yjhk/model-dev/envs/micromamba
-micromamba create -n elix_local python=3.10 openstructure zlib uv -c bioconda -c conda-forge -y
+micromamba create -n elix_local python=3.12 zlib uv -c conda-forge -y
 micromamba activate elix_local
 bash scripts/local_scripts/jinho/setup/install_elix_local.sh
 ```
@@ -50,10 +52,11 @@ python allatom_design/train_seq_denoiser.py --config-path configs_local/seq_deno
 
 ### Python Packages
 - **PyTorch**: 2.7.0+cu126
-- **JAX**: 0.4.34+cuda12
-- **Lightning**: Latest
-- **AlphaFold3**: Installed in editable mode
-- **Allatom-design**: installed in editable mode with core dependencies (mashumaro, torch-cluster, torch-geometric, nglview, pandas, seaborn, matplotlib, torchtyping, einops, biopython, ihm, modelcif)
+- **JAX**: 0.9.1 from the AlphaFold3 dependency set
+- **Lightning**: 2.5.6
+- **AlphaFold3**: Installed in editable mode with C++ extensions built locally
+- **AtomWorks**: installed in editable mode with `--no-deps`
+- **Allatom-design**: installed in editable mode with core dependencies (mashumaro, nglview, pandas, seaborn, matplotlib, torchtyping, einops, biopython, ihm, modelcif)
 - **Extras**: biotite==1.2.0, hydride, py3Dmol, pymol-remote, pyarrow==17.0.0, cython, cytoolz, typer, openbabel-wheel, pathspec
 
 ### System Tools
@@ -82,7 +85,19 @@ The script `install_elix_local.sh` installs the `atomworks` package from the `at
 
 ## Allatom-design Installation
 
-The script installs `allatom_design` from the repository root in editable mode. The `elix_local` environment uses Python 3.10 for OpenStructure compatibility, while the root package metadata currently declares Python 3.12, so the local install command uses `python -m pip install -e . --no-deps --ignore-requires-python`.
+The script installs `allatom_design` from the repository root in editable mode.
+The `elix_local` environment uses Python 3.12 to satisfy the AlphaFold3
+runtime and editable C++ build requirements.
+
+## Expected pip check Conflicts
+
+- `atomworks` declares `rdkit<2025.9`, while AlphaFold3 uses
+  `rdkit==2025.09.4`.
+- `torch==2.7.0+cu126` declares `nvidia-cudnn-cu12==9.5.1.17`, while JAX 0.9.1
+  uses `nvidia-cudnn-cu12==9.22.0.52`.
+
+These metadata conflicts are expected for this environment; validate runtime
+behavior with imports, AF3 runner tests, and a focused `run_elix` smoke.
 
 ## Key Changes Made
 
