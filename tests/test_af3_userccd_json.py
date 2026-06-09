@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 from biotite.structure import AtomArray, get_residue_starts
 
 import atomworks.enums as aw_enums
@@ -75,6 +76,33 @@ def _make_gap_protein_atom_array(residue_names: dict[int, str]) -> AtomArray:
     return atom_array
 
 
+def _make_modified_protein_atom_array() -> AtomArray:
+    records = [
+        ("A", 1, "ALA", False, "N", "N", [0.0, 0.0, 0.0], "A_1"),
+        ("A", 1, "ALA", False, "CA", "C", [1.0, 0.0, 0.0], "A_1"),
+        ("A", 1, "ALA", False, "C", "C", [2.0, 0.0, 0.0], "A_1"),
+        ("A", 1, "ALA", False, "O", "O", [3.0, 0.0, 0.0], "A_1"),
+        ("A", 2, "MLY", True, "N", "N", [0.0, 1.0, 0.0], "A_1"),
+        ("A", 2, "MLY", True, "CA", "C", [1.0, 1.0, 0.0], "A_1"),
+        ("A", 2, "MLY", True, "C", "C", [2.0, 1.0, 0.0], "A_1"),
+        ("A", 2, "MLY", True, "O", "O", [3.0, 1.0, 0.0], "A_1"),
+        ("A", 3, "GLY", False, "N", "N", [0.0, 2.0, 0.0], "A_1"),
+        ("A", 3, "GLY", False, "CA", "C", [1.0, 2.0, 0.0], "A_1"),
+        ("A", 3, "GLY", False, "C", "C", [2.0, 2.0, 0.0], "A_1"),
+        ("A", 3, "GLY", False, "O", "O", [3.0, 2.0, 0.0], "A_1"),
+    ]
+    atom_array = AtomArray(len(records))
+    atom_array.chain_id = np.array([record[0] for record in records])
+    atom_array.res_id = np.array([record[1] for record in records])
+    atom_array.res_name = np.array([record[2] for record in records])
+    atom_array.hetero = np.array([record[3] for record in records], dtype=bool)
+    atom_array.atom_name = np.array([record[4] for record in records])
+    atom_array.element = np.array([record[5] for record in records])
+    atom_array.coord = np.array([record[6] for record in records], dtype=np.float32)
+    atom_array.set_annotation("pn_unit_iid", np.array([record[7] for record in records]))
+    return atom_array
+
+
 def _res_names_by_id(atom_array: AtomArray) -> dict[int, str]:
     starts = get_residue_starts(atom_array)
     return {
@@ -113,6 +141,44 @@ def test_make_af3_json_uses_userccd_component_ids_without_metal_rewrite(tmp_path
     assert payload["version"] == 4
     assert payload["userCCDPath"] == "/tmp/example_components_userccd.cif"
     assert ligand_entries == [{"id": "B", "ccdCodes": ["S179002"]}]
+
+
+def test_make_af3_json_uses_closest_canonical_sequence_for_protein_ptm(tmp_path: Path) -> None:
+    sample_dict = {
+        "sample": {
+            "designed_sample_id": ["sample0"],
+            "designed_sample_atom_array": [_make_modified_protein_atom_array()],
+            "pdb_chain_info": {
+                "protein_pn_unit_iids": ["A_1"],
+                "ligand_pn_unit_iids": [],
+                "ligand_ccd_codes": [],
+            },
+        }
+    }
+
+    make_af3_json(
+        af3_ss_input_dir=tmp_path,
+        sample_dict=sample_dict,
+        json_config={"model_seeds": [42], "version": 2},
+    )
+
+    payload = json.loads((tmp_path / "sample0.json").read_text())
+    protein_entry = payload["sequences"][0]["protein"]
+
+    assert protein_entry["sequence"] == "AKG"
+    assert protein_entry["modifications"] == [
+        {"ptmType": "MLY", "ptmPosition": 2}
+    ]
+    assert "bondedAtomPairs" not in payload
+
+    folding_input = pytest.importorskip(
+        "alphafold3.common.folding_input",
+        reason="local AlphaFold 3 parser is not importable",
+    )
+    protein_chain = folding_input.ProteinChain.from_dict({"protein": protein_entry})
+
+    assert protein_chain.to_dict()["protein"]["sequence"] == "AKG"
+    assert protein_chain.to_ccd_sequence() == ["ALA", "MLY", "GLY"]
 
 
 def test_insert_gap_residues_defaults_to_unk_without_native_lookup() -> None:

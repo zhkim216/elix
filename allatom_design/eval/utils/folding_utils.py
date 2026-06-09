@@ -413,7 +413,7 @@ def make_af3_json(af3_ss_input_dir: str = None,
                     one_letter = get_1_from_3_letter_code(
                         res_name,
                         chain_type=ChainType.POLYPEPTIDE_L,
-                        use_closest_canonical=False
+                        use_closest_canonical=True
                     )
                     sequence_letters.append(one_letter)
 
