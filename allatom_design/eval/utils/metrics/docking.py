@@ -16,6 +16,7 @@ from allatom_design.data.transform.custom_transforms import annotate_ligand_pock
 from allatom_design.utils.sample_io_utils import save_cif_file
 
 from allatom_design.eval.utils.metrics.af3_confidence import extract_af3_confidence_metrics
+from allatom_design.eval.utils.misc import normalize_ccd_code
 
 
 def _docking_metric_error(message: str, ligand_ccd_code: str | None = None) -> dict[str, float | int | str | None]:
@@ -30,10 +31,6 @@ def _docking_metric_error(message: str, ligand_ccd_code: str | None = None) -> d
         "interface_min_pae": None,
         "ligand_ccd_code": ligand_ccd_code,
     }
-
-
-def _normalise_element(element: object) -> str:
-    return str(element).strip().upper()
 
 
 def _join_unique(values: list[str]) -> str | None:
@@ -67,7 +64,7 @@ def _selected_metal_pn_unit_iids(atom_array: AtomArray, ligand_pn_unit_iids: lis
         if not np.any(mask):
             continue
         ligand_atoms = atom_array[mask]
-        ligand_elements = [_normalise_element(element) for element in ligand_atoms.element]
+        ligand_elements = [normalize_ccd_code(element) for element in ligand_atoms.element]
         if len(ligand_elements) == 1 and ligand_elements[0] in METAL_ELEMENTS:
             metal_pn_unit_iids.append(str(ligand_pn_unit_iid))
     return metal_pn_unit_iids
@@ -145,7 +142,7 @@ def _metal_atom_key(atom_array: AtomArray, idx: int) -> tuple[str, str, str, str
         str(atom_array.pn_unit_iid[idx]),
         str(atom_array.res_name[idx]),
         str(atom_array.atom_name[idx]),
-        _normalise_element(atom_array.element[idx]),
+        normalize_ccd_code(atom_array.element[idx]),
     )
 
 
@@ -156,11 +153,11 @@ def _matched_metal_atom_masks(
 ) -> tuple[np.ndarray | None, np.ndarray | None, list[tuple[str, str, str, str]] | None, str | None]:
     sample_indices = np.where(
         np.isin(sample_atom_array.pn_unit_iid, metal_pn_unit_iids)
-        & np.isin([_normalise_element(element) for element in sample_atom_array.element], list(METAL_ELEMENTS))
+        & np.isin([normalize_ccd_code(element) for element in sample_atom_array.element], list(METAL_ELEMENTS))
     )[0]
     pred_indices = np.where(
         np.isin(pred_atom_array.pn_unit_iid, metal_pn_unit_iids)
-        & np.isin([_normalise_element(element) for element in pred_atom_array.element], list(METAL_ELEMENTS))
+        & np.isin([normalize_ccd_code(element) for element in pred_atom_array.element], list(METAL_ELEMENTS))
     )[0]
 
     sample_by_key = {}
@@ -189,8 +186,8 @@ def _matched_metal_atom_masks(
             pred_idx = int(pred_indices[0])
             sample_pn_unit_iid = str(sample_atom_array.pn_unit_iid[sample_idx])
             pred_pn_unit_iid = str(pred_atom_array.pn_unit_iid[pred_idx])
-            sample_element = _normalise_element(sample_atom_array.element[sample_idx])
-            pred_element = _normalise_element(pred_atom_array.element[pred_idx])
+            sample_element = normalize_ccd_code(sample_atom_array.element[sample_idx])
+            pred_element = normalize_ccd_code(pred_atom_array.element[pred_idx])
             if (
                 sample_pn_unit_iid == pred_pn_unit_iid
                 and sample_pn_unit_iid == str(metal_pn_unit_iids[0])

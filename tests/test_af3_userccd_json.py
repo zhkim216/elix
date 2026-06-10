@@ -5,11 +5,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
 import pytest
 from biotite.structure import AtomArray, get_residue_starts
 
 import atomworks.enums as aw_enums
+import allatom_design.eval.utils.design_sequence_two_stage as two_stage
 from allatom_design.eval.utils import folding_utils
+from allatom_design.eval.utils.data_utils import (
+    collect_design_outputs,
+    resolve_query_pn_unit_iids,
+)
 from allatom_design.eval.utils.folding_utils import make_af3_json
 from allatom_design.utils.atom_array_utils import (
     get_res_name_by_chain_res_id,
@@ -102,6 +108,27 @@ def _make_modified_protein_atom_array() -> AtomArray:
     atom_array.element = np.array([record[5] for record in records])
     atom_array.coord = np.array([record[6] for record in records], dtype=np.float32)
     atom_array.set_annotation("pn_unit_iid", np.array([record[7] for record in records]))
+    return atom_array
+
+
+def _make_designed_protein_ligand_atom_array(*, ligand_res_name: str = "UNK") -> AtomArray:
+    records = [
+        ("A", 1, "ALA", False, "N", "N", [0.0, 0.0, 0.0], "A_1", aw_enums.ChainType.POLYPEPTIDE_L),
+        ("A", 1, "ALA", False, "CA", "C", [1.0, 0.0, 0.0], "A_1", aw_enums.ChainType.POLYPEPTIDE_L),
+        ("A", 1, "ALA", False, "C", "C", [2.0, 0.0, 0.0], "A_1", aw_enums.ChainType.POLYPEPTIDE_L),
+        ("A", 1, "ALA", False, "O", "O", [3.0, 0.0, 0.0], "A_1", aw_enums.ChainType.POLYPEPTIDE_L),
+        ("E", 1, ligand_res_name, True, "C1", "C", [1.0, 2.0, 3.0], "E_1", aw_enums.ChainType.NON_POLYMER),
+    ]
+    atom_array = AtomArray(len(records))
+    atom_array.chain_id = np.array([record[0] for record in records])
+    atom_array.res_id = np.array([record[1] for record in records])
+    atom_array.res_name = np.array([record[2] for record in records])
+    atom_array.hetero = np.array([record[3] for record in records], dtype=bool)
+    atom_array.atom_name = np.array([record[4] for record in records])
+    atom_array.element = np.array([record[5] for record in records])
+    atom_array.coord = np.array([record[6] for record in records], dtype=np.float32)
+    atom_array.set_annotation("pn_unit_iid", np.array([record[7] for record in records]))
+    atom_array.set_annotation("chain_type", np.array([int(record[8]) for record in records], dtype=np.int8))
     return atom_array
 
 
@@ -291,6 +318,120 @@ def test_make_af3_json_uses_userccd_component_ids_without_metal_rewrite(tmp_path
     assert payload["version"] == 4
     assert payload["userCCDPath"] == "/tmp/example_components_userccd.cif"
     assert ligand_entries == [{"id": "B", "ccdCodes": ["S179002"]}]
+
+
+def test_resolve_query_pn_unit_iids_uses_json_fallback_when_legacy_column_is_blank() -> None:
+    atom_array = _make_designed_protein_ligand_atom_array()
+    sampling_inputs_df = pd.DataFrame(
+        {
+            "pdb_id": ["8clq"],
+            "query_pn_unit_iids": [""],
+            "query_pn_unit_iids_json": ['["A_1", "E_1"]'],
+        }
+    )
+
+    assert resolve_query_pn_unit_iids(
+        atom_array=atom_array,
+        sampling_inputs_df=sampling_inputs_df,
+        pdb_id="8clq",
+    ) == ["A_1", "E_1"]
+
+
+def test_collect_design_outputs_preserves_sampling_ligand_ccd_for_af3_json(tmp_path: Path) -> None:
+    sampling_inputs_df = pd.DataFrame(
+        {
+            "pdb_id": ["8clq"],
+            "query_pn_unit_iids": [""],
+            "query_pn_unit_iids_json": ['["A_1", "E_1"]'],
+            "ccd_code": ["ZGR"],
+        }
+    )
+    outputs = {
+        "8clq": {
+            "designed_sample_id": ["8clq_sample0"],
+            "seq_recovery_metrics": [{"seq_recovery_ratio": 1.0}],
+            "designed_sample_atom_array": [_make_designed_protein_ligand_atom_array(ligand_res_name="UNK")],
+            "designed_sample_seq": ["A"],
+            "designed_sample_path": [str(tmp_path / "8clq_sample0.cif")],
+            "designed_sample_path_for_af3_tc": [str(tmp_path / "8clq_sample0_tc.cif")],
+            "U": [0.0],
+        }
+    }
+    sample_dict = {
+        "8clq": {
+            "input_sample_path": str(tmp_path / "8clq.cif"),
+            "input_sample_id": "8clq",
+        }
+    }
+
+    collected = collect_design_outputs(
+        sample_dict=sample_dict,
+        outputs=outputs,
+        log_dir_per_ckpt=tmp_path,
+        csv_suffix="",
+        guidance_cfg=None,
+        sampling_inputs_df=sampling_inputs_df,
+    )
+
+    assert collected["8clq"]["pdb_chain_info"]["protein_pn_unit_iids"] == ["A_1"]
+    assert collected["8clq"]["pdb_chain_info"]["ligand_pn_unit_iids"] == ["E_1"]
+    assert collected["8clq"]["pdb_chain_info"]["ligand_ccd_codes"] == ["ZGR"]
+
+    af3_dir = tmp_path / "af3_inputs"
+    af3_dir.mkdir()
+    make_af3_json(
+        af3_ss_input_dir=af3_dir,
+        sample_dict=collected,
+        json_config={"model_seeds": [42], "version": 2},
+    )
+    payload = json.loads((af3_dir / "8clq_sample0.json").read_text())
+    ligand_entries = [entry["ligand"] for entry in payload["sequences"] if "ligand" in entry]
+
+    assert ligand_entries == [{"id": "E", "ccdCodes": ["ZGR"]}]
+
+
+def test_stage2_inputs_preserve_stage1_pdb_chain_info(monkeypatch) -> None:
+    def fake_create_pos_constraint_dict_from_pocket(**kwargs):
+        return {
+            "pdb_key": kwargs["pdb_key"],
+            "fixed_pos_seq": "",
+            "fixed_pos_scn": "",
+        }, None
+
+    monkeypatch.setattr(
+        two_stage,
+        "create_pos_constraint_dict_from_pocket",
+        fake_create_pos_constraint_dict_from_pocket,
+    )
+    pdb_chain_info = {
+        "protein_pn_unit_iids": ["A_1"],
+        "ligand_pn_unit_iids": ["E_1"],
+        "ligand_ccd_codes": ["ZGR"],
+    }
+    stage2_sample_dict, _, _ = two_stage._build_stage2_inputs_and_constraints(
+        stage1_sample_dict_per_ckpt={
+            "8clq": {
+                "input_sample_path": "/tmp/8clq.cif",
+                "designed_sample_id": ["8clq_twostage_ps_psample0"],
+                "designed_sample_path": ["/tmp/8clq_twostage_ps_psample0.cif"],
+                "designed_sample_atom_array": [object()],
+                "designed_sample_seq": ["A"],
+                "pdb_chain_info": pdb_chain_info,
+            }
+        },
+        stage1_ckpt_info={"global_step": 1, "epoch": 1, "ckpt_path": "/tmp/ckpt.pt"},
+        stage1_log_dir_per_ckpt=Path("/tmp/stage1"),
+        stage1_region="pocket",
+        stage2_region="scaffold",
+        stage2_constraint_type="pocket",
+        stage1_model_label="stage1",
+        pocket_distance=8.0,
+        pocket_annotation_method="calpha",
+        use_calpha_for_pocket_annotation=True,
+    )
+
+    assert stage2_sample_dict["8clq_twostage_ps_psample0"]["pdb_chain_info"] == pdb_chain_info
+    assert stage2_sample_dict["8clq_twostage_ps_psample0"]["pdb_chain_info"] is not pdb_chain_info
 
 
 def test_make_af3_json_uses_closest_canonical_sequence_for_protein_ptm(tmp_path: Path) -> None:

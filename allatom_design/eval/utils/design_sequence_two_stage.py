@@ -1,3 +1,4 @@
+import copy
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -61,6 +62,10 @@ def _build_stage2_inputs_and_constraints(
                 "input_sample_path": stage1_sample_path,
                 "input_sample_id": stage1_sample_id,
             }
+            if "pdb_chain_info" in stage1_entry:
+                stage2_sample_dict[stage1_sample_id]["pdb_chain_info"] = copy.deepcopy(
+                    stage1_entry["pdb_chain_info"]
+                )
             lineage_by_stage1_sample_id[stage1_sample_id] = {
                 "stage1_region": stage1_region,
                 "stage2_region": stage2_region,

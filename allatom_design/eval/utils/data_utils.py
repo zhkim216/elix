@@ -213,6 +213,59 @@ def _parse_query_pn_unit_iids(raw_value: Any) -> list[str]:
 
     return [str(parsed)] if str(parsed) != "" else []
 
+
+def _matched_sampling_input_row(
+    sampling_inputs_df: pd.DataFrame | None,
+    pdb_id: str | None,
+) -> pd.Series | None:
+    if sampling_inputs_df is None or pdb_id is None or "pdb_id" not in sampling_inputs_df.columns:
+        return None
+
+    pdb_id_normalized = str(pdb_id).lower()
+    matched = sampling_inputs_df[sampling_inputs_df["pdb_id"].astype(str).str.lower() == pdb_id_normalized]
+    if matched.empty:
+        return None
+    return matched.iloc[0]
+
+
+def _resolve_query_pn_unit_iids_from_sampling_row(row: pd.Series | None) -> list[str]:
+    if row is None:
+        return []
+
+    for column in ("query_pn_unit_iids", "query_pn_unit_iids_json"):
+        if column not in row.index:
+            continue
+        parsed = _parse_query_pn_unit_iids(row[column])
+        if len(parsed) > 0:
+            return parsed
+    return []
+
+
+def _metadata_ccd_code(raw_value: Any) -> str | None:
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, (float, np.floating)) and np.isnan(raw_value):
+        return None
+
+    ccd_code = str(raw_value).strip()
+    if ccd_code == "" or ccd_code.lower() == "nan":
+        return None
+    return ccd_code
+
+
+def _sampling_ligand_ccd_by_iid(
+    sampling_row: pd.Series | None,
+    ligand_pn_unit_iids: list[str],
+) -> dict[str, str]:
+    if sampling_row is None or len(ligand_pn_unit_iids) != 1 or "ccd_code" not in sampling_row.index:
+        return {}
+
+    ccd_code = _metadata_ccd_code(sampling_row["ccd_code"])
+    if ccd_code is None:
+        return {}
+    return {ligand_pn_unit_iids[0]: ccd_code}
+
+
 def resolve_query_pn_unit_iids(
     *,
     atom_array: AtomArray,
@@ -222,18 +275,11 @@ def resolve_query_pn_unit_iids(
     """
     Resolve query pn_unit_iids from sampling_inputs_df if available; otherwise fallback to all unique pn_unit_iid.
     """
-    if (
-        sampling_inputs_df is not None
-        and pdb_id is not None
-        and "pdb_id" in sampling_inputs_df.columns
-        and "query_pn_unit_iids" in sampling_inputs_df.columns
-    ):
-        pdb_id_normalized = str(pdb_id).lower()
-        matched = sampling_inputs_df[sampling_inputs_df["pdb_id"].astype(str).str.lower() == pdb_id_normalized]
-        if not matched.empty:
-            parsed = _parse_query_pn_unit_iids(matched["query_pn_unit_iids"].iloc[0])
-            if len(parsed) > 0:
-                return parsed
+    parsed = _resolve_query_pn_unit_iids_from_sampling_row(
+        _matched_sampling_input_row(sampling_inputs_df, pdb_id)
+    )
+    if len(parsed) > 0:
+        return parsed
 
     if "pn_unit_iid" in atom_array.get_annotation_categories():
         return [str(x) for x in np.unique(atom_array.pn_unit_iid).tolist()]
@@ -289,6 +335,7 @@ def collect_design_outputs(
     log_dir_per_ckpt: Path,
     csv_suffix: str,
     guidance_cfg: DictConfig | dict | None,
+    sampling_inputs_df: pd.DataFrame | None = None,
 ) -> dict:
     sample_dict_per_ckpt = copy.deepcopy(sample_dict)
     guidance_enabled = guidance_is_enabled(guidance_cfg)
@@ -343,6 +390,7 @@ def collect_design_outputs(
 
     for example_id in sample_dict_per_ckpt.keys():
         pdb_chain_info = defaultdict(list)
+        previous_chain_info = sample_dict_per_ckpt[example_id].get("pdb_chain_info", {})
         designed_sample_atom_array = sample_dict_per_ckpt[example_id]["designed_sample_atom_array"][0]
         designed_sample_prot_atom_array = designed_sample_atom_array[
             designed_sample_atom_array.chain_type == aw_enums.ChainType.POLYPEPTIDE_L
@@ -362,12 +410,65 @@ def collect_design_outputs(
             ].res_name[0])
             for pn_unit_iid in ligand_pn_unit_iids
         ]
+        ligand_ccd_code_by_iid = dict(zip(ligand_pn_unit_iids, ligand_ccd_codes))
+
+        input_sample_id = sample_dict_per_ckpt[example_id].get("input_sample_id", example_id)
+        pdb_id = str(input_sample_id).split("_")[0]
+        sampling_row = _matched_sampling_input_row(sampling_inputs_df, pdb_id)
+        query_pn_unit_iids = _resolve_query_pn_unit_iids_from_sampling_row(sampling_row)
+        if len(query_pn_unit_iids) == 0 and previous_chain_info:
+            query_pn_unit_iids = [
+                *previous_chain_info.get("protein_pn_unit_iids", []),
+                *previous_chain_info.get("ligand_pn_unit_iids", []),
+            ]
+
+        if len(query_pn_unit_iids) > 0:
+            query_pn_unit_iid_set = set(map(str, query_pn_unit_iids))
+            protein_pn_unit_iids = [
+                pn_unit_iid for pn_unit_iid in protein_pn_unit_iids
+                if pn_unit_iid in query_pn_unit_iid_set
+            ]
+            ligand_pn_unit_iids = [
+                pn_unit_iid for pn_unit_iid in ligand_pn_unit_iids
+                if pn_unit_iid in query_pn_unit_iid_set
+            ]
+
+        previous_ligand_ccd_by_iid = {
+            str(pn_unit_iid): str(ccd_code)
+            for pn_unit_iid, ccd_code in zip(
+                previous_chain_info.get("ligand_pn_unit_iids", []),
+                previous_chain_info.get("ligand_ccd_codes", []),
+            )
+        }
+        sampling_ligand_ccd_by_iid = _sampling_ligand_ccd_by_iid(sampling_row, ligand_pn_unit_iids)
 
         for pn_unit_iid in protein_pn_unit_iids:
             pdb_chain_info["protein_pn_unit_iids"].append(str(pn_unit_iid))
-        for pn_unit_iid, ccd_code in zip(ligand_pn_unit_iids, ligand_ccd_codes):
+        for pn_unit_iid in ligand_pn_unit_iids:
+            ccd_code = (
+                sampling_ligand_ccd_by_iid.get(pn_unit_iid)
+                or previous_ligand_ccd_by_iid.get(pn_unit_iid)
+                or ligand_ccd_code_by_iid[pn_unit_iid]
+            )
             pdb_chain_info["ligand_pn_unit_iids"].append(str(pn_unit_iid))
             pdb_chain_info["ligand_ccd_codes"].append(str(ccd_code))
+        if "af3_ligand_ccd_codes" in previous_chain_info:
+            previous_af3_ligand_ccd_by_iid = {
+                str(pn_unit_iid): str(ccd_code)
+                for pn_unit_iid, ccd_code in zip(
+                    previous_chain_info.get("ligand_pn_unit_iids", []),
+                    previous_chain_info.get("af3_ligand_ccd_codes", []),
+                )
+            }
+            af3_ligand_ccd_codes = [
+                previous_af3_ligand_ccd_by_iid[pn_unit_iid]
+                for pn_unit_iid in ligand_pn_unit_iids
+                if pn_unit_iid in previous_af3_ligand_ccd_by_iid
+            ]
+            if len(af3_ligand_ccd_codes) == len(ligand_pn_unit_iids):
+                pdb_chain_info["af3_ligand_ccd_codes"].extend(af3_ligand_ccd_codes)
+        if "af3_user_ccd_path" in previous_chain_info:
+            pdb_chain_info["af3_user_ccd_path"] = previous_chain_info["af3_user_ccd_path"]
 
         sample_dict_per_ckpt[example_id]["pdb_chain_info"] = pdb_chain_info
 

@@ -368,6 +368,7 @@ def iter_design_sequence_per_checkpoint(
             log_dir_per_ckpt=log_dir_per_ckpt,
             csv_suffix=csv_suffix,
             guidance_cfg=guidance_cfg,
+            sampling_inputs_df=sampling_inputs_df,
         )
 
         del seq_des_model
