@@ -6,7 +6,7 @@ import os
 import importlib.util
 from collections import defaultdict
 from dataclasses import asdict, dataclass
-from functools import partial
+from functools import lru_cache, partial
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Tuple
 
@@ -28,6 +28,13 @@ from atomworks.enums import ChainType
 from atomworks.constants import (AF3_EXCLUDED_LIGANDS, METAL_ELEMENTS, STANDARD_AA,
                                     STANDARD_DNA, STANDARD_RNA)
 
+from allatom_design.eval.utils.cfg_utils import (
+    config_value_as_bool,
+    get_config_value,
+    get_json_config_value,
+)
+from allatom_design.eval.utils.misc import normalize_ccd_code
+
 # ============================================================================
 # AF3 In-Process Runner Utils (Internal)
 # ============================================================================
@@ -38,6 +45,53 @@ _AF3_MODEL_RUNNER = None
 _AF3_DATA_PIPELINE_CONFIG = None
 _AF3_MAX_TEMPLATE_DATE = None
 _AF3_BUCKETS = None
+
+
+@lru_cache(maxsize=1)
+def _af3_glycan_ccd_codes() -> frozenset[str]:
+    from alphafold3.constants import chemical_component_sets
+
+    return frozenset(
+        normalize_ccd_code(code)
+        for code in (
+            chemical_component_sets.GLYCAN_LINKING_LIGANDS
+            | chemical_component_sets.GLYCAN_OTHER_LIGANDS
+        )
+    )
+
+
+def _fold_input_has_glycan_ligand(fold_input) -> bool:
+    glycan_ccd_codes = _af3_glycan_ccd_codes()
+    ligands = getattr(fold_input, "ligands", [])
+    if callable(ligands):
+        ligands = ligands()
+    for ligand in ligands:
+        ccd_ids = getattr(ligand, "ccd_ids", None)
+        if ccd_ids is None:
+            continue
+        if any(normalize_ccd_code(code) in glycan_ccd_codes for code in ccd_ids):
+            return True
+    return False
+
+
+def _resolve_fix_standalone_glycans(mode_config: dict | DictConfig, fold_input) -> bool:
+    override = get_config_value(mode_config, "fix_standalone_glycans", None)
+    if override is not None:
+        return config_value_as_bool(override)
+    return _fold_input_has_glycan_ligand(fold_input)
+
+
+def _json_needs_fix_standalone_glycans(json_path: str | Path, mode_config: dict | DictConfig) -> bool:
+    override = get_config_value(mode_config, "fix_standalone_glycans", None)
+    if override is not None:
+        return config_value_as_bool(override)
+
+    from alphafold3.common import folding_input
+
+    return any(
+        _fold_input_has_glycan_ligand(fold_input)
+        for fold_input in folding_input.load_fold_inputs_from_path(Path(json_path))
+    )
 
 
 def _load_af3_runner(runner_path: str):
@@ -178,6 +232,10 @@ def _run_af3_inprocess(
 
     for fold_input_item in fold_inputs:
         output_dir = os.path.join(out_dir, fold_input_item.sanitised_name())
+        fix_standalone_glycans = _resolve_fix_standalone_glycans(
+            mode_config=mode_config,
+            fold_input=fold_input_item,
+        )
         try:
             runner.process_fold_input(
                 fold_input=fold_input_item,
@@ -190,6 +248,7 @@ def _run_af3_inprocess(
                 resolve_msa_overlaps=True,
                 max_templates=mode_config.get('max_templates', 0),
                 ligand_protein_template_conditioning_mode=mode_config.get('ligand_protein_template_conditioning_mode', 0),
+                fix_standalone_glycans=fix_standalone_glycans,
                 force_output_dir=True,
             )
         except SystemExit as e:
@@ -213,7 +272,7 @@ def _resolve_af3_ligand_ccd_code(
 ) -> str:
     """Use the element symbol for single-atom metal ligands with synthetic names."""
     raw_ccd_code = str(ligand_ccd_code).strip()
-    normalized_ccd_code = raw_ccd_code.upper()
+    normalized_ccd_code = normalize_ccd_code(raw_ccd_code)
     if normalized_ccd_code in METAL_ELEMENTS:
         return normalized_ccd_code
 
@@ -222,7 +281,7 @@ def _resolve_af3_ligand_ccd_code(
     if len(ligand_atom_array) != 1:
         return raw_ccd_code
 
-    element = str(ligand_atom_array.element[0]).strip().upper()
+    element = normalize_ccd_code(ligand_atom_array.element[0])
     if element not in METAL_ELEMENTS:
         return raw_ccd_code
 
@@ -233,19 +292,10 @@ def _resolve_af3_ligand_ccd_code(
     return element
 
 
-def _get_json_config_value(json_config: dict | DictConfig, *keys: str, default=None):
-    for key in keys:
-        if hasattr(json_config, "get"):
-            value = json_config.get(key, None)
-            if value is not None:
-                return value
-    return default
-
-
 def _get_user_ccd_path(json_config: dict | DictConfig, pdb_chain_info: dict) -> str | None:
     user_ccd_path = pdb_chain_info.get("af3_user_ccd_path")
     if user_ccd_path is None:
-        user_ccd_path = _get_json_config_value(
+        user_ccd_path = get_json_config_value(
             json_config,
             "user_ccd_path",
             "userCCDPath",
@@ -550,6 +600,7 @@ def run_af3_single_sequence(json_path: str,
             print(f"AF3 prediction already exists for {Path(json_path).stem}")
             return
         else:
+            ss_config = inference_config.ss
             cmd = [
                 sys.executable,  # Use current Python interpreter
                 runner_path,
@@ -560,11 +611,13 @@ def run_af3_single_sequence(json_path: str,
                 "--run_inference=True",
                 f"--db_dir={inference_config.base.get('db_dir', None)}",
                 f"--flash_attention_implementation={inference_config.base.get('flash_attention_implementation', 'triton')}",
-                f"--num_recycles={inference_config.ss.get('num_recycles', 3)}",
-                f"--num_diffusion_samples={inference_config.ss.get('num_diffusion_samples', 5)}",
-                f"--max_templates={inference_config.ss.get('max_templates', 0)}",
-                f"--ligand_protein_template_conditioning_mode={inference_config.ss.get('ligand_protein_template_conditioning_mode', 0)}",
+                f"--num_recycles={ss_config.get('num_recycles', 3)}",
+                f"--num_diffusion_samples={ss_config.get('num_diffusion_samples', 5)}",
+                f"--max_templates={ss_config.get('max_templates', 0)}",
+                f"--ligand_protein_template_conditioning_mode={ss_config.get('ligand_protein_template_conditioning_mode', 0)}",
             ]
+            if _json_needs_fix_standalone_glycans(json_path, ss_config):
+                cmd.append("--fix_standalone_glycans=True")
             env = os.environ.copy()
             subprocess.run(cmd, check=True, env=env)
     else:
@@ -602,6 +655,7 @@ def run_af3_template_conditioned(json_path: str,
             print(f"AF3 prediction already exists for {Path(json_path).stem}")
             return
         else:
+            tc_config = inference_config.tc
             cmd = [
                 sys.executable,  # Use current Python interpreter
                 runner_path,
@@ -612,14 +666,16 @@ def run_af3_template_conditioned(json_path: str,
                 "--run_inference=True",
                 f"--db_dir={inference_config.base.get('db_dir', None)}",
                 f"--flash_attention_implementation={inference_config.base.get('flash_attention_implementation', 'triton')}",
-                f"--num_recycles={inference_config.tc.get('num_recycles', 3)}",
-                f"--num_diffusion_samples={inference_config.tc.get('num_diffusion_samples', 5)}",
-                f"--max_templates={inference_config.tc.get('max_templates', 1)}",
-                f"--ligand_protein_template_conditioning_mode={inference_config.tc.get('ligand_protein_template_conditioning_mode', 1)}",
-                f"--mask_template_sidechains={inference_config.tc.get('mask_template_sidechains', True)}",
-                f"--mask_template_sequence={inference_config.tc.get('mask_template_sequence', True)}",
-                f"--max_template_date={inference_config.tc.get('max_template_date', '2025-11-21')}",  # Dummy date to run template-conditioning AF3
+                f"--num_recycles={tc_config.get('num_recycles', 3)}",
+                f"--num_diffusion_samples={tc_config.get('num_diffusion_samples', 5)}",
+                f"--max_templates={tc_config.get('max_templates', 1)}",
+                f"--ligand_protein_template_conditioning_mode={tc_config.get('ligand_protein_template_conditioning_mode', 1)}",
+                f"--mask_template_sidechains={tc_config.get('mask_template_sidechains', True)}",
+                f"--mask_template_sequence={tc_config.get('mask_template_sequence', True)}",
+                f"--max_template_date={tc_config.get('max_template_date', '2025-11-21')}",  # Dummy date to run template-conditioning AF3
             ]
+            if _json_needs_fix_standalone_glycans(json_path, tc_config):
+                cmd.append("--fix_standalone_glycans=True")
             env = os.environ.copy()
             subprocess.run(cmd, check=True, env=env)
     else:

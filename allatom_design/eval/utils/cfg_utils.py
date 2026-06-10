@@ -6,6 +6,32 @@ def require_cfg_value(cfg: DictConfig | dict, key: str, owner: str) -> Any:
         raise ValueError(f"{owner}.{key} is required")
     return cfg.get(key)
 
+def get_config_value(config: dict | DictConfig | None, key: str, default=None):
+    if config is None:
+        return default
+    if hasattr(config, "get"):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+def get_json_config_value(json_config: dict | DictConfig, *keys: str, default=None):
+    for key in keys:
+        if hasattr(json_config, "get"):
+            value = json_config.get(key, None)
+            if value is not None:
+                return value
+    return default
+
+def config_value_as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y"}:
+            return True
+        if normalized in {"false", "0", "no", "n"}:
+            return False
+    return bool(value)
+
 def resolve_sampling_cfg(cfg: DictConfig) -> DictConfig:
     sampling_cfg = require_cfg_value(cfg, "sampling_cfg", "sequence design config")
     sampling_cfg_path = sampling_cfg.get("base_cfg_path", None)

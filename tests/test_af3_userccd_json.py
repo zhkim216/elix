@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from biotite.structure import AtomArray, get_residue_starts
 
 import atomworks.enums as aw_enums
+from allatom_design.eval.utils import folding_utils
 from allatom_design.eval.utils.folding_utils import make_af3_json
 from allatom_design.utils.atom_array_utils import (
     get_res_name_by_chain_res_id,
@@ -109,6 +111,154 @@ def _res_names_by_id(atom_array: AtomArray) -> dict[int, str]:
         int(atom_array.res_id[idx]): str(atom_array.res_name[idx])
         for idx in starts
     }
+
+
+def _write_af3_ligand_json(json_path: Path, ccd_code: str) -> None:
+    json_path.write_text(
+        json.dumps(
+            {
+                "name": json_path.stem,
+                "sequences": [
+                    {
+                        "protein": {
+                            "id": "A",
+                            "sequence": "A",
+                            "unpairedMsa": "",
+                            "pairedMsa": "",
+                            "templates": [],
+                        }
+                    },
+                    {"ligand": {"id": "B", "ccdCodes": [ccd_code]}},
+                ],
+                "modelSeeds": [42],
+                "dialect": "alphafold3",
+                "version": 2,
+            }
+        )
+    )
+
+
+def _minimal_af3_inference_config(ss_config: dict | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        base={
+            "model_dir": "/tmp/model",
+            "db_dir": "/tmp/db",
+            "flash_attention_implementation": "triton",
+        },
+        ss=ss_config or {
+            "num_recycles": 1,
+            "num_diffusion_samples": 1,
+            "max_templates": 0,
+            "ligand_protein_template_conditioning_mode": 0,
+        },
+    )
+
+
+def test_af3_json_detects_glycan_ligand_ccd_from_af3_sets(tmp_path: Path) -> None:
+    glycan_json = tmp_path / "glycan.json"
+    non_glycan_json = tmp_path / "non_glycan.json"
+    _write_af3_ligand_json(glycan_json, "NAG")
+    _write_af3_ligand_json(non_glycan_json, "FAD")
+
+    assert folding_utils._json_needs_fix_standalone_glycans(glycan_json, {}) is True
+    assert folding_utils._json_needs_fix_standalone_glycans(non_glycan_json, {}) is False
+
+
+def test_run_af3_single_sequence_subprocess_adds_glycan_flag_only_for_glycans(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands = []
+
+    def fake_run(cmd, check, env):
+        commands.append(cmd)
+
+    monkeypatch.setattr(folding_utils.subprocess, "run", fake_run)
+
+    glycan_json = tmp_path / "glycan.json"
+    non_glycan_json = tmp_path / "non_glycan.json"
+    _write_af3_ligand_json(glycan_json, "NAG")
+    _write_af3_ligand_json(non_glycan_json, "FAD")
+    inference_config = _minimal_af3_inference_config()
+
+    folding_utils.run_af3_single_sequence(
+        json_path=str(glycan_json),
+        out_dir=str(tmp_path / "glycan_out"),
+        runner_path="/tmp/run_alphafold.py",
+        inference_config=inference_config,
+        use_subprocess=True,
+    )
+    folding_utils.run_af3_single_sequence(
+        json_path=str(non_glycan_json),
+        out_dir=str(tmp_path / "non_glycan_out"),
+        runner_path="/tmp/run_alphafold.py",
+        inference_config=inference_config,
+        use_subprocess=True,
+    )
+
+    assert "--fix_standalone_glycans=True" in commands[0]
+    assert "--fix_standalone_glycans=True" not in commands[1]
+
+
+def test_run_af3_inprocess_passes_auto_glycan_flag_to_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    passed_flags = []
+
+    class FakeRunner:
+        def process_fold_input(self, **kwargs):
+            passed_flags.append(kwargs["fix_standalone_glycans"])
+
+    monkeypatch.setattr(
+        folding_utils,
+        "_get_af3_model_runner_and_config",
+        lambda runner_path, inference_config, mode: (FakeRunner(), object(), object()),
+    )
+
+    glycan_json = tmp_path / "glycan.json"
+    non_glycan_json = tmp_path / "non_glycan.json"
+    _write_af3_ligand_json(glycan_json, "NAG")
+    _write_af3_ligand_json(non_glycan_json, "FAD")
+
+    folding_utils._run_af3_inprocess(
+        json_path=str(glycan_json),
+        out_dir=str(tmp_path / "glycan_out"),
+        runner_path="/tmp/run_alphafold.py",
+        inference_config={"ss": {}},
+        mode="ss",
+    )
+    folding_utils._run_af3_inprocess(
+        json_path=str(non_glycan_json),
+        out_dir=str(tmp_path / "non_glycan_out"),
+        runner_path="/tmp/run_alphafold.py",
+        inference_config={"ss": {}},
+        mode="ss",
+    )
+
+    assert passed_flags == [True, False]
+
+
+def test_fix_standalone_glycans_config_override_wins_over_auto_detection(tmp_path: Path) -> None:
+    glycan_json = tmp_path / "glycan.json"
+    non_glycan_json = tmp_path / "non_glycan.json"
+    _write_af3_ligand_json(glycan_json, "NAG")
+    _write_af3_ligand_json(non_glycan_json, "FAD")
+
+    assert (
+        folding_utils._json_needs_fix_standalone_glycans(
+            glycan_json,
+            {"fix_standalone_glycans": False},
+        )
+        is False
+    )
+    assert (
+        folding_utils._json_needs_fix_standalone_glycans(
+            non_glycan_json,
+            {"fix_standalone_glycans": True},
+        )
+        is True
+    )
 
 
 def test_make_af3_json_uses_userccd_component_ids_without_metal_rewrite(tmp_path: Path) -> None:
