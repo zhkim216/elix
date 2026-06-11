@@ -15,6 +15,8 @@ from pathlib import Path
 CSV_STEMS = [
     "all_docking_metrics_per_designed_sample",
     "all_sc_metrics_per_designed_sample",
+    "tc_all_docking_metrics_per_designed_sample",
+    "tc_all_sc_metrics_per_designed_sample",
     "seq_recovery_metrics",
 ]
 
