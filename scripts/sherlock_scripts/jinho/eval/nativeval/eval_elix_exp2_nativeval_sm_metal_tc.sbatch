@@ -84,7 +84,7 @@ AF3_TEMPLATE_CONDITIONING_MODE=1
 AF3_MAX_TEMPLATE_DATE=2026-06-10
 
 DENOISER_TRAIN_DIR=/scratch/users/zhkim216/out_dir/ligand_seq_des/${MODEL_NAME}
-EXP_NAME=${MODEL_NAME}_${VALSET_NAME}_tc_step${STEP}_numseqs${NUM_SEQS_PER_PDB}
+EXP_NAME=${MODEL_NAME}_${VALSET_NAME}_tc_numseqs${NUM_SEQS_PER_PDB}
 HYDRA_DIR=${HYDRA_ROOT}/${EXP_NAME}
 
 mkdir -p /scratch/users/zhkim216/job_output/eval_ligand_seq_des "${HYDRA_DIR}" "${BASE_OUT_DIR}"
