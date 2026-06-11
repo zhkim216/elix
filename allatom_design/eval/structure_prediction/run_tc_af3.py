@@ -1,10 +1,8 @@
-from collections import defaultdict
 from pathlib import Path
 
 import hydra
 import numpy as np
 from omegaconf import OmegaConf, DictConfig
-import pandas as pd
 import yaml
 from tqdm import tqdm
 
@@ -12,39 +10,16 @@ import atomworks.enums as aw_enums
 
 from allatom_design.eval.utils.eval_setup_utils import (
     get_pdb_files, wandb_setup)
-from allatom_design.eval.utils.data_utils import prepare_designed_sample
-from allatom_design.eval.eval_utils.folding_utils import (
+from allatom_design.eval.structure_prediction.af3_input_utils import (
+    filter_sample_paths_by_sampling_inputs,
+    load_af3_eval_sample,
+    load_sampling_inputs_csv,
+)
+from allatom_design.eval.utils.folding_utils import (
     evaluate_af3_docking_consistency,
 )
 from allatom_design.utils.atom_array_utils import insert_unk_residues_for_gaps_in_atom_array
-from allatom_design.utils.sample_io_utils import _fix_cif_formal_charge
-from atomworks.io.utils.io_utils import to_cif_file
-
-
-def extract_pdb_chain_info(atom_array) -> dict:
-    """
-    Extract protein and ligand chain info from an atom array.
-    """
-    pdb_chain_info = defaultdict(list)
-    
-    prot_atom_array = atom_array[atom_array.chain_type == aw_enums.ChainType.POLYPEPTIDE_L]
-    ligand_atom_array = atom_array[np.isin(atom_array.chain_type, list(aw_enums.ChainTypeInfo.NON_POLYMERS))]
-    
-    protein_pn_unit_iids = [str(pn_unit_iid) for pn_unit_iid in np.unique(prot_atom_array.pn_unit_iid)]
-    ligand_pn_unit_iids = [str(pn_unit_iid) for pn_unit_iid in np.unique(ligand_atom_array.pn_unit_iid)]
-    ligand_ccd_codes = [
-        str(ligand_atom_array[ligand_atom_array.pn_unit_iid == pn_unit_iid].res_name[0])
-        for pn_unit_iid in ligand_pn_unit_iids
-    ]
-
-    for pn_unit_iid in protein_pn_unit_iids:
-        pdb_chain_info["protein_pn_unit_iids"].append(str(pn_unit_iid))
-
-    for pn_unit_iid, ccd_code in zip(ligand_pn_unit_iids, ligand_ccd_codes):
-        pdb_chain_info["ligand_pn_unit_iids"].append(str(pn_unit_iid))
-        pdb_chain_info["ligand_ccd_codes"].append(str(ccd_code))
-    
-    return pdb_chain_info
+from allatom_design.utils.sample_io_utils import save_cif_file
 
 
 def prepare_tc_template_cif(atom_array, 
@@ -86,18 +61,12 @@ def prepare_tc_template_cif(atom_array,
     if "b_factor" not in tc_atom_array.get_annotation_categories():
         tc_atom_array.set_annotation("b_factor", np.zeros(len(tc_atom_array)))
     
-    # Save to CIF
-    out_path = to_cif_file(
-        tc_atom_array, out_path, 
-        file_type="cif", 
-        **cif_save_args
-    )
-    _fix_cif_formal_charge(out_path)
-    
-    return out_path
+    cif_save_args = dict(cif_save_args)
+    cif_save_args.setdefault("file_type", "cif")
+    return str(save_cif_file(tc_atom_array, out_path, cif_save_cfg=OmegaConf.create(cif_save_args)))
 
 
-@hydra.main(config_path="../configs/eval", config_name="run_tc_eval_af3", version_base="1.3.2")
+@hydra.main(config_path="../../configs/eval/structure_prediction", config_name="run_tc_eval_af3", version_base="1.3.2")
 def main(cfg: DictConfig):
     """
     Run AF3 template-conditioned docking consistency evaluation on pre-designed samples.
@@ -136,11 +105,23 @@ def main(cfg: DictConfig):
     print("Phase 1: Loading designed samples and preparing TC templates")
     print("="*80 + "\n")
     
-    # Get CIF file paths
     sample_paths = get_pdb_files(**cfg.pdb_cfg)
+    sampling_inputs_df = load_sampling_inputs_csv(cfg.get("sampling_inputs_csv", None))
+    if sampling_inputs_df is not None:
+        print(f"Loaded sampling inputs: {len(sampling_inputs_df)} entries from {cfg.sampling_inputs_csv}")
+        before_filter = len(sample_paths)
+        sample_paths = filter_sample_paths_by_sampling_inputs(sample_paths, sampling_inputs_df)
+        print(f"Filtered to {len(sample_paths)} samples matching sampling inputs from {before_filter}")
     
     if cfg.debug:
         sample_paths = sample_paths[:cfg.num_debug_samples]
+
+    if cfg.input_sample_is_designed:
+        cif_parse_cfg = cfg.cif_cfg.parse.designed_samples
+        preprocess_cfg_input = cfg.preprocess_cfg.designed_samples
+    else:
+        cif_parse_cfg = cfg.cif_cfg.parse.native_samples
+        preprocess_cfg_input = cfg.preprocess_cfg.native_samples
     
     # Create TC template CIF output directory
     tc_template_dir = Path(log_dir, "samples_for_af3_tc")
@@ -155,20 +136,20 @@ def main(cfg: DictConfig):
         sample_id = Path(sample_path).stem
         
         try:
-            example = prepare_designed_sample(
-                pdb_path=sample_path,
-                cif_parse_cfg=cfg.cif_cfg.parse.designed_samples,
-                preprocess_cfg=cfg.preprocess_cfg.designed_samples,
+            example = load_af3_eval_sample(
+                sample_path=sample_path,
+                cif_parse_cfg=cif_parse_cfg,
+                preprocess_cfg=preprocess_cfg_input,
                 featurizer_cfg=cfg.featurizer_cfg.prepare_designed_samples,
+                sample_is_designed=cfg.input_sample_is_designed,
+                sampling_inputs_df=sampling_inputs_df,
             )
         except Exception as e:
             print(f"Failed to load {sample_id}: {e}")
             continue
         
         atom_array = example["atom_array"]
-        
-        # Extract chain info
-        pdb_chain_info = extract_pdb_chain_info(atom_array)
+        pdb_chain_info = example["pdb_chain_info"]
         
         if not pdb_chain_info["protein_pn_unit_iids"]:
             print(f"Warning: No protein chains found in {sample_id}, skipping")
@@ -197,6 +178,8 @@ def main(cfg: DictConfig):
         }
     
     print(f"\nSuccessfully loaded {len(sample_dict)} samples")
+    if len(sample_dict) == 0:
+        raise RuntimeError("No samples were loaded for AF3 template-conditioned evaluation")
     
     ###########################################################
     # Phase 2: AF3 Docking Consistency Evaluation

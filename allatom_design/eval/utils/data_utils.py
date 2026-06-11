@@ -217,15 +217,28 @@ def _parse_query_pn_unit_iids(raw_value: Any) -> list[str]:
 def _matched_sampling_input_row(
     sampling_inputs_df: pd.DataFrame | None,
     pdb_id: str | None,
+    pdb_key: str | None = None,
 ) -> pd.Series | None:
-    if sampling_inputs_df is None or pdb_id is None or "pdb_id" not in sampling_inputs_df.columns:
+    if sampling_inputs_df is None:
         return None
 
-    pdb_id_normalized = str(pdb_id).lower()
-    matched = sampling_inputs_df[sampling_inputs_df["pdb_id"].astype(str).str.lower() == pdb_id_normalized]
-    if matched.empty:
-        return None
-    return matched.iloc[0]
+    if pdb_key is not None and "pdb_key" in sampling_inputs_df.columns:
+        pdb_key_normalized = str(pdb_key).lower()
+        matched = sampling_inputs_df[
+            sampling_inputs_df["pdb_key"].astype(str).str.lower() == pdb_key_normalized
+        ]
+        if not matched.empty:
+            return matched.iloc[0]
+
+    if pdb_id is not None and "pdb_id" in sampling_inputs_df.columns:
+        pdb_id_normalized = str(pdb_id).lower()
+        matched = sampling_inputs_df[
+            sampling_inputs_df["pdb_id"].astype(str).str.lower() == pdb_id_normalized
+        ]
+        if not matched.empty:
+            return matched.iloc[0]
+
+    return None
 
 
 def _resolve_query_pn_unit_iids_from_sampling_row(row: pd.Series | None) -> list[str]:
@@ -271,12 +284,13 @@ def resolve_query_pn_unit_iids(
     atom_array: AtomArray,
     sampling_inputs_df: pd.DataFrame | None = None,
     pdb_id: str | None = None,
+    pdb_key: str | None = None,
 ) -> list[str]:
     """
     Resolve query pn_unit_iids from sampling_inputs_df if available; otherwise fallback to all unique pn_unit_iid.
     """
     parsed = _resolve_query_pn_unit_iids_from_sampling_row(
-        _matched_sampling_input_row(sampling_inputs_df, pdb_id)
+        _matched_sampling_input_row(sampling_inputs_df, pdb_id, pdb_key=pdb_key)
     )
     if len(parsed) > 0:
         return parsed
