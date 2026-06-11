@@ -10,7 +10,7 @@
 #SBATCH --job-name=elix_exp4_multigpu
 #SBATCH -p possu
 #SBATCH --array=0
-#SBATCH -G 2
+#SBATCH --gres=gpu:2
 #SBATCH --mem=96G
 #SBATCH --cpus-per-task=16
 #SBATCH --constraint=GPU_SKU:H100_SXM5
@@ -95,6 +95,7 @@ export MASTER_ADDR=127.0.0.1
 export MASTER_PORT=$((20000 + (SLURM_JOB_ID_FOR_DDP % 40000) + ARRAY_TASK_ID))
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 echo "[DDP] MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT} (job=${SLURM_JOB_ID:-manual} task=${ARRAY_TASK_ID})"
+echo "[GPU] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset} SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-unset} SLURM_GPUS_ON_NODE=${SLURM_GPUS_ON_NODE:-unset}"
 
 DEBUG= HYDRA_FULL_ERROR=1 WANDB__SERVICE_WAIT=300 \
 python3 allatom_design/train_seq_denoiser.py \
