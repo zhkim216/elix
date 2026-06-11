@@ -128,6 +128,7 @@ class TemplateEmbedding(hk.Module):
     ligand_protein_template_conditioning_mode: int = 0
     mask_template_sidechains: bool = False
     mask_template_sequence: bool = False
+    template_pair_scale: float = 1.0
 
   def __init__(
       self,

@@ -43,6 +43,8 @@ from allatom_design.eval.utils.misc import normalize_ccd_code
 _AF3_RUNNER_MOD = None
 _AF3_MODEL_RUNNER = None
 _AF3_DATA_PIPELINE_CONFIG = None
+_AF3_MODEL_RUNNER_CACHE_KEY = None
+_AF3_DATA_PIPELINE_CONFIG_CACHE_KEY = None
 _AF3_MAX_TEMPLATE_DATE = None
 _AF3_BUCKETS = None
 
@@ -117,13 +119,14 @@ def _get_af3_model_runner_and_config(
 ):
     """
     Get or create cached AF3 ModelRunner and DataPipelineConfig.
-    ModelRunner and DataPipelineConfig are created once and reused across calls.
+    Caches are keyed by the runtime values that affect model/data-pipeline setup.
     """
     import datetime as dt
     import pathlib
     import jax
 
     global _AF3_MODEL_RUNNER, _AF3_DATA_PIPELINE_CONFIG
+    global _AF3_MODEL_RUNNER_CACHE_KEY, _AF3_DATA_PIPELINE_CONFIG_CACHE_KEY
     global _AF3_MAX_TEMPLATE_DATE, _AF3_BUCKETS
 
     runner = _load_af3_runner(runner_path)
@@ -137,14 +140,26 @@ def _get_af3_model_runner_and_config(
 
     base_config = inference_config.get('base', {})
     mode_config = inference_config.get(mode, {})
+    flash_attn = base_config.get('flash_attention_implementation', 'triton')
+    model_dir = base_config.get('model_dir', '')
+    template_pair_scale = mode_config.get('template_pair_scale', 1.0)
+    model_runner_cache_key = (
+        str(runner_path),
+        str(model_dir),
+        flash_attn,
+        mode_config.get('num_diffusion_samples', 5),
+        mode_config.get('num_recycles', 3),
+        mode_config.get('ligand_protein_template_conditioning_mode', 0),
+        mode_config.get('mask_template_sidechains', True),
+        mode_config.get('mask_template_sequence', True),
+        template_pair_scale,
+    )
 
-    if _AF3_MODEL_RUNNER is None:
+    if (
+        _AF3_MODEL_RUNNER is None
+        or _AF3_MODEL_RUNNER_CACHE_KEY != model_runner_cache_key
+    ):
         torch.cuda.empty_cache()
-
-        import shutil
-        from alphafold3.data import pipeline
-
-        flash_attn = base_config.get('flash_attention_implementation', 'triton')
 
         devices = jax.local_devices(backend='gpu')
         print(f'[AF3 init] Found devices: {devices}, using device 0: {devices[0]}')
@@ -158,24 +173,33 @@ def _get_af3_model_runner_and_config(
             ligand_protein_template_conditioning_mode=mode_config.get('ligand_protein_template_conditioning_mode', 0),
             mask_template_sidechains=mode_config.get('mask_template_sidechains', True),
             mask_template_sequence=mode_config.get('mask_template_sequence', True),
+            template_pair_scale=template_pair_scale,
         )
 
         _AF3_MODEL_RUNNER = runner.ModelRunner(
             config=model_config,
             device=devices[0],
-            model_dir=pathlib.Path(base_config.get('model_dir', '')),
+            model_dir=pathlib.Path(model_dir),
         )
         print('[AF3 init] Loading model parameters...')
         _ = _AF3_MODEL_RUNNER.model_params
         print('[AF3 init] Model parameters loaded and cached.')
+        _AF3_MODEL_RUNNER_CACHE_KEY = model_runner_cache_key
 
-        max_template_date_str = mode_config.get('max_template_date', '2021-09-30')
+    max_template_date_str = mode_config.get('max_template_date', '2021-09-30')
+    db_dir = base_config.get('db_dir', '')
+    data_pipeline_cache_key = (str(db_dir), max_template_date_str)
+
+    if (
+        _AF3_DATA_PIPELINE_CONFIG is None
+        or _AF3_DATA_PIPELINE_CONFIG_CACHE_KEY != data_pipeline_cache_key
+    ):
+        import shutil
+        from alphafold3.data import pipeline
+
         _AF3_MAX_TEMPLATE_DATE = dt.date.fromisoformat(max_template_date_str)
-
         buckets_list = [256, 512, 768, 1024, 1280, 1536, 2048, 2560, 3072, 3584, 4096, 4608, 5120]
         _AF3_BUCKETS = tuple(buckets_list)
-
-        db_dir = base_config.get('db_dir', '')
         expand_path = lambda x: runner.replace_db_dir(x, [db_dir])
         _AF3_DATA_PIPELINE_CONFIG = pipeline.DataPipelineConfig(
             jackhmmer_binary_path=shutil.which('jackhmmer'),
@@ -195,6 +219,7 @@ def _get_af3_model_runner_and_config(
             max_template_date=_AF3_MAX_TEMPLATE_DATE,
         )
         print('[AF3 init] DataPipelineConfig created and cached.')
+        _AF3_DATA_PIPELINE_CONFIG_CACHE_KEY = data_pipeline_cache_key
 
     return runner, _AF3_MODEL_RUNNER, _AF3_DATA_PIPELINE_CONFIG
 
@@ -615,6 +640,7 @@ def run_af3_single_sequence(json_path: str,
                 f"--num_diffusion_samples={ss_config.get('num_diffusion_samples', 5)}",
                 f"--max_templates={ss_config.get('max_templates', 0)}",
                 f"--ligand_protein_template_conditioning_mode={ss_config.get('ligand_protein_template_conditioning_mode', 0)}",
+                f"--template_pair_scale={ss_config.get('template_pair_scale', 1.0)}",
             ]
             if _json_needs_fix_standalone_glycans(json_path, ss_config):
                 cmd.append("--fix_standalone_glycans=True")
@@ -672,6 +698,7 @@ def run_af3_template_conditioned(json_path: str,
                 f"--ligand_protein_template_conditioning_mode={tc_config.get('ligand_protein_template_conditioning_mode', 1)}",
                 f"--mask_template_sidechains={tc_config.get('mask_template_sidechains', True)}",
                 f"--mask_template_sequence={tc_config.get('mask_template_sequence', True)}",
+                f"--template_pair_scale={tc_config.get('template_pair_scale', 1.0)}",
                 f"--max_template_date={tc_config.get('max_template_date', '2025-11-21')}",  # Dummy date to run template-conditioning AF3
             ]
             if _json_needs_fix_standalone_glycans(json_path, tc_config):

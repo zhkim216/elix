@@ -81,6 +81,7 @@ AF3_RECYCLES=1
 AF3_DIFFUSION_SAMPLES=5
 AF3_MAX_TEMPLATES=1
 AF3_TEMPLATE_CONDITIONING_MODE=1
+AF3_TEMPLATE_PAIR_SCALE=1.0
 AF3_MAX_TEMPLATE_DATE=2026-06-10
 
 DENOISER_TRAIN_DIR=/scratch/users/zhkim216/out_dir/ligand_seq_des/${MODEL_NAME}
@@ -116,7 +117,7 @@ echo "GPU compute capability: ${COMPUTE_CAP}, using flash_attention_implementati
 echo "PDB_DIR=${PDB_DIR}"
 echo "PDB_NAME_LIST=${PDB_NAME_LIST}"
 echo "SAMPLING_INPUTS_CSV=${SAMPLING_INPUTS_CSV}"
-echo "AF3 TC: recycles=${AF3_RECYCLES}, diffusion_samples=${AF3_DIFFUSION_SAMPLES}, max_templates=${AF3_MAX_TEMPLATES}, ligand_protein_template_conditioning_mode=${AF3_TEMPLATE_CONDITIONING_MODE}"
+echo "AF3 TC: recycles=${AF3_RECYCLES}, diffusion_samples=${AF3_DIFFUSION_SAMPLES}, max_templates=${AF3_MAX_TEMPLATES}, ligand_protein_template_conditioning_mode=${AF3_TEMPLATE_CONDITIONING_MODE}, template_pair_scale=${AF3_TEMPLATE_PAIR_SCALE}"
 echo "EXP_NAME=${EXP_NAME}"
 
 WANDB__SERVICE_WAIT=300 python3 allatom_design/eval/sampling/run_elix.py \
@@ -174,6 +175,7 @@ WANDB__SERVICE_WAIT=300 python3 allatom_design/eval/sampling/run_elix.py \
     struct_pred_cfg.af3.inference_config.tc.num_diffusion_samples=${AF3_DIFFUSION_SAMPLES} \
     struct_pred_cfg.af3.inference_config.tc.max_templates=${AF3_MAX_TEMPLATES} \
     struct_pred_cfg.af3.inference_config.tc.ligand_protein_template_conditioning_mode=${AF3_TEMPLATE_CONDITIONING_MODE} \
+    struct_pred_cfg.af3.inference_config.tc.template_pair_scale=${AF3_TEMPLATE_PAIR_SCALE} \
     struct_pred_cfg.af3.inference_config.tc.mask_template_sidechains=true \
     struct_pred_cfg.af3.inference_config.tc.mask_template_sequence=true \
     struct_pred_cfg.af3.inference_config.tc.max_template_date=${AF3_MAX_TEMPLATE_DATE} \

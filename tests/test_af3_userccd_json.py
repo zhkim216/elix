@@ -165,7 +165,10 @@ def _write_af3_ligand_json(json_path: Path, ccd_code: str) -> None:
     )
 
 
-def _minimal_af3_inference_config(ss_config: dict | None = None) -> SimpleNamespace:
+def _minimal_af3_inference_config(
+    ss_config: dict | None = None,
+    tc_config: dict | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         base={
             "model_dir": "/tmp/model",
@@ -177,6 +180,15 @@ def _minimal_af3_inference_config(ss_config: dict | None = None) -> SimpleNamesp
             "num_diffusion_samples": 1,
             "max_templates": 0,
             "ligand_protein_template_conditioning_mode": 0,
+        },
+        tc=tc_config or {
+            "num_recycles": 1,
+            "num_diffusion_samples": 1,
+            "max_templates": 1,
+            "ligand_protein_template_conditioning_mode": 1,
+            "mask_template_sidechains": True,
+            "mask_template_sequence": True,
+            "template_pair_scale": 0.25,
         },
     )
 
@@ -225,6 +237,42 @@ def test_run_af3_single_sequence_subprocess_adds_glycan_flag_only_for_glycans(
 
     assert "--fix_standalone_glycans=True" in commands[0]
     assert "--fix_standalone_glycans=True" not in commands[1]
+    assert "--template_pair_scale=1.0" in commands[0]
+
+
+def test_run_af3_template_conditioned_subprocess_adds_template_pair_scale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands = []
+
+    def fake_run(cmd, check, env):
+        commands.append(cmd)
+
+    monkeypatch.setattr(folding_utils.subprocess, "run", fake_run)
+
+    template_json = tmp_path / "template.json"
+    _write_af3_ligand_json(template_json, "FAD")
+
+    folding_utils.run_af3_template_conditioned(
+        json_path=str(template_json),
+        out_dir=str(tmp_path / "tc_out"),
+        runner_path="/tmp/run_alphafold.py",
+        inference_config=_minimal_af3_inference_config(
+            tc_config={
+                "num_recycles": 1,
+                "num_diffusion_samples": 1,
+                "max_templates": 1,
+                "ligand_protein_template_conditioning_mode": 1,
+                "mask_template_sidechains": True,
+                "mask_template_sequence": True,
+                "template_pair_scale": 0.25,
+            }
+        ),
+        use_subprocess=True,
+    )
+
+    assert "--template_pair_scale=0.25" in commands[0]
 
 
 def test_run_af3_inprocess_passes_auto_glycan_flag_to_runner(

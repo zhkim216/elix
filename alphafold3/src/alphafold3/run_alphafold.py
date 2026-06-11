@@ -423,6 +423,12 @@ _MASK_TEMPLATE_SIDECHAINS = flags.DEFINE_bool(
     'Whether to use CA rather than pseudo-beta template positions when local'
     ' template conditioning is enabled.',
 )
+_TEMPLATE_PAIR_SCALE = flags.DEFINE_float(
+    'template_pair_scale',
+    1.0,
+    'Scalar multiplier applied to the template pair embedding before it is'
+    ' added to pair activations.',
+)
 
 
 def _validate_ligand_protein_template_conditioning_flags(
@@ -447,6 +453,7 @@ def make_model_config(
     ligand_protein_template_conditioning_mode: int = 0,
     mask_template_sidechains: bool = False,
     mask_template_sequence: bool = False,
+    template_pair_scale: float = 1.0,
 ) -> model.Model.Config:
   """Returns a model config with some defaults overridden."""
   config = model.Model.Config()
@@ -462,6 +469,7 @@ def make_model_config(
   )
   config.evoformer.template.mask_template_sidechains = mask_template_sidechains
   config.evoformer.template.mask_template_sequence = mask_template_sequence
+  config.evoformer.template.template_pair_scale = template_pair_scale
   return config
 
 
@@ -980,7 +988,8 @@ def main(_):
         f' {_LIGAND_PROTEIN_TEMPLATE_CONDITIONING_MODE.value};'
         f' max_templates: {_MAX_TEMPLATES.value};'
         f' mask_template_sequence: {mask_template_sequence};'
-        f' mask_template_sidechains: {mask_template_sidechains}'
+        f' mask_template_sidechains: {mask_template_sidechains};'
+        f' template_pair_scale: {_TEMPLATE_PAIR_SCALE.value}'
     )
 
   # Make sure we can create the output directory before running anything.
@@ -1090,6 +1099,7 @@ def main(_):
             ),
             mask_template_sidechains=mask_template_sidechains,
             mask_template_sequence=mask_template_sequence,
+            template_pair_scale=_TEMPLATE_PAIR_SCALE.value,
         ),
         device=devices[_GPU_DEVICE.value],
         model_dir=pathlib.Path(MODEL_DIR.value),

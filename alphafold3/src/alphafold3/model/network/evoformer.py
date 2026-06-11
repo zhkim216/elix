@@ -213,6 +213,7 @@ class Evoformer(hk.Module):
         multichain_mask_2d=multichain_mask,
         padding_mask_2d=pair_mask,
     )
+    template_act = template_act * self.config.template.template_pair_scale
     return pair_activations + template_act, key
 
   @hk.transparent
