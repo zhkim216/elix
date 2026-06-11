@@ -8,7 +8,6 @@
 #SBATCH --array=0-0
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
-#SBATCH --constraint=GPU_SKU:H100_SXM5
 #SBATCH --mem=16G
 #SBATCH --time=8:00:00
 #SBATCH --output=/scratch/users/zhkim216/job_output/eval_ligand_seq_des/tc_af3_nativeval_nativeseq_%A_%a.out
@@ -63,13 +62,13 @@ PDB_DIR=/scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs/cifs
 SAMPLING_INPUTS_CSV=/scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs/sampling_inputs_sm_metal.csv
 PDB_NAME_LIST=/scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs/nativeval_sm_metal.txt
 
-AF3_DIFFUSION_SAMPLES=1
+AF3_DIFFUSION_SAMPLES=5
 AF3_MAX_TEMPLATES=1
 AF3_TEMPLATE_CONDITIONING_MODE=1
-AF3_MAX_TEMPLATE_DATE=2026-03-24
+AF3_MAX_TEMPLATE_DATE=2026-06-10
 POCKET_DISTANCE_FOR_DOCKING_METRICS=5.0
 
-EXP_NAME=tc_af3_${VALSET_NAME}_nativeseq_recycles${NUM_RECYCLES}_chunk${CHUNK_IDX}of${NUM_CHUNKS}
+EXP_NAME=tc_af3_${VALSET_NAME}_nativeseq_recycles${NUM_RECYCLES}
 HYDRA_DIR=${HYDRA_ROOT}/${EXP_NAME}
 
 mkdir -p /scratch/users/zhkim216/job_output/eval_ligand_seq_des "${HYDRA_DIR}" "${BASE_OUT_DIR}"
