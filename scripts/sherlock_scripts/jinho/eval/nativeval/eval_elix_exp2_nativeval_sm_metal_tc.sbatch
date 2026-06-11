@@ -5,7 +5,7 @@
 #     scripts/sherlock_scripts/jinho/eval/nativeval/eval_elix_exp2_nativeval_sm_metal_tc.sbatch
 #SBATCH --job-name=eval_elix_exp2_native_tc
 #SBATCH -p possu,bioe
-#SBATCH --array=0-124
+#SBATCH --array=0-24
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --constraint=GPU_SKU:H100_SXM5
@@ -50,7 +50,7 @@ if [[ "${NUM_COMBOS}" -eq 0 ]]; then
   exit 2
 fi
 
-NUM_CHUNKS=5
+NUM_CHUNKS=1
 NUM_TASKS=$((NUM_COMBOS * NUM_CHUNKS))
 
 if [[ "${TASK_ID}" -ge "${NUM_TASKS}" ]]; then
@@ -77,14 +77,14 @@ NUM_SEQS_PER_PDB=1
 POCKET_DISTANCE_FOR_DOCKING_METRICS=8.0
 POCKET_DISTANCES_FOR_SEQ_RECOVERY="[4.0,6.0,8.0,10.0]"
 POCKET_DISTANCE_BINS="[[0.0,4.0],[4.0,6.0],[6.0,8.0],[8.0,10.0]]"
-AF3_RECYCLES=10
-AF3_DIFFUSION_SAMPLES=1
+AF3_RECYCLES=1
+AF3_DIFFUSION_SAMPLES=5
 AF3_MAX_TEMPLATES=1
 AF3_TEMPLATE_CONDITIONING_MODE=1
-AF3_MAX_TEMPLATE_DATE=2026-03-24
+AF3_MAX_TEMPLATE_DATE=2026-06-10
 
 DENOISER_TRAIN_DIR=/scratch/users/zhkim216/out_dir/ligand_seq_des/${MODEL_NAME}
-EXP_NAME=${MODEL_NAME}_${VALSET_NAME}_tc_step${STEP}_numseqs${NUM_SEQS_PER_PDB}_chunk${CHUNK_IDX}of${NUM_CHUNKS}
+EXP_NAME=${MODEL_NAME}_${VALSET_NAME}_tc_step${STEP}_numseqs${NUM_SEQS_PER_PDB}
 HYDRA_DIR=${HYDRA_ROOT}/${EXP_NAME}
 
 mkdir -p /scratch/users/zhkim216/job_output/eval_ligand_seq_des "${HYDRA_DIR}" "${BASE_OUT_DIR}"
