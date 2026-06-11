@@ -6,10 +6,24 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-EXP_DIRS=(
-    /scratch/users/zhkim216/out_dir/eval_ligand_seq_des/eval_exp41_cfg0_denovoval_af3
-    /scratch/users/zhkim216/out_dir/eval_ligand_seq_des/eval_exp41_cfg1_denovoval_af3
+BASE_OUT_DIR=/scratch/users/zhkim216/out_dir/eval_ligand_seq_des
+VALSET_NAME=nativeval_sm_metal
+EXP_NAME_SUFFIX=_tc_numseqs1
+
+MODEL_NAMES=(
+    elix_exp2_cfg0
+    elix_exp2_cfg1
+    elix_exp2_cfg2
+    elix_exp2_cfg3
+    elix_exp2_cfg4
 )
+
+EXP_DIRS=(
+)
+
+for MODEL_NAME in "${MODEL_NAMES[@]}"; do
+    EXP_DIRS+=("${BASE_OUT_DIR}/${MODEL_NAME}_${VALSET_NAME}${EXP_NAME_SUFFIX}")
+done
 
 echo "=============================================="
 echo "Merging CSV files for ${#EXP_DIRS[@]} experiments"
