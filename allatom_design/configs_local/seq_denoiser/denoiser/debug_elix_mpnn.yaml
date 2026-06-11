@@ -49,10 +49,12 @@ mpnn:
     norm_potts_inputs: false  # LayerNorm h_V/h_E before the Potts head
     parameterization: "factor"
     num_factors: null
+    num_heads: 1
+    reduce: "mean" # mean or sqrt; used by multi_head_factor
     symmetric_J: true
     multi_head:
-      dim_multi_head: 128 # dimension of the multi-head factor Potts model, must be divisible by num_heads
+      dim_multi_head: 128
       reduce: "mean" # "mean", "sqrt"
       num_heads: 4
 
-  expansion_mode: "node_concat" # null, node_concat, node_concat_context_skip, multi_head_factor, node_concat_multi_head
+  expansion_mode: null # null, node_concat, node_concat_context_skip, multi_head_factor, node_concat_multi_head

@@ -48,11 +48,18 @@ class ElixMPNN(nn.Module):
         self.n_tokens = const.AF3_ENCODING.n_tokens
         self.expansion_mode = cfg.get("expansion_mode", None)
         self.use_context_skip_connection = cfg.get("use_context_skip_connection", False)
+        self.use_potts_context_skip_concat = self.expansion_mode == "node_concat_context_skip"
         if self.use_context_skip_connection:
             assert self.ligand_conditioning, (
                 "use_context_skip_connection requires ligand_conditioning=True; "
                 "the skip path sources its signal from the ligand ContextModule."
             )
+        if self.use_potts_context_skip_concat:
+            assert self.ligand_conditioning, (
+                "expansion_mode='node_concat_context_skip' requires ligand_conditioning=True; "
+                "the Potts edge expansion sources its skip signal from the ligand ContextModule."
+            )
+        self.return_context_skip = self.use_context_skip_connection or self.use_potts_context_skip_concat
 
         self.token_features = TokenFeatures(cfg.token_features)
         self.W_e = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False) # Edge embedding
@@ -91,7 +98,7 @@ class ElixMPNN(nn.Module):
                 num_processor_layers=self.num_context_feature_processor_layers,
                 num_aggregator_layers=self.num_context_feature_aggregator_layers,
                 context_edge_update=self.context_edge_update,
-                use_context_skip_connection=self.use_context_skip_connection,
+                return_context_skip=self.return_context_skip,
             )
 
         # Potts decoder
@@ -109,6 +116,15 @@ class ElixMPNN(nn.Module):
             if self.expansion_mode == "node_concat":
                 self.dim_nodes_potts = self.hidden_dim
                 self.dim_edges_potts = self.hidden_dim * 3
+            elif self.expansion_mode == "node_concat_context_skip":
+                if self.parameterization != "factor":
+                    raise ValueError(
+                        "expansion_mode='node_concat_context_skip' requires "
+                        "potts.parameterization='factor'; "
+                        f"got {self.parameterization!r}"
+                    )
+                self.dim_nodes_potts = self.hidden_dim * 2
+                self.dim_edges_potts = self.hidden_dim * 5
             elif self.expansion_mode is None:
                 self.dim_nodes_potts = self.dim_edges_potts = self.hidden_dim
             elif self.expansion_mode == "multi_head_factor":
@@ -137,7 +153,8 @@ class ElixMPNN(nn.Module):
             else:
                 raise ValueError(
                     f"Invalid expansion mode: {self.expansion_mode}. Must be "
-                    "'node_concat', 'multi_head_factor', or 'node_concat_multi_head'."
+                    "'node_concat', 'node_concat_context_skip', "
+                    "'multi_head_factor', or 'node_concat_multi_head'."
                 )
 
             if self.norm_potts_inputs:
@@ -229,15 +246,13 @@ class ElixMPNN(nn.Module):
                                 mask_V = protein_residue_node_mask, E_idx = E_idx,
                                 mask_attend = protein_residue_node_mask_2d, h_V_C_skip=h_V_C_skip)
 
-        if self.expansion_mode in ("node_concat", "node_concat_multi_head"):
-            h_E = cat_neighbors_nodes(h_V, h_E, E_idx) # V_j -> E_ij # [B, L, K, 2*num_hidden]
-            h_V_expand = h_V.unsqueeze(-2).expand(-1,-1,h_E.size(-2),-1) # [B, L, K, num_hidden]
-            h_E = torch.cat([h_V_expand, h_E], -1) # V_i -> E_ij. [B, L, K, 3*num_hidden]
+        h_V_potts = self._expand_potts_nodes(h_V, h_V_C_skip)
+        h_E = self._expand_potts_edges(h_V, h_E, E_idx, h_V_C_skip)
 
         # Potts model
         if self.use_potts:
             if self.norm_potts_inputs:
-                h_V = self.norm_potts_inputs_nodes(h_V)
+                h_V_potts = self.norm_potts_inputs_nodes(h_V_potts)
                 h_E = self.norm_potts_inputs_edges(h_E)
 
             if self.max_dist_potts is not None:
@@ -249,7 +264,7 @@ class ElixMPNN(nn.Module):
                 E_idx = E_idx[:, :, :self.k_neighbors_potts]
                 protein_residue_node_mask_2d = protein_residue_node_mask_2d[:, :, :self.k_neighbors_potts]
 
-            h, J = self.decoder_S_potts(h_V, h_E, E_idx, protein_residue_node_mask, protein_residue_node_mask_2d)
+            h, J = self.decoder_S_potts(h_V_potts, h_E, E_idx, protein_residue_node_mask, protein_residue_node_mask_2d)
             potts_decoder_aux = {
                 "h": h,
                 "J": J,
@@ -266,6 +281,42 @@ class ElixMPNN(nn.Module):
             mpnn_feature_dict["potts_decoder_aux"] = potts_decoder_aux
 
         return logits, mpnn_feature_dict
+
+    def _expand_potts_nodes(self, h_V, h_V_C_skip=None):
+        if self.expansion_mode != "node_concat_context_skip":
+            return h_V
+        if h_V_C_skip is None:
+            raise RuntimeError(
+                "expansion_mode='node_concat_context_skip' requires h_V_C_skip "
+                "from ContextModule; check ligand_conditioning and return_context_skip."
+            )
+        return torch.cat([h_V, h_V_C_skip], -1)
+
+    def _expand_potts_edges(self, h_V, h_E, E_idx, h_V_C_skip=None):
+        if self.expansion_mode not in (
+            "node_concat",
+            "node_concat_context_skip",
+            "node_concat_multi_head",
+        ):
+            return h_E
+
+        h_E_neighbors = cat_neighbors_nodes(h_V, h_E, E_idx) # [h_E_ij, h_V_j]
+        h_V_expand = h_V.unsqueeze(-2).expand(-1, -1, h_E_neighbors.size(-2), -1)
+        h_E_expanded = torch.cat([h_V_expand, h_E_neighbors], -1)
+
+        if self.expansion_mode != "node_concat_context_skip":
+            return h_E_expanded
+
+        if h_V_C_skip is None:
+            raise RuntimeError(
+                "expansion_mode='node_concat_context_skip' requires h_V_C_skip "
+                "from ContextModule; check ligand_conditioning and return_context_skip."
+            )
+        h_V_C_skip_j = gather_nodes(h_V_C_skip, E_idx)
+        h_V_C_skip_i = h_V_C_skip.unsqueeze(-2).expand(
+            -1, -1, h_E_neighbors.size(-2), -1
+        )
+        return torch.cat([h_E_expanded, h_V_C_skip_i, h_V_C_skip_j], -1)
 
 
 class TokenFeatures(nn.Module):
@@ -872,11 +923,11 @@ class DecLayer(nn.Module):
 
 class ContextModule(nn.Module):
     def __init__(self, hidden_dim: int, dropout_p: float, num_processor_layers: int, num_aggregator_layers: int, context_edge_update: bool,
-                 use_context_skip_connection: bool):
+                 return_context_skip: bool):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.context_edge_update = context_edge_update
-        self.use_context_skip_connection = use_context_skip_connection
+        self.return_context_skip = return_context_skip
 
         # Projections
         self.W_v = torch.nn.Linear(self.hidden_dim, self.hidden_dim, bias=True)
@@ -932,7 +983,7 @@ class ContextModule(nn.Module):
                     h_V=h_V_C, h_E_context=h_E_context, Y_nodes = Y_nodes, mask_V=protein_residue_node_mask, mask_attend=Y_m
                 ) # Overwrite h_E_context with the new context features
 
-        h_V_C_skip = h_V_C if self.use_context_skip_connection else None
+        h_V_C_skip = h_V_C if self.return_context_skip else None
 
         h_V_C = self.V_C(h_V_C)
         h_V = h_V + self.V_C_norm(self.dropout(h_V_C))

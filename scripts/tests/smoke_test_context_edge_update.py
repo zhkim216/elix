@@ -38,7 +38,7 @@ def test_context_module(context_edge_update: bool) -> None:
         num_processor_layers=2,
         num_aggregator_layers=2,
         context_edge_update=context_edge_update,
-        use_context_skip_connection=False,
+        return_context_skip=False,
     )
 
     h_V = torch.randn(B, L, C, requires_grad=True)
