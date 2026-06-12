@@ -174,6 +174,78 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
 
         return batch
 
+    @staticmethod
+    def _guidance_branch_batch(
+        batch: dict[str, TensorType["b ..."]],
+        atom_cond_mask: torch.Tensor,
+    ) -> dict[str, TensorType["b ..."]]:
+        branch_batch = dict(batch)
+        branch_batch["atom_cond_mask"] = atom_cond_mask
+        return branch_batch
+
+    @staticmethod
+    def _require_guidance_atom_cond_mask(
+        guidance_cfg: dict[str, Any],
+        key: str,
+        batch: dict[str, TensorType["b ..."]],
+    ) -> torch.Tensor:
+        if key not in guidance_cfg:
+            raise ValueError(f"guidance.mode=selectivity requires guidance_cfg.{key}")
+        mask = guidance_cfg[key]
+        if not torch.is_tensor(mask):
+            raise TypeError(f"guidance_cfg.{key} must be a torch.Tensor, got {type(mask).__name__}")
+        if mask.shape != batch["atom_cond_mask"].shape:
+            raise ValueError(
+                f"guidance_cfg.{key} shape {tuple(mask.shape)} does not match "
+                f"atom_cond_mask shape {tuple(batch['atom_cond_mask'].shape)}"
+            )
+        return mask.to(device=batch["atom_cond_mask"].device, dtype=batch["atom_cond_mask"].dtype)
+
+    @classmethod
+    def _resolve_potts_guidance_branches(
+        cls,
+        batch: dict[str, TensorType["b ..."]],
+        guidance_cfg: dict[str, Any],
+    ) -> dict[str, Any]:
+        guidance_mode = str(guidance_cfg.get("mode", "cond_uncond"))
+        if guidance_mode == "cond_uncond":
+            uncond_mode = guidance_cfg.get("uncond_mode", "protein_only")
+            if uncond_mode != "protein_only":
+                raise NotImplementedError(
+                    f"Unsupported uncond_mode={uncond_mode!r}. Only 'protein_only' is implemented."
+                )
+            negative_mask = batch["atom_cond_mask"] * batch["atom_is_protein_chain"]
+            return {
+                "mode": guidance_mode,
+                "positive_batch": batch,
+                "negative_batch": cls._guidance_branch_batch(batch, negative_mask),
+                "positive_branch_label": "cond",
+                "negative_branch_label": "protein_only",
+            }
+
+        if guidance_mode == "selectivity":
+            positive_mask = cls._require_guidance_atom_cond_mask(
+                guidance_cfg,
+                "positive_atom_cond_mask",
+                batch,
+            )
+            negative_mask = cls._require_guidance_atom_cond_mask(
+                guidance_cfg,
+                "negative_atom_cond_mask",
+                batch,
+            )
+            return {
+                "mode": guidance_mode,
+                "positive_batch": cls._guidance_branch_batch(batch, positive_mask),
+                "negative_batch": cls._guidance_branch_batch(batch, negative_mask),
+                "positive_branch_label": str(guidance_cfg.get("positive_branch_label", "positive")),
+                "negative_branch_label": str(guidance_cfg.get("negative_branch_label", "negative")),
+            }
+
+        raise NotImplementedError(
+            f"Unsupported guidance.mode={guidance_mode!r}. Expected 'cond_uncond' or 'selectivity'."
+        )
+
     def potts_sample(self,
                      batch: dict[str, TensorType["b ..."]],
                      sampling_inputs: dict[str, Any],
@@ -182,20 +254,19 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
         """
         Potts sampling for sequence design.
 
-        When ``potts_sampling_cfg.guidance_cfg.enabled`` is true, a second
-        forward pass is run on a ligand-masked (``protein_only``) copy of the
-        batch to obtain "uncond" Potts parameters. The sampler then runs DLMC
-        on the linearly-mixed parameters
+        When ``potts_sampling_cfg.guidance_cfg.enabled`` is true, Potts
+        parameters are computed for positive and negative branches. In legacy
+        ``cond_uncond`` mode these are the ligand-conditioned and protein-only
+        branches; in ``selectivity`` mode the eval layer supplies generic
+        branch atom masks. The sampler then runs DLMC on the linearly-mixed
+        parameters
 
-            h_mix = gamma * h_cond + (1 - gamma) * h_uncond
-            J_mix = gamma * J_cond + (1 - gamma) * J_uncond
+            h_mix = scale * h_positive + (1 - scale) * h_negative
+            J_mix = scale * J_positive + (1 - scale) * J_negative
 
-        sweeping over ``gamma_list``. This samples from the Boltzmann
-        distribution of ``U_mix = gamma * U_cond + (1 - gamma) * U_uncond``.
+        sweeping over ``guidance_scale_list`` or the legacy ``gamma_list``.
         For each sampled sequence we also record post-hoc physical Potts
-        energies ``U_cond`` and ``U_uncond`` (no LCP penalty) so that
-        downstream code can plot the Pareto front of ligand-fit vs.
-        ligand-free stability.
+        energies for both branches.
 
         Returns:
             output_feats: list[dict[str, TensorType["b ..."]]]: list of length (n_samples_per_pdb) of output features for each sample
@@ -222,30 +293,35 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
                 raise NotImplementedError(
                     "Potts guidance is not supported together with tied_sampling."
                 )
-            gamma_list = list(guidance_cfg.get("gamma_list", [1.0]))
+            guidance_branches = self._resolve_potts_guidance_branches(batch, guidance_cfg)
+            guidance_mode = guidance_branches["mode"]
+            guidance_scale_list = list(
+                guidance_cfg.get("guidance_scale_list", guidance_cfg.get("gamma_list", [1.0]))
+            )
             schedule_list_raw = guidance_cfg.get("schedule_list", None)
             schedule_list = [dict(s) for s in schedule_list_raw] if schedule_list_raw is not None else None
-            uncond_mode = guidance_cfg.get("uncond_mode", "protein_only")
-            if uncond_mode != "protein_only":
-                raise NotImplementedError(
-                    f"Unsupported uncond_mode={uncond_mode!r}. Only 'protein_only' is implemented."
-                )
-            # Build the uncond batch *before* the first compute_potts_params
-            # call so both branches see the same starting state. A shallow
-            # copy is enough — we only rebind specific keys; no tensors are
-            # mutated in place.
-            batch_uncond = dict(batch)
-            batch_uncond["atom_cond_mask"] = batch["atom_cond_mask"] * batch["atom_is_protein_chain"]
+            batch_positive = guidance_branches["positive_batch"]
+            batch_negative = guidance_branches["negative_batch"]
             pocket_distance = float(guidance_cfg.get("pocket_distance", 10.0))
         else:
-            gamma_list = [None]
+            guidance_branches = None
+            guidance_mode = None
+            guidance_scale_list = [None]
             schedule_list = None
-            batch_uncond = None
+            batch_positive = None
+            batch_negative = None
             pocket_distance = None
 
         # Compute cond potts parameters, or use a runtime provider that returns
         # aux tensors on this same token axis.
-        if potts_aux_provider is None:
+        if use_guidance:
+            potts_decoder_aux, batch_positive, sampling_inputs = self.compute_potts_params(
+                batch_positive,
+                sampling_inputs,
+            )
+            batch["protein_residue_node_mask"] = batch_positive["protein_residue_node_mask"]
+            batch["token_exists_mask"] = batch_positive["token_exists_mask"]
+        elif potts_aux_provider is None:
             potts_decoder_aux, batch, sampling_inputs = self.compute_potts_params(batch, sampling_inputs)
         else:
             potts_decoder_aux, batch, sampling_inputs = potts_aux_provider(
@@ -253,13 +329,13 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
                 sampling_inputs=sampling_inputs,
             )
 
-        # Compute uncond potts parameters (single extra forward pass) if guidance is on
-        potts_decoder_aux_uncond = None
+        # Compute negative branch Potts parameters if guidance is on.
+        potts_decoder_aux_negative = None
         pocket_mask = None
         n_protein = None
         n_pocket = None
         if use_guidance:
-            potts_decoder_aux_uncond, _, _ = self.compute_potts_params(batch_uncond, sampling_inputs)
+            potts_decoder_aux_negative, _, _ = self.compute_potts_params(batch_negative, sampling_inputs)
             # Pocket mask is structure-only; compute once per batch, reuse for
             # every (gamma, sample). N_pocket==0 is possible (no ligand atoms
             # or nothing within pocket_distance) — handled via clamp below.
@@ -324,7 +400,7 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
         num_seqs_per_pdb = sampling_inputs["num_seqs_per_pdb"]
 
         # Outer iteration: schedule_list (when set) takes precedence over
-        # gamma_list. Each item is normalized to {label, type, gamma_max}; for
+        # scale lists. Each item is normalized to {label, type, gamma_max}; for
         # constant entries we pass gamma_schedule_cfg=None so the legacy
         # constant-γ path runs unchanged.
         if use_guidance and schedule_list is not None:
@@ -347,7 +423,7 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
                     "type": "constant",
                     "gamma_max": (float(g) if g is not None else None),
                 }
-                for g in gamma_list
+                for g in guidance_scale_list
             ]
 
         # Design sequences: outer loop over schedule (or constant gamma),
@@ -376,9 +452,9 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
                         verbose=False,
                         edge_idx_coloring=edge_idx_coloring,
                         mask_ij_coloring=mask_ij_coloring,
-                        h_uncond=potts_decoder_aux_uncond["h"],
-                        J_uncond=potts_decoder_aux_uncond["J"],
-                        edge_idx_uncond=potts_decoder_aux_uncond["edge_idx"],
+                        h_uncond=potts_decoder_aux_negative["h"],
+                        J_uncond=potts_decoder_aux_negative["J"],
+                        edge_idx_uncond=potts_decoder_aux_negative["edge_idx"],
                         gamma=sched_gamma_max,
                         gamma_schedule_cfg=sched_cfg,
                     )
@@ -420,9 +496,9 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
                     )
                     U_uncond_post, _, U_uncond_per_res_post = potts.compute_potts_energy(
                         S_sample,
-                        potts_decoder_aux_uncond["h"],
-                        potts_decoder_aux_uncond["J"],
-                        potts_decoder_aux_uncond["edge_idx"],
+                        potts_decoder_aux_negative["h"],
+                        potts_decoder_aux_negative["J"],
+                        potts_decoder_aux_negative["edge_idx"],
                         return_per_res=True,
                     )
                     # Pocket-restricted totals: sum per-residue contributions
@@ -460,14 +536,30 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
 
         # Free GPU potts parameters before postprocessing
         del potts_decoder_aux
-        if potts_decoder_aux_uncond is not None:
-            del potts_decoder_aux_uncond
+        if potts_decoder_aux_negative is not None:
+            del potts_decoder_aux_negative
 
         per_sample_aux = [
             {
                 "U": aux["U"][si],
                 "gamma": aux["gamma"][si],
+                "guidance_scale": aux["gamma"][si],
+                "guidance_mode": guidance_mode if use_guidance else None,
                 "schedule_label": aux["schedule_label"][si],
+                "positive_branch_label": (
+                    guidance_branches["positive_branch_label"] if use_guidance else None
+                ),
+                "negative_branch_label": (
+                    guidance_branches["negative_branch_label"] if use_guidance else None
+                ),
+                "U_positive": aux["U_cond"][si],
+                "U_negative": aux["U_uncond"][si],
+                "U_positive_per_res": aux["U_cond_per_res"][si],
+                "U_negative_per_res": aux["U_uncond_per_res"][si],
+                "U_positive_pocket": aux["U_cond_pocket"][si],
+                "U_negative_pocket": aux["U_uncond_pocket"][si],
+                "U_positive_pocket_per_res": aux["U_cond_pocket_per_res"][si],
+                "U_negative_pocket_per_res": aux["U_uncond_pocket_per_res"][si],
                 "U_cond": aux["U_cond"][si],
                 "U_uncond": aux["U_uncond"][si],
                 "U_cond_per_res": aux["U_cond_per_res"][si],
@@ -723,9 +815,22 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
                     sample_aux["U"] = _extract_scalar(aux_si.get("U"), bi)
                     if "gamma" in aux_si:
                         sample_aux["gamma"] = aux_si["gamma"]  # scalar or None
+                    if "guidance_scale" in aux_si:
+                        sample_aux["guidance_scale"] = aux_si["guidance_scale"]  # scalar or None
+                    for key in ("guidance_mode", "positive_branch_label", "negative_branch_label"):
+                        if key in aux_si:
+                            sample_aux[key] = aux_si[key]
                     if "schedule_label" in aux_si:
                         sample_aux["schedule_label"] = aux_si["schedule_label"]  # str or None
                     for key in (
+                        "U_positive",
+                        "U_negative",
+                        "U_positive_per_res",
+                        "U_negative_per_res",
+                        "U_positive_pocket",
+                        "U_negative_pocket",
+                        "U_positive_pocket_per_res",
+                        "U_negative_pocket_per_res",
                         "U_cond",
                         "U_uncond",
                         "U_cond_per_res",
@@ -800,13 +905,22 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
 
 def _aggregate_potts_params(potts_decoder_aux: dict[str, TensorType["b ..."]],
                             tied_sampling_inputs: dict[str, Any],
-                            use_mean: bool = True,
+                            use_mean: bool | None = True,
+                            reduce: str | None = None,
                             ) -> dict[str, TensorType["b ..."]]:
     """
     Aggregate potts parameters across tied groups.
 
-    If use_mean, we take the mean of the potts parameters across the tied groups (equivalent to geometric mean in probability space)
+    If reduce is "mean", we take the mean of the potts parameters across the tied
+    groups (equivalent to geometric mean in probability space). If reduce is
+    "sqrt", summed parameters are divided by sqrt(group size). The legacy
+    use_mean argument is preserved for callers/tests that use sum vs mean.
     """
+    if reduce is None:
+        reduce = "mean" if use_mean else "sum"
+    if reduce not in {"sum", "mean", "sqrt"}:
+        raise ValueError(f"Unknown Potts aggregation reduce: {reduce!r}")
+
     h, J, edge_idx, mask_i, mask_ij = potts_decoder_aux["h"], potts_decoder_aux["J"], potts_decoder_aux["edge_idx"], potts_decoder_aux["mask_i"], potts_decoder_aux["mask_ij"]
     inverse, unique_ids = tied_sampling_inputs["inverse"], tied_sampling_inputs["unique_ids"]
 
@@ -832,9 +946,13 @@ def _aggregate_potts_params(potts_decoder_aux: dict[str, TensorType["b ..."]],
     mask_ij_new = (edge_counts > 0) * (mask_i_new[:, :, None] * mask_i_new[:, None, :])  # edge i,j is present only if both nodes are present and there exists some edge between them
     edge_idx_new = torch.arange(N, device=edge_idx.device).expand(1, 1, -1).repeat(n_grp, N, 1)  # new edge indices are given in the full NxN grid
 
-    if use_mean:
+    if reduce == "mean":
         J_new = J_new / counts.view(-1, 1, 1, 1, 1)
         h_new = h_new / counts.view(-1, 1, 1)
+    elif reduce == "sqrt":
+        scale = torch.sqrt(counts.to(dtype=J_new.dtype))
+        J_new = J_new / scale.view(-1, 1, 1, 1, 1)
+        h_new = h_new / scale.to(dtype=h_new.dtype).view(-1, 1, 1)
 
     potts_decoder_aux_new = {
         "h": h_new,

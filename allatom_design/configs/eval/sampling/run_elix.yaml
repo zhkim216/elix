@@ -43,6 +43,16 @@ sampling_cfg:
       potts_sweeps: 500
       lcp_expand_edge_idx_fix: true
       rejection_step: false
+      ensemble_conditioning:
+        enabled: false
+        num_ensembles: 1
+        reduce: "mean"  # mean = 1/M, sqrt = 1/sqrt(M)
+        noise_seed: null
+        save_noisy_inputs_dir: null
+        noise_std:
+          protein: 0.0
+          metal: 0.0
+          nonpolymer: 0.0
   # Classifier-free-style guidance for Potts sequence design.
   # When enabled, sampling runs two forward passes (cond = with ligand,
   # uncond = ligand masked out) and runs the standard DLMC proposal on the

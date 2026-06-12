@@ -239,6 +239,55 @@ class TestPottsAggregation(unittest.TestCase):
         expected_mask_ij = torch.ones(1, N, N, device=self.device, dtype=self.dtype)
         torch.testing.assert_close(result["mask_ij"], expected_mask_ij)
 
+    def test_sqrt_reduce_scales_sum_by_group_size_sqrt(self):
+        """Test sqrt aggregation divides summed parameters by sqrt(group size)."""
+        B, N, C = 4, 2, 2
+
+        h = torch.ones(B, N, C, device=self.device, dtype=self.dtype)
+        J = torch.ones(B, N, N, C, C, device=self.device, dtype=self.dtype)
+        potts_decoder_aux = {
+            "h": h,
+            "J": J,
+            "edge_idx": torch.arange(N, device=self.device).expand(B, N, N),
+            "mask_i": torch.ones(B, N, device=self.device, dtype=self.dtype),
+            "mask_ij": torch.ones(B, N, N, device=self.device, dtype=self.dtype),
+        }
+        tied_sampling_inputs = {
+            "inverse": torch.tensor([0, 0, 0, 0], device=self.device),
+            "unique_ids": torch.tensor([0], device=self.device),
+        }
+
+        result = _aggregate_potts_params(
+            potts_decoder_aux,
+            tied_sampling_inputs,
+            reduce="sqrt",
+        )
+
+        expected_scale = torch.sqrt(torch.tensor(float(B), device=self.device))
+        torch.testing.assert_close(result["h"], torch.full((1, N, C), float(B), device=self.device) / expected_scale)
+        torch.testing.assert_close(result["J"], torch.full((1, N, N, C, C), float(B), device=self.device) / expected_scale)
+
+    def test_unknown_reduce_raises(self):
+        B, N, C = 1, 2, 2
+        potts_decoder_aux = {
+            "h": torch.ones(B, N, C, device=self.device, dtype=self.dtype),
+            "J": torch.ones(B, N, N, C, C, device=self.device, dtype=self.dtype),
+            "edge_idx": torch.arange(N, device=self.device).expand(B, N, N),
+            "mask_i": torch.ones(B, N, device=self.device, dtype=self.dtype),
+            "mask_ij": torch.ones(B, N, N, device=self.device, dtype=self.dtype),
+        }
+        tied_sampling_inputs = {
+            "inverse": torch.tensor([0], device=self.device),
+            "unique_ids": torch.tensor([0], device=self.device),
+        }
+
+        with self.assertRaisesRegex(ValueError, "Unknown Potts aggregation reduce"):
+            _aggregate_potts_params(
+                potts_decoder_aux,
+                tied_sampling_inputs,
+                reduce="bad",
+            )
+
 
 if __name__ == "__main__":
     unittest.main(argv=['first-arg-is-ignored'], exit=False)

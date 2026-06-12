@@ -26,6 +26,20 @@ potts_sampling_cfg:
   # add gaussian noise to inputs
   noise_std: 0.0
 
+  # Ensemble conditioning computes Potts parameters on multiple independently
+  # noised copies of each input and aggregates h/J before sampling. The sampled
+  # CIF coordinates still come from the original unnoised input batch.
+  ensemble_conditioning:
+    enabled: false
+    num_ensembles: 1
+    reduce: "mean"  # mean = 1/M, sqrt = 1/sqrt(M)
+    noise_seed: null
+    save_noisy_inputs_dir: null
+    noise_std:
+      protein: 0.0
+      metal: 0.0
+      nonpolymer: 0.0
+
   # Classifier-free-style guidance: mix a ligand-conditioned ("cond") and
   # ligand-absent ("uncond") Potts proposal at each DLMC sweep. When
   # `enabled=false` this is a no-op and the sampler uses the cond branch
@@ -38,8 +52,9 @@ potts_sampling_cfg:
   # branches share the same protein kNN graph).
   guidance_cfg:
     enabled: false
+    mode: "cond_uncond"
     gamma_list: [0.0, 0.5, 1.0, 1.5, 2.0]   # gamma > 1 = CFG extrapolation
-    uncond_mode: "protein_only"              # only mode currently implemented
+    uncond_mode: "protein_only"              # cond_uncond negative branch
     pocket_distance: 10.0                    # Å from any ligand atom to C-alpha for the pocket mask
 
 mlm_sampling_cfg:
