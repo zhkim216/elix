@@ -5,7 +5,7 @@
 #     scripts/sherlock_scripts/jinho/eval/structure_prediction/run_tc_af3_nativeval_sm_metal_nativeseq_pairscale_sweep.sbatch
 #SBATCH --job-name=tc_af3_pairscale
 #SBATCH -p possu,bioe
-#SBATCH --array=0-4
+#SBATCH --array=0-11
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
@@ -17,26 +17,30 @@ set -euo pipefail
 
 TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 
-# Pair-scale sweep for native-sequence template-conditioned AF3 with num_recycles=1.
-# Update the SBATCH array range to NUM_PAIR_SCALES * NUM_CHUNKS - 1 if
-# adding more values or chunks.
-PAIR_SCALES=(0.1 0.15 0.2 0.25 0.3)
+# Pair-scale x num-recycles sweep for native-sequence template-conditioned AF3.
+# Update the SBATCH array range to NUM_SWEEP_CONFIGS * NUM_CHUNKS - 1 if
+# adding more sweep values or chunks.
+PAIR_SCALES=(0.05 0.1 0.15)
+NUM_RECYCLES_VALUES=(3 5 7 10)
 
 NUM_PAIR_SCALES=${#PAIR_SCALES[@]}
+NUM_RECYCLES_OPTIONS=${#NUM_RECYCLES_VALUES[@]}
+NUM_SWEEP_CONFIGS=$((NUM_PAIR_SCALES * NUM_RECYCLES_OPTIONS))
 NUM_CHUNKS=1
-NUM_TASKS=$((NUM_PAIR_SCALES * NUM_CHUNKS))
+NUM_TASKS=$((NUM_SWEEP_CONFIGS * NUM_CHUNKS))
 
 if [[ "${TASK_ID}" -ge "${NUM_TASKS}" ]]; then
   echo "TASK_ID=${TASK_ID} is outside selected tasks=${NUM_TASKS}; exiting without work."
   exit 0
 fi
 
-PAIR_SCALE_IDX=$((TASK_ID / NUM_CHUNKS))
+SWEEP_CONFIG_IDX=$((TASK_ID / NUM_CHUNKS))
 CHUNK_IDX=$((TASK_ID % NUM_CHUNKS))
+PAIR_SCALE_IDX=$((SWEEP_CONFIG_IDX / NUM_RECYCLES_OPTIONS))
+NUM_RECYCLES_IDX=$((SWEEP_CONFIG_IDX % NUM_RECYCLES_OPTIONS))
 AF3_TEMPLATE_PAIR_SCALE=${PAIR_SCALES[$PAIR_SCALE_IDX]}
+NUM_RECYCLES=${NUM_RECYCLES_VALUES[$NUM_RECYCLES_IDX]}
 PAIR_SCALE_LABEL=${AF3_TEMPLATE_PAIR_SCALE//./p}
-
-NUM_RECYCLES=1
 
 BASE_DIR="${PROJECT_ROOT:-/home/users/zhkim216/code/elix}"
 HYDRA_ROOT=/scratch/users/zhkim216/hydra_outputs/tc_af3_nativeval_sm_metal_nativeseq_pairscale_sweep
