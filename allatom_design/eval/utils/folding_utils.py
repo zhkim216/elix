@@ -289,6 +289,26 @@ def _run_af3_inprocess(
 # ============================================================================
 
 
+def make_af3_protein_sequence_entry(
+    *,
+    chain_id: str,
+    sequence: str,
+    modifications: list[dict] | None = None,
+    templates: list[dict] | None = None,
+) -> dict:
+    """Build a protein sequence entry accepted by AF3's custom input path."""
+    return {
+        "protein": {
+            "id": chain_id,
+            "sequence": sequence,
+            "modifications": modifications or [],
+            "unpairedMsa": "",
+            "pairedMsa": "",
+            "templates": templates or [],
+        }
+    }
+
+
 def _resolve_af3_ligand_ccd_code(
     *,
     designed_sample_atom_array: AtomArray,
@@ -348,6 +368,34 @@ def _af3_ligand_ccd_codes_for_json(
     if any(not code for code in codes):
         raise ValueError("af3_ligand_ccd_codes contains an empty component ID")
     return codes, False
+
+
+def _ligand_metric_values_from_chain_info(
+    pdb_chain_info: dict,
+    keys: tuple[str, ...],
+    ligand_pn_unit_iids: list[str],
+) -> list[str | None] | None:
+    def _clean_metric_value(value: object) -> str | None:
+        if value is None or pd.isna(value):
+            return None
+        text = str(value).strip()
+        if not text or text.lower() == "nan":
+            return None
+        return text
+
+    for key in keys:
+        values = pdb_chain_info.get(key)
+        if values is None:
+            continue
+        if isinstance(values, dict):
+            result = [_clean_metric_value(values.get(str(iid))) for iid in ligand_pn_unit_iids]
+            return result if any(value is not None for value in result) else None
+        if isinstance(values, str):
+            value = _clean_metric_value(values)
+            return [value] if value is not None and len(ligand_pn_unit_iids) == 1 else None
+        result = [_clean_metric_value(value) for value in values]
+        return result if any(value is not None for value in result) else None
+    return None
 
 
 def make_af3_json(af3_ss_input_dir: str = None,
@@ -505,36 +553,32 @@ def make_af3_json(af3_ss_input_dir: str = None,
                     # Make template indices for the actual sequence. 0-based
                     query_indices = template_indices = [int(x) for x in list(_res_ids_0based)]
 
-                ss_sequences.append({
-                    "protein": {
-                        "id": protein_pn_unit_iid.split("_")[0],
-                        "sequence": sequence_with_gaps,
-                        "modifications": modifications if modifications else [],
-                        "unpairedMsa": "",
-                        "pairedMsa": "",
-                        "templates": [],
-                        }
-                    }
+                chain_id = protein_pn_unit_iid.split("_")[0]
+                ss_sequences.append(
+                    make_af3_protein_sequence_entry(
+                        chain_id=chain_id,
+                        sequence=sequence_with_gaps,
+                        modifications=modifications,
+                        templates=[],
+                    )
                 )
 
                 if make_tc_input:
-                    tc_sequences.append({
-                        "protein": {
-                            "id": protein_pn_unit_iid.split("_")[0],
-                            "sequence": sequence_with_gaps,
-                            "modifications": modifications if modifications else [],
-                            "unpairedMsa": "",
-                            "pairedMsa": "",
-                            "templates": [
+                    tc_sequences.append(
+                        make_af3_protein_sequence_entry(
+                            chain_id=chain_id,
+                            sequence=sequence_with_gaps,
+                            modifications=modifications,
+                            templates=[
                                 {
                                     "mmcifPath": template_sample_path,
                                     "queryIndices": query_indices,
                                     "templateIndices": template_indices,
-                                    "templateChainId": protein_pn_unit_iid.split("_")[0],
+                                    "templateChainId": chain_id,
                                 }
-                            ]
-                        }
-                    })
+                            ],
+                        )
+                    )
 
 
             for ligand_pn_unit_iid, ligand_ccd_code in zip(ligand_pn_unit_iids, af3_ligand_ccd_codes):
@@ -812,6 +856,9 @@ def evaluate_af3_self_consistency(sample_dict: dict = None,
             designed_sample_id_to_per_pred_docking_metrics[designed_sample_id] = {"input_sample_id": input_sample_id}
 
             designed_sample_atom_array = subsample_dict['designed_sample_atom_array'][dsidx]
+            reference_sample_atom_array = subsample_dict.get('reference_sample_atom_array', designed_sample_atom_array)
+            if isinstance(reference_sample_atom_array, list):
+                reference_sample_atom_array = reference_sample_atom_array[dsidx]
             pdb_chain_info = subsample_dict['pdb_chain_info']
             ss_json_path = subsample_dict['af3_ss_json_paths'][dsidx]
 
@@ -819,6 +866,20 @@ def evaluate_af3_self_consistency(sample_dict: dict = None,
             protein_pn_unit_iids = pdb_chain_info['protein_pn_unit_iids']
             ligand_pn_unit_iids = pdb_chain_info['ligand_pn_unit_iids']
             ligand_ccd_codes = pdb_chain_info.get('ligand_ccd_codes', [])
+            ligand_smiles = _ligand_metric_values_from_chain_info(
+                pdb_chain_info,
+                ("ligand_smiles", "ligand_smiles_by_iid"),
+                ligand_pn_unit_iids,
+            )
+            reference_ligand_pn_unit_iids = _ligand_metric_values_from_chain_info(
+                pdb_chain_info,
+                (
+                    "reference_ligand_pn_unit_iids",
+                    "original_ligand_pn_unit_iids",
+                    "reference_ligand_pn_unit_iids_by_iid",
+                ),
+                ligand_pn_unit_iids,
+            )
 
             if not calculate_metrics_only:
                 # Run AF3 single-sequence prediction
@@ -868,11 +929,14 @@ def evaluate_af3_self_consistency(sample_dict: dict = None,
                             per_pred_docking_metrics = compute_docking_metrics_atomarray(
                                 pred_atom_array=pred_atom_array,
                                 sample_atom_array=designed_sample_atom_array,
+                                reference_atom_array=reference_sample_atom_array,
                                 pred_sample_path=pred_ss_sample_path,
                                 pocket_distance_for_docking_metrics=pocket_cfg.pocket_distance_for_docking_metrics,
                                 receptor_pn_unit_iids=protein_pn_unit_iids,
                                 ligand_pn_unit_iids=ligand_pn_unit_iids,
                                 ligand_ccd_codes=ligand_ccd_codes,
+                                ligand_smiles=ligand_smiles,
+                                reference_ligand_pn_unit_iids=reference_ligand_pn_unit_iids,
                                 ref_sample_is_designed=input_sample_is_designed,
                             )
 
@@ -998,6 +1062,9 @@ def evaluate_af3_docking_consistency(sample_dict: dict = None,
             designed_sample_id_to_per_pred_docking_metrics[designed_sample_id] = {"input_sample_id": input_sample_id}
 
             designed_sample_atom_array = subsample_dict['designed_sample_atom_array'][dsidx]
+            reference_sample_atom_array = subsample_dict.get('reference_sample_atom_array', designed_sample_atom_array)
+            if isinstance(reference_sample_atom_array, list):
+                reference_sample_atom_array = reference_sample_atom_array[dsidx]
             pdb_chain_info = subsample_dict['pdb_chain_info']
             tc_json_path = subsample_dict['af3_tc_json_paths'][dsidx]
 
@@ -1005,6 +1072,20 @@ def evaluate_af3_docking_consistency(sample_dict: dict = None,
             protein_pn_unit_iids = pdb_chain_info['protein_pn_unit_iids']
             ligand_pn_unit_iids = pdb_chain_info['ligand_pn_unit_iids']
             ligand_ccd_codes = pdb_chain_info.get('ligand_ccd_codes', [])
+            ligand_smiles = _ligand_metric_values_from_chain_info(
+                pdb_chain_info,
+                ("ligand_smiles", "ligand_smiles_by_iid"),
+                ligand_pn_unit_iids,
+            )
+            reference_ligand_pn_unit_iids = _ligand_metric_values_from_chain_info(
+                pdb_chain_info,
+                (
+                    "reference_ligand_pn_unit_iids",
+                    "original_ligand_pn_unit_iids",
+                    "reference_ligand_pn_unit_iids_by_iid",
+                ),
+                ligand_pn_unit_iids,
+            )
 
             if not calculate_metrics_only:
                 # Run AF3 template-conditioned prediction
@@ -1056,12 +1137,15 @@ def evaluate_af3_docking_consistency(sample_dict: dict = None,
                             per_pred_docking_metrics = compute_docking_metrics_atomarray(
                                 pred_atom_array=pred_atom_array,
                                 sample_atom_array=designed_sample_atom_array,
+                                reference_atom_array=reference_sample_atom_array,
                                 pred_sample_path=pred_tc_sample_path,
                                 save_aligned=False,
                                 pocket_distance_for_docking_metrics=pocket_cfg.pocket_distance_for_docking_metrics,
                                 receptor_pn_unit_iids=protein_pn_unit_iids,
                                 ligand_pn_unit_iids=ligand_pn_unit_iids,
                                 ligand_ccd_codes=ligand_ccd_codes,
+                                ligand_smiles=ligand_smiles,
+                                reference_ligand_pn_unit_iids=reference_ligand_pn_unit_iids,
                                 ref_sample_is_designed=input_sample_is_designed,
                             )
 
@@ -1135,6 +1219,24 @@ def _aggregate_best_sc_metrics_per_designed_sample(designed_sample_id_to_per_pre
     return designed_sample_id_best_sc_metrics
 
 
+_OPTIONAL_DOCKING_METRIC_FIELDS = (
+    "ligand_input_type",
+    "ligand_rmsd_mode",
+    "ligand_pn_unit_iids",
+    "reference_ligand_pn_unit_iids",
+    "reference_ligand_ccd_code",
+    "mcs_num_atoms",
+    "mcs_pred_coverage",
+    "mcs_reference_coverage",
+)
+
+
+def _copy_optional_docking_metric_fields(target: dict, source: dict) -> None:
+    for field in _OPTIONAL_DOCKING_METRIC_FIELDS:
+        if field in source:
+            target[field] = source.get(field)
+
+
 def _aggregate_best_docking_metrics_per_designed_sample(designed_sample_id_to_per_pred_docking_metrics: dict) -> dict:
     """
     Aggregate best docking metrics per designed_sample_id (by max ligand_plddt across diffusion samples).
@@ -1162,7 +1264,7 @@ def _aggregate_best_docking_metrics_per_designed_sample(designed_sample_id_to_pe
 
         # Find the prediction with max ligand_plddt
         best_pred = max(diffusion_preds.values(), key=lambda x: x["ligand_plddt"])
-        designed_sample_id_best_docking_metrics[designed_sample_id] = {
+        best_metrics = {
             "input_sample_id": input_sample_id,
             "ligand_rmsd": best_pred["ligand_rmsd"],
             "binding_site_rmsd": best_pred["binding_site_rmsd"],
@@ -1172,6 +1274,8 @@ def _aggregate_best_docking_metrics_per_designed_sample(designed_sample_id_to_pe
             "interface_min_pae": best_pred["interface_min_pae"],
             "ligand_ccd_code": best_pred.get("ligand_ccd_code"),
         }
+        _copy_optional_docking_metric_fields(best_metrics, best_pred)
+        designed_sample_id_best_docking_metrics[designed_sample_id] = best_metrics
     return designed_sample_id_best_docking_metrics
 
 
@@ -1217,7 +1321,7 @@ def _aggregate_best_docking_metrics_per_input_sample(designed_sample_id_best_doc
     input_sample_id_best_docking_metrics = {}
     for input_sample_id, designed_samples in input_sample_id_to_designed_samples.items():
         best_designed_sample_id, best_metrics = max(designed_samples, key=lambda x: x[1]["ligand_plddt"])
-        input_sample_id_best_docking_metrics[input_sample_id] = {
+        best_input_metrics = {
             "best_designed_sample_id": best_designed_sample_id,
             "ligand_rmsd": best_metrics["ligand_rmsd"],
             "binding_site_rmsd": best_metrics["binding_site_rmsd"],
@@ -1227,6 +1331,8 @@ def _aggregate_best_docking_metrics_per_input_sample(designed_sample_id_best_doc
             "interface_min_pae": best_metrics["interface_min_pae"],
             "ligand_ccd_code": best_metrics.get("ligand_ccd_code"),
         }
+        _copy_optional_docking_metric_fields(best_input_metrics, best_metrics)
+        input_sample_id_best_docking_metrics[input_sample_id] = best_input_metrics
     return input_sample_id_best_docking_metrics
 
 

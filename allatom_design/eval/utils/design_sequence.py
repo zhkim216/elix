@@ -23,8 +23,17 @@ from allatom_design.eval.utils.constraint_utils import (
     parse_fixed_pos_info,
     parse_pos_restrict_aatype_info,
 )
-from allatom_design.eval.utils.data_utils import get_sd_batch, collect_design_outputs
+from allatom_design.eval.utils.data_utils import (
+    _matched_sampling_input_row,
+    collect_design_outputs,
+    get_sd_batch,
+)
 from allatom_design.eval.utils.sequence_recovery import calculate_sequence_recovery
+from allatom_design.eval.utils.selectivity import (
+    SELECTIVITY_GUIDANCE_METADATA_KEYS,
+    normalize_target_ligand_side,
+    resolve_selectivity_guidance_branches,
+)
 from allatom_design.model.seq_denoiser.sd_model import SeqDenoiser
 
 
@@ -39,6 +48,149 @@ def _format_designed_sample_id(
     if tag is None:
         return f"{example_id}_{sample_token}"
     return f"{example_id}_{tag}_{sample_token}"
+
+
+_GUIDANCE_AUX_KEYS = (
+    "guidance_mode",
+    "guidance_scale",
+    "positive_branch_label",
+    "negative_branch_label",
+    "U_positive",
+    "U_negative",
+    "U_positive_per_res",
+    "U_negative_per_res",
+    "U_positive_pocket",
+    "U_negative_pocket",
+    "U_positive_pocket_per_res",
+    "U_negative_pocket_per_res",
+    "U_cond",
+    "U_uncond",
+    "U_cond_per_res",
+    "U_uncond_per_res",
+    "U_cond_pocket",
+    "U_uncond_pocket",
+    "U_cond_pocket_per_res",
+    "U_uncond_pocket_per_res",
+    "N_pocket",
+)
+
+def _guidance_cfg_to_dict(guidance_cfg: DictConfig | dict | None) -> dict[str, Any] | None:
+    if guidance_cfg is None:
+        return None
+    if isinstance(guidance_cfg, DictConfig):
+        return OmegaConf.to_container(guidance_cfg, resolve=True)
+    return dict(guidance_cfg)
+
+
+def _guidance_mode(guidance_cfg: DictConfig | dict | None) -> str:
+    if guidance_cfg is None:
+        return "cond_uncond"
+    return str(guidance_cfg.get("mode", "cond_uncond"))
+
+
+def _ligand_atom_mask_for_branch(
+    *,
+    atom_array,
+    atom_cond_mask: torch.Tensor,
+    ligand_pn_unit_iid: str,
+    example_id: str,
+) -> torch.Tensor:
+    ligand_mask = torch.zeros_like(atom_cond_mask, dtype=torch.bool)
+    atom_iids = np.asarray(atom_array.pn_unit_iid).astype(str)
+    selected = atom_iids == str(ligand_pn_unit_iid)
+    if not np.any(selected):
+        raise ValueError(
+            f"selectivity guidance ligand {ligand_pn_unit_iid!r} not found in atom_array for {example_id}"
+        )
+    ligand_mask[: len(atom_array)] = torch.as_tensor(selected, device=atom_cond_mask.device)
+    return ligand_mask
+
+
+def build_selectivity_guidance_branch_masks(
+    *,
+    batch: dict[str, Any],
+    sampling_inputs_df: pd.DataFrame,
+    target_ligand_side: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, dict[str, Any]]]:
+    """Build generic positive/negative branch atom masks for selectivity guidance."""
+    if sampling_inputs_df is None:
+        raise ValueError("guidance.mode=selectivity requires sampling_inputs_csv")
+
+    positive_mask = torch.zeros_like(batch["atom_cond_mask"])
+    negative_mask = torch.zeros_like(batch["atom_cond_mask"])
+    metadata_by_example_id: dict[str, dict[str, Any]] = {}
+
+    for batch_idx, example_id_raw in enumerate(batch["example_id"]):
+        example_id = str(example_id_raw)
+        row = _matched_sampling_input_row(
+            sampling_inputs_df,
+            pdb_id=example_id.split("_")[0],
+            pdb_key=example_id,
+        )
+        if row is None:
+            raise ValueError(
+                f"guidance.mode=selectivity could not match example_id={example_id!r} "
+                "to sampling_inputs_csv by pdb_key or pdb_id"
+            )
+
+        metadata = resolve_selectivity_guidance_branches(
+            row,
+            target_ligand_side=target_ligand_side,
+            example_id=example_id,
+        )
+        atom_cond_mask = batch["atom_cond_mask"][batch_idx]
+        protein_atom_mask = batch["atom_is_protein_chain"][batch_idx].bool()
+        positive_ligand_mask = _ligand_atom_mask_for_branch(
+            atom_array=batch["atom_array"][batch_idx],
+            atom_cond_mask=atom_cond_mask,
+            ligand_pn_unit_iid=metadata["positive_ligand_pn_unit_iid"],
+            example_id=example_id,
+        )
+        negative_ligand_mask = _ligand_atom_mask_for_branch(
+            atom_array=batch["atom_array"][batch_idx],
+            atom_cond_mask=atom_cond_mask,
+            ligand_pn_unit_iid=metadata["negative_ligand_pn_unit_iid"],
+            example_id=example_id,
+        )
+
+        positive_keep = protein_atom_mask | positive_ligand_mask
+        negative_keep = protein_atom_mask | negative_ligand_mask
+        positive_mask[batch_idx] = atom_cond_mask * positive_keep.to(atom_cond_mask.dtype)
+        negative_mask[batch_idx] = atom_cond_mask * negative_keep.to(atom_cond_mask.dtype)
+        metadata_by_example_id[example_id] = metadata
+
+    return positive_mask, negative_mask, metadata_by_example_id
+
+
+def _inject_guidance_inputs(
+    *,
+    guidance_cfg: DictConfig | dict | None,
+    batch: dict[str, Any],
+    sampling_inputs_df: pd.DataFrame | None,
+) -> tuple[dict[str, Any] | None, dict[str, dict[str, Any]]]:
+    guidance_cfg_dict = _guidance_cfg_to_dict(guidance_cfg)
+    if guidance_cfg_dict is None:
+        return None, {}
+    if not guidance_cfg_dict.get("enabled", False):
+        return guidance_cfg_dict, {}
+
+    guidance_mode = _guidance_mode(guidance_cfg_dict)
+    if guidance_mode != "selectivity":
+        return guidance_cfg_dict, {}
+
+    target_ligand_side = normalize_target_ligand_side(
+        guidance_cfg_dict.get("target_ligand_side", None)
+    )
+    positive_mask, negative_mask, metadata_by_example_id = build_selectivity_guidance_branch_masks(
+        batch=batch,
+        sampling_inputs_df=sampling_inputs_df,
+        target_ligand_side=target_ligand_side,
+    )
+    guidance_cfg_dict["positive_atom_cond_mask"] = positive_mask
+    guidance_cfg_dict["negative_atom_cond_mask"] = negative_mask
+    guidance_cfg_dict.setdefault("positive_branch_label", "positive")
+    guidance_cfg_dict.setdefault("negative_branch_label", "negative")
+    return guidance_cfg_dict, metadata_by_example_id
 
 
 def design_sequence(
@@ -60,6 +212,7 @@ def design_sequence(
     pocket_distances_for_seq_recovery: list[float] = None,
     pocket_distance_bins: list[tuple[float, float]] | None = None,
     pocket_n_min_ligand_atoms_for_seq_recovery: int = 5,
+    csv_suffix: str = "",
     guidance_cfg: DictConfig | None = None,
 ) -> tuple[dict[str, dict[str, torch.Tensor]], dict[str, Any]]:
     """
@@ -141,13 +294,15 @@ def design_sequence(
             )
 
             # Inject guidance_cfg into potts_sampling_cfg so it reaches
-            # ElixMPNNDenoiser.potts_sample. A None / disabled guidance_cfg
-            # is a no-op (denoiser falls back to the cond-only path).
+            # ElixMPNNDenoiser.potts_sample. For selectivity guidance, runtime
+            # CSV side metadata is translated here into generic branch masks;
+            # the denoiser only consumes masks and labels.
+            guidance_metadata_by_example_id: dict[str, dict[str, Any]] = {}
             if guidance_cfg is not None:
-                guidance_cfg_dict = (
-                    OmegaConf.to_container(guidance_cfg, resolve=True)
-                    if isinstance(guidance_cfg, DictConfig)
-                    else dict(guidance_cfg)
+                guidance_cfg_dict, guidance_metadata_by_example_id = _inject_guidance_inputs(
+                    guidance_cfg=guidance_cfg,
+                    batch=batch,
+                    sampling_inputs_df=sampling_inputs_df,
                 )
                 sampling_inputs.setdefault("potts_sampling_cfg", {})
                 sampling_inputs["potts_sampling_cfg"]["guidance_cfg"] = guidance_cfg_dict
@@ -165,6 +320,8 @@ def design_sequence(
                 batch_idx = example_id_to_batch_idx[example_id]
                 input_atom_array = batch["atom_array"][batch_idx]
                 native_res_name_by_chain_res_id = batch["native_res_name_by_chain_res_id"][batch_idx]
+                if "reference_sample_atom_array" not in outputs[example_id]:
+                    outputs[example_id]["reference_sample_atom_array"] = input_atom_array.copy()
                 outputs[example_id]["native_res_name_by_chain_res_id"] = native_res_name_by_chain_res_id
 
                 # Per-(schedule, gamma) counter so that tagged sample ids reset
@@ -174,7 +331,10 @@ def design_sequence(
 
                 for ai, designed_atom_array in enumerate(atom_arrays):
                     gamma_val = aux[ai].get("gamma") if isinstance(aux[ai], dict) else None
+                    guidance_scale_val = aux[ai].get("guidance_scale") if isinstance(aux[ai], dict) else gamma_val
+                    guidance_mode_val = aux[ai].get("guidance_mode") if isinstance(aux[ai], dict) else None
                     schedule_label_val = aux[ai].get("schedule_label") if isinstance(aux[ai], dict) else None
+                    selectivity_metadata = guidance_metadata_by_example_id.get(example_id, {})
                     if schedule_label_val is not None and not str(schedule_label_val).startswith("gamma_"):
                         tag = str(schedule_label_val)
                         sub_ai = tag_counter[tag]
@@ -185,8 +345,9 @@ def design_sequence(
                             tag=tag,
                             sample_token_prefix=sample_token_prefix,
                         )
-                    elif gamma_val is not None:
-                        tag = f"gamma{gamma_val:.2f}"
+                    elif guidance_scale_val is not None:
+                        tag_name = "guidance_scale" if guidance_mode_val == "selectivity" else "gamma"
+                        tag = f"{tag_name}{guidance_scale_val:.2f}"
                         sub_ai = tag_counter[tag]
                         tag_counter[tag] += 1
                         designed_sample_id = _format_designed_sample_id(
@@ -205,19 +366,18 @@ def design_sequence(
                     outputs[example_id]["U"].append(aux[ai]["U"])
                     outputs[example_id]["gamma"].append(gamma_val)
                     outputs[example_id]["schedule_label"].append(schedule_label_val)
-                    for guidance_key in (
-                        "U_cond",
-                        "U_uncond",
-                        "U_cond_per_res",
-                        "U_uncond_per_res",
-                        "U_cond_pocket",
-                        "U_uncond_pocket",
-                        "U_cond_pocket_per_res",
-                        "U_uncond_pocket_per_res",
-                        "N_pocket",
-                    ):
+                    for guidance_key in _GUIDANCE_AUX_KEYS:
+                        if guidance_mode_val == "selectivity" and guidance_key in selectivity_metadata:
+                            outputs[example_id][guidance_key].append(selectivity_metadata.get(guidance_key))
+                            continue
                         outputs[example_id][guidance_key].append(
                             aux[ai].get(guidance_key) if isinstance(aux[ai], dict) else None
+                        )
+                    for guidance_key in SELECTIVITY_GUIDANCE_METADATA_KEYS:
+                        if guidance_key in _GUIDANCE_AUX_KEYS:
+                            continue
+                        outputs[example_id][guidance_key].append(
+                            selectivity_metadata.get(guidance_key)
                         )
 
                     # Save atom_array and sequence
@@ -283,22 +443,13 @@ def design_sequence(
             }
             if "gamma" in example_outputs:
                 meta_entry["gamma"] = example_outputs["gamma"][idx]
-            for guidance_key in (
-                "U_cond",
-                "U_uncond",
-                "U_cond_per_res",
-                "U_uncond_per_res",
-                "U_cond_pocket",
-                "U_uncond_pocket",
-                "U_cond_pocket_per_res",
-                "U_uncond_pocket_per_res",
-                "N_pocket",
-            ):
+            for guidance_key in (*_GUIDANCE_AUX_KEYS, *SELECTIVITY_GUIDANCE_METADATA_KEYS):
                 if guidance_key in example_outputs:
                     meta_entry[guidance_key] = example_outputs[guidance_key][idx]
             sample_metadata[designed_sample_id] = meta_entry
-    torch.save(sample_metadata, f"{sample_out_dir}/sample_metadata.pt")
-    print(f"Saved sample_metadata.pt with {len(sample_metadata)} samples to {sample_out_dir}")
+    sample_metadata_path = f"{sample_out_dir}/sample_metadata{csv_suffix}.pt"
+    torch.save(sample_metadata, sample_metadata_path)
+    print(f"Saved sample_metadata{csv_suffix}.pt with {len(sample_metadata)} samples to {sample_metadata_path}")
 
     return outputs
 
@@ -359,6 +510,7 @@ def iter_design_sequence_per_checkpoint(
             pocket_distances_for_seq_recovery=pocket_distances_for_seq_recovery,
             pocket_distance_bins=pocket_distance_bins,
             pocket_n_min_ligand_atoms_for_seq_recovery=pocket_n_min_ligand_atoms_for_seq_recovery,
+            csv_suffix=csv_suffix,
             guidance_cfg=guidance_cfg,
         )
 

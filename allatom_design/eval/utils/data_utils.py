@@ -154,11 +154,13 @@ def get_sd_example(
     )
     native_res_name_by_chain_res_id = get_res_name_by_chain_res_id(example["atom_array"])
 
-    pdb_id = Path(pdb_path).stem.split("_")[0]
+    pdb_key = Path(pdb_path).stem
+    pdb_id = pdb_key.split("_")[0]
     example["query_pn_unit_iids"] = resolve_query_pn_unit_iids(
         atom_array=example["atom_array"],
         sampling_inputs_df=sampling_inputs_df,
         pdb_id=pdb_id,
+        pdb_key=pdb_key,
     )
 
     featurizer_cfg = OmegaConf.to_container(featurizer_cfg, resolve=True)
@@ -212,6 +214,11 @@ def _parse_query_pn_unit_iids(raw_value: Any) -> list[str]:
         return [str(x) for x in parsed if str(x) != ""]
 
     return [str(parsed)] if str(parsed) != "" else []
+
+
+def parse_query_pn_unit_iids(raw_value: Any) -> list[str]:
+    """Public wrapper for parsing query PN unit IDs from runtime CSV cells."""
+    return _parse_query_pn_unit_iids(raw_value)
 
 
 def _matched_sampling_input_row(
@@ -306,11 +313,13 @@ def resolve_query_pn_unit_iids(
 # Sequence design model output preparation utilities
 ########################################################
 def _build_guidance_row(output: dict, i: int, n: int) -> dict[str, Any]:
-    """Build per-sample guidance metrics (U_cond/uncond and their gamma-mixtures)."""
+    """Build per-sample guidance metrics for branch-mixed Potts sampling."""
     def _get_field(key):
         return output.get(key, [None] * n)[i]
 
     gamma_val = output["gamma"][i]
+    guidance_scale = _get_field("guidance_scale")
+    scale_val = guidance_scale if guidance_scale is not None else gamma_val
     u_cond_per_res = _get_field("U_cond_per_res")
     u_uncond_per_res = _get_field("U_uncond_per_res")
     u_cond_pocket = _get_field("U_cond_pocket")
@@ -319,13 +328,25 @@ def _build_guidance_row(output: dict, i: int, n: int) -> dict[str, Any]:
     u_uncond_pocket_per_res = _get_field("U_uncond_pocket_per_res")
 
     def _mix(uc, uu):
-        if uc is None or uu is None or gamma_val is None:
+        if uc is None or uu is None or scale_val is None:
             return None
-        return gamma_val * uc + (1.0 - gamma_val) * uu
+        return scale_val * uc + (1.0 - scale_val) * uu
 
     return {
+        "guidance_mode": _get_field("guidance_mode"),
+        "guidance_scale": guidance_scale,
+        "positive_branch_label": _get_field("positive_branch_label"),
+        "negative_branch_label": _get_field("negative_branch_label"),
         "gamma": gamma_val,
         "schedule_label": _get_field("schedule_label"),
+        "U_positive": _get_field("U_positive"),
+        "U_negative": _get_field("U_negative"),
+        "U_positive_per_res": _get_field("U_positive_per_res"),
+        "U_negative_per_res": _get_field("U_negative_per_res"),
+        "U_positive_pocket": _get_field("U_positive_pocket"),
+        "U_negative_pocket": _get_field("U_negative_pocket"),
+        "U_positive_pocket_per_res": _get_field("U_positive_pocket_per_res"),
+        "U_negative_pocket_per_res": _get_field("U_negative_pocket_per_res"),
         "U_cond": output["U_cond"][i],
         "U_uncond": output["U_uncond"][i],
         "U_mixed": output["U"][i],
@@ -339,6 +360,17 @@ def _build_guidance_row(output: dict, i: int, n: int) -> dict[str, Any]:
         "U_uncond_pocket_per_res": u_uncond_pocket_per_res,
         "U_mixed_pocket_per_res": _mix(u_cond_pocket_per_res, u_uncond_pocket_per_res),
         "N_pocket": _get_field("N_pocket"),
+        "selectivity_pair_id": _get_field("selectivity_pair_id"),
+        "scaffold_side": _get_field("scaffold_side"),
+        "native_ligand_side": _get_field("native_ligand_side"),
+        "transformed_ligand_side": _get_field("transformed_ligand_side"),
+        "guidance_target_ligand_side": _get_field("guidance_target_ligand_side"),
+        "positive_ligand_side": _get_field("positive_ligand_side"),
+        "negative_ligand_side": _get_field("negative_ligand_side"),
+        "positive_ligand_pn_unit_iid": _get_field("positive_ligand_pn_unit_iid"),
+        "negative_ligand_pn_unit_iid": _get_field("negative_ligand_pn_unit_iid"),
+        "positive_ligand_role": _get_field("positive_ligand_role"),
+        "negative_ligand_role": _get_field("negative_ligand_role"),
     }
 
 
@@ -397,6 +429,8 @@ def collect_design_outputs(
         sample_dict_per_ckpt[example_id]["designed_sample_seq"] = output["designed_sample_seq"]
         sample_dict_per_ckpt[example_id]["designed_sample_path"] = output["designed_sample_path"]
         sample_dict_per_ckpt[example_id]["designed_sample_path_for_af3_tc"] = output["designed_sample_path_for_af3_tc"]
+        if "reference_sample_atom_array" in output:
+            sample_dict_per_ckpt[example_id]["reference_sample_atom_array"] = output["reference_sample_atom_array"]
         if "native_res_name_by_chain_res_id" in output:
             sample_dict_per_ckpt[example_id]["native_res_name_by_chain_res_id"] = output[
                 "native_res_name_by_chain_res_id"
@@ -428,7 +462,11 @@ def collect_design_outputs(
 
         input_sample_id = sample_dict_per_ckpt[example_id].get("input_sample_id", example_id)
         pdb_id = str(input_sample_id).split("_")[0]
-        sampling_row = _matched_sampling_input_row(sampling_inputs_df, pdb_id)
+        sampling_row = _matched_sampling_input_row(
+            sampling_inputs_df,
+            pdb_id,
+            pdb_key=input_sample_id,
+        )
         query_pn_unit_iids = _resolve_query_pn_unit_iids_from_sampling_row(sampling_row)
         if len(query_pn_unit_iids) == 0 and previous_chain_info:
             query_pn_unit_iids = [
@@ -520,7 +558,8 @@ def prepare_af3_prediction(
 def resolve_selectivity_row(
     *,
     sampling_inputs_df: pd.DataFrame,
-    pdb_id: str,
+    pdb_id: str | None = None,
+    pdb_key: str | None = None,
     guidance_direction: int,
 ) -> dict[str, Any]:
     """Resolve one backbone's selectivity-assay context from the paired CSV.
@@ -533,8 +572,10 @@ def resolve_selectivity_row(
     Args:
         sampling_inputs_df: DataFrame loaded from the paired selectivity CSV.
         pdb_id: Backbone identifier (case-insensitive).
+        pdb_key: Optional endpoint identifier such as `2eck_A_1_C_1`, used to
+            disambiguate repeated PDB IDs.
         guidance_direction: 1 or 2. Selects `ccd_code_{guidance_direction}` as
-            the guidance target — independent of which slot the backbone
+            the guidance target, independent of which slot the backbone
             occupies. One pass with `guidance_direction=1` designs every
             backbone with the potential pulling toward the H-bond-rich CCD;
             `guidance_direction=2` pulls toward the H-bond-poor CCD.
@@ -548,7 +589,8 @@ def resolve_selectivity_row(
 
     Raises:
         ValueError: if `guidance_direction` is not in {1, 2}, required columns
-            are missing, or `pdb_id` is absent from both slots.
+            are missing, the endpoint is absent from both slots, or a `pdb_id`
+            match is ambiguous without `pdb_key`.
     """
     if guidance_direction not in (1, 2):
         raise ValueError(f"guidance_direction must be 1 or 2, got {guidance_direction}")
@@ -562,31 +604,47 @@ def resolve_selectivity_row(
     if missing:
         raise ValueError(f"sampling_inputs_df missing columns: {sorted(missing)}")
 
-    pdb_lc = str(pdb_id).lower()
+    if pdb_id is None and pdb_key is None:
+        raise ValueError("Either pdb_id or pdb_key must be provided")
+
+    pdb_lc = str(pdb_id).lower() if pdb_id is not None else None
+    pdb_key_lc = str(pdb_key).lower() if pdb_key is not None else None
+    matches: list[tuple[pd.Series, int]] = []
     for self_pos in (1, 2):
+        for _, row in sampling_inputs_df.iterrows():
+            row_pdb_id = str(row[f"pdb_id_{self_pos}"]).lower()
+            query_iids = parse_query_pn_unit_iids(row[f"query_pn_unit_iids_{self_pos}"])
+            row_pdb_key = f"{row[f'pdb_id_{self_pos}']}_{query_iids[0]}_{query_iids[1]}".lower()
+            if pdb_key_lc is not None:
+                if row_pdb_key == pdb_key_lc:
+                    matches.append((row, self_pos))
+            elif row_pdb_id == pdb_lc:
+                matches.append((row, self_pos))
+
+    if len(matches) > 1:
+        raise ValueError(
+            f"Endpoint match is ambiguous for pdb_id={pdb_id!r}; pass pdb_key to disambiguate"
+        )
+    if len(matches) == 1:
+        row, self_pos = matches[0]
         other_pos = 3 - self_pos
-        hit = sampling_inputs_df[
-            sampling_inputs_df[f"pdb_id_{self_pos}"].astype(str).str.lower() == pdb_lc
-        ]
-        if not hit.empty:
-            row = hit.iloc[0]
-            out = {
-                "pdb_id_self": str(row[f"pdb_id_{self_pos}"]),
-                "query_pn_unit_iids_self":
-                    parse_query_pn_unit_iids(row[f"query_pn_unit_iids_{self_pos}"]),
-                "ccd_self": str(row[f"ccd_code_{self_pos}"]),
-                "pdb_id_partner": str(row[f"pdb_id_{other_pos}"]),
-                "query_pn_unit_iids_partner":
-                    parse_query_pn_unit_iids(row[f"query_pn_unit_iids_{other_pos}"]),
-                "ccd_partner": str(row[f"ccd_code_{other_pos}"]),
-                "guidance_target_ccd": str(row[f"ccd_code_{guidance_direction}"]),
-                "self_position": self_pos,
-            }
-            if "pocket_subcluster_id" in sampling_inputs_df.columns:
-                out["pocket_subcluster_id"] = int(row["pocket_subcluster_id"])
-            return out
+        out = {
+            "pdb_id_self": str(row[f"pdb_id_{self_pos}"]),
+            "query_pn_unit_iids_self":
+                parse_query_pn_unit_iids(row[f"query_pn_unit_iids_{self_pos}"]),
+            "ccd_self": str(row[f"ccd_code_{self_pos}"]),
+            "pdb_id_partner": str(row[f"pdb_id_{other_pos}"]),
+            "query_pn_unit_iids_partner":
+                parse_query_pn_unit_iids(row[f"query_pn_unit_iids_{other_pos}"]),
+            "ccd_partner": str(row[f"ccd_code_{other_pos}"]),
+            "guidance_target_ccd": str(row[f"ccd_code_{guidance_direction}"]),
+            "self_position": self_pos,
+        }
+        if "pocket_subcluster_id" in sampling_inputs_df.columns:
+            out["pocket_subcluster_id"] = int(row["pocket_subcluster_id"])
+        return out
 
     raise ValueError(
-        f"pdb_id={pdb_id} not found in either pdb_id_1 or pdb_id_2 column of "
+        f"pdb_id={pdb_id} pdb_key={pdb_key} not found in paired selectivity columns of "
         f"sampling_inputs_df (rows={len(sampling_inputs_df)})"
     )

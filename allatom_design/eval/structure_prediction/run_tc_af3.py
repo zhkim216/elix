@@ -201,6 +201,7 @@ def main(cfg: DictConfig):
             ckpt_info=None,
             calculate_metrics_only=cfg.struct_pred_cfg.calculate_metrics_only,
             csv_suffix=csv_suffix,
+            input_sample_is_designed=cfg.input_sample_is_designed,
         )
     
     print("\n" + "="*80)
