@@ -1,0 +1,36 @@
+# @package _global_
+
+defaults:
+  - /run_elix@_global_
+  - _self_
+
+sampling_cfg:
+  overrides:
+    batch_size: 8
+    num_seqs_per_pdb: 1
+    use_potts_sampling: true
+    potts_sampling_cfg:
+      potts_sweeps: 500
+      lcp_expand_edge_idx_fix: true
+      rejection_step: false
+  guidance:
+    enabled: true
+    mode: "selectivity"
+    guidance_scale_list: [0.0]
+    target_ligand_side: null
+    pocket_distance: 10.0
+
+pocket_cfg:
+  pocket_distance_for_docking_metrics: 5.0
+  pocket_distances_for_seq_recovery: [4.0, 6.0, 8.0, 10.0]
+  pocket_distance_bins: [[0.0, 4.0], [4.0, 6.0], [6.0, 8.0], [8.0, 10.0]]
+  n_min_ligand_atoms_for_seq_recovery: 1
+
+cif_cfg:
+  save:
+    include_bonds: false
+
+struct_pred_cfg:
+  evaluate_self_consistency: false
+  evaluate_docking_consistency: false
+  calculate_metrics_only: false

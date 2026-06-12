@@ -53,8 +53,11 @@ sampling_cfg:
   #   U_mix = gamma * U_cond + (1 - gamma) * U_uncond.
   guidance:
     enabled: false
+    mode: "cond_uncond"
     gamma_list: [0.0, 0.5, 1.0, 1.5, 2.0]
+    guidance_scale_list: [0.0, 0.5, 1.0, 1.5, 2.0]
     uncond_mode: "protein_only"
+    target_ligand_side: null  # selectivity mode: null=native positive, 1/2=ligand side target
     pocket_distance: 10.0  # Å from any ligand atom to C-alpha for pocket mask
 
 two_stage:
