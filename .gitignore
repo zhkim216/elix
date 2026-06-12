@@ -1,7 +1,15 @@
 .vscode
 .hydra/
+.codegraph/
 out_dir
 cutlass
+
+# Codex local harness files
+.agents/
+.codex/
+AGENTS.md
+PLANS.md
+code_review.md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
