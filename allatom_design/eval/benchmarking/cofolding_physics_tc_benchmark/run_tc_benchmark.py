@@ -48,6 +48,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-size", type=int, default=None)
     parser.add_argument("--array-id", type=int, default=None)
     parser.add_argument("--num-arrays", type=int, default=None)
+    parser.add_argument(
+        "--no-shard",
+        action="store_true",
+        help=(
+            "Process all selected rows in a single chunk and ignore SLURM_ARRAY_TASK_ID/"
+            "SLURM_ARRAY_TASK_COUNT. Use when the SLURM array dimension is consumed by the "
+            "submit script (e.g. per pair-scale) rather than by row sharding."
+        ),
+    )
     parser.add_argument("--print-array-plan", action="store_true")
     parser.add_argument("--generate-inputs-only", action="store_true")
     parser.add_argument("--metrics-only", action="store_true")
@@ -353,6 +362,7 @@ def main() -> None:
         array_id=args.array_id,
         num_arrays=args.num_arrays,
         chunk_size=args.chunk_size,
+        ignore_env=args.no_shard,
     )
     if args.print_array_plan:
         print(f"selected_rows={chunk_plan.total_rows}")

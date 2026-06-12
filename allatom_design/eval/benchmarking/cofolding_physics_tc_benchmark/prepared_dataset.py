@@ -136,9 +136,11 @@ def select_run_plan_rows(
     return sorted(selected, key=lambda r: (r["af3_condition"], r["experiment_id"]))
 
 
-def resolve_array_id(array_id: int | None) -> int | None:
+def resolve_array_id(array_id: int | None, *, ignore_env: bool = False) -> int | None:
     if array_id is not None:
         return array_id
+    if ignore_env:
+        return None
     env_id = os.environ.get("SLURM_ARRAY_TASK_ID")
     return int(env_id) if env_id is not None else None
 
@@ -149,8 +151,9 @@ def plan_chunk(
     array_id: int | None = None,
     num_arrays: int | None = None,
     chunk_size: int | None = None,
+    ignore_env: bool = False,
 ) -> ChunkPlan:
-    resolved_array_id = resolve_array_id(array_id)
+    resolved_array_id = resolve_array_id(array_id, ignore_env=ignore_env)
     if chunk_size is not None and chunk_size <= 0:
         raise ValueError("--chunk-size must be positive")
     if num_arrays is not None and num_arrays <= 0:
@@ -161,7 +164,7 @@ def plan_chunk(
         resolved_chunk_size = chunk_size
     else:
         if num_arrays is None:
-            env_count = os.environ.get("SLURM_ARRAY_TASK_COUNT")
+            env_count = None if ignore_env else os.environ.get("SLURM_ARRAY_TASK_COUNT")
             num_arrays = int(env_count) if env_count else 1
         resolved_num_arrays = max(1, int(num_arrays))
         resolved_chunk_size = max(1, math.ceil(total_rows / resolved_num_arrays))

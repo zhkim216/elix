@@ -20,7 +20,7 @@ set -euo pipefail
 
 TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 
-PAIR_SCALES=(0.1 0.15 0.2 0.25 0.3)
+PAIR_SCALES=(0.15 0.2 0.25 0.3 0.35)
 NUM_RECYCLES_VALUES=(1 3 5 7 10)
 EXPERIMENT_IDS=(
   cdk2_1b38_atp_modification_native_atp
@@ -39,7 +39,7 @@ PAIR_SCALE_LABEL=${PAIR_SCALE//./p}
 BASE_DIR="${PROJECT_ROOT:-/home/users/zhkim216/code/elix}"
 DATASET_ROOT="${DATASET_ROOT:-/scratch/users/zhkim216/datasets/cofolding_physics_tc_benchmark}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/scratch/users/zhkim216/out_dir/cofolding_physics_tc_benchmark}"
-RUN_LABEL="${RUN_LABEL:-atp_native_vs_charge3_pairscale_recycles_sweep}"
+RUN_LABEL="${RUN_LABEL:-atp_native_vs_charge3_pairscale_recycles_sweep_v2}"
 MODE="${MODE:-run-af3}"
 RUNNER_PATH="${RUNNER_PATH:-${BASE_DIR}/alphafold3/src/alphafold3/run_alphafold.py}"
 MODEL_DIR="${MODEL_DIR:-/scratch/users/zhkim216/model_params/af3}"
@@ -115,13 +115,17 @@ for NUM_RECYCLES in "${NUM_RECYCLES_VALUES[@]}"; do
   mkdir -p "${RUN_OUTPUT_DIR}"
 
   echo "Running pair_scale=${PAIR_SCALE}, num_recycles=${NUM_RECYCLES}, output=${RUN_OUTPUT_DIR}"
-  python3 -m allatom_design.eval.benchmarking.cofolding_physics_tc_benchmark.run_tc_benchmark \
+  # The SLURM array dimension selects the pair scale (see TASK_ID above), not runner
+  # row sharding. Strip SLURM_ARRAY_TASK_ID/COUNT and pass --no-shard so the runner
+  # processes BOTH experiments for every (scale, recycle) leaf instead of splitting
+  # the two experiment rows across the array tasks.
+  env -u SLURM_ARRAY_TASK_ID -u SLURM_ARRAY_TASK_COUNT \
+    python3 -m allatom_design.eval.benchmarking.cofolding_physics_tc_benchmark.run_tc_benchmark \
     --dataset-root "${DATASET_ROOT}" \
     --output-dir "${RUN_OUTPUT_DIR}" \
     --condition holo_protein_only_template \
     "${EXPERIMENT_ARGS[@]}" \
-    --array-id 0 \
-    --num-arrays 1 \
+    --no-shard \
     ${MODE_FLAG} \
     --runner-path "${RUNNER_PATH}" \
     --model-dir "${MODEL_DIR}" \
