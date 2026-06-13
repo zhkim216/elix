@@ -291,6 +291,7 @@ def get_checkpoints(design_cfg: DictConfig) -> list[dict[str, Any]]:
             "global_step": int(match.group(1)),
             "epoch": int(match.group(2)),
         })
+    all_ckpt_infos.sort(key=lambda ckpt_info: (ckpt_info["global_step"], ckpt_info["epoch"], ckpt_info["ckpt_path"]))
 
     # Filter by start_step and end_step if provided
     if ckpt_cfg.start_step is not None or ckpt_cfg.end_step is not None:

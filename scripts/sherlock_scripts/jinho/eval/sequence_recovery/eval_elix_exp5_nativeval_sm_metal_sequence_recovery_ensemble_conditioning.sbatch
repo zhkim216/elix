@@ -5,7 +5,7 @@
 #     scripts/sherlock_scripts/jinho/eval/sequence_recovery/eval_elix_exp5_nativeval_sm_metal_sequence_recovery_ensemble_conditioning.sbatch
 #SBATCH --job-name=seqrec_exp5_ens
 #SBATCH -p possu,bioe
-#SBATCH --array=0-2079
+#SBATCH --array=0-167
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
@@ -16,7 +16,7 @@
 set -euo pipefail
 
 MODEL_FILTER="${MODEL_FILTER:-all}"
-STEP_FILTER="${STEP_FILTER:-all}"
+ENSEMBLE_MODE_FILTER="${ENSEMBLE_MODE_FILTER:-all}"
 NUM_ENSEMBLES_FILTER="${NUM_ENSEMBLES_FILTER:-all}"
 PROTEIN_NOISE_STD_FILTER="${PROTEIN_NOISE_STD_FILTER:-all}"
 PRINT_ARRAY_PLAN="${PRINT_ARRAY_PLAN:-false}"
@@ -35,7 +35,10 @@ MODEL_NAMES=(
   elix_exp5_cfg7_context_skip_edge_update_decoder_skip
 )
 
-STEPS=(2500 12500 22500 32500 42500 52500 62500 72500 82500 92500 102500 112500 122500)
+START_STEP=2500
+END_STEP=122500
+EVAL_EVERY_N_CKPTS=4
+CHECKPOINT_STEP_INTERVAL=2500
 NUM_ENSEMBLES_LIST=(2 4 8 16)
 PROTEIN_NOISE_STD_LIST=(0.1 0.2 0.3 0.4 0.5)
 NUM_CHUNKS=1
@@ -48,29 +51,45 @@ matches_filter() {
 
 print_valid_filters() {
   echo "Valid MODEL_FILTER values: all ${MODEL_NAMES[*]}" >&2
-  echo "Valid STEP_FILTER values: all ${STEPS[*]}" >&2
+  echo "Valid ENSEMBLE_MODE_FILTER values: all baseline ensemble" >&2
   echo "Valid NUM_ENSEMBLES_FILTER values: all ${NUM_ENSEMBLES_LIST[*]}" >&2
   echo "Valid PROTEIN_NOISE_STD_FILTER values: all ${PROTEIN_NOISE_STD_LIST[*]}" >&2
+}
+
+expected_eval_steps() {
+  local step
+  local stride=$((CHECKPOINT_STEP_INTERVAL * EVAL_EVERY_N_CKPTS))
+  local steps=()
+  for ((step = START_STEP; step <= END_STEP; step += stride)); do
+    steps+=("${step}")
+  done
+  echo "${steps[*]}"
 }
 
 SWEEP_COMBOS=()
 for CANDIDATE_MODEL in "${MODEL_NAMES[@]}"; do
   matches_filter "${CANDIDATE_MODEL}" "${MODEL_FILTER}" || continue
-  for CANDIDATE_STEP in "${STEPS[@]}"; do
-    matches_filter "${CANDIDATE_STEP}" "${STEP_FILTER}" || continue
+
+  if matches_filter "baseline" "${ENSEMBLE_MODE_FILTER}" \
+    && [[ "${NUM_ENSEMBLES_FILTER}" == "all" ]] \
+    && [[ "${PROTEIN_NOISE_STD_FILTER}" == "all" ]]; then
+    SWEEP_COMBOS+=("${CANDIDATE_MODEL}:baseline:1:0.0")
+  fi
+
+  if matches_filter "ensemble" "${ENSEMBLE_MODE_FILTER}"; then
     for CANDIDATE_NUM_ENSEMBLES in "${NUM_ENSEMBLES_LIST[@]}"; do
       matches_filter "${CANDIDATE_NUM_ENSEMBLES}" "${NUM_ENSEMBLES_FILTER}" || continue
       for CANDIDATE_PROTEIN_NOISE_STD in "${PROTEIN_NOISE_STD_LIST[@]}"; do
         matches_filter "${CANDIDATE_PROTEIN_NOISE_STD}" "${PROTEIN_NOISE_STD_FILTER}" || continue
-        SWEEP_COMBOS+=("${CANDIDATE_MODEL}:${CANDIDATE_STEP}:${CANDIDATE_NUM_ENSEMBLES}:${CANDIDATE_PROTEIN_NOISE_STD}")
+        SWEEP_COMBOS+=("${CANDIDATE_MODEL}:ensemble:${CANDIDATE_NUM_ENSEMBLES}:${CANDIDATE_PROTEIN_NOISE_STD}")
       done
     done
-  done
+  fi
 done
 
 NUM_COMBOS=${#SWEEP_COMBOS[@]}
 if [[ "${NUM_COMBOS}" -eq 0 ]]; then
-  echo "No sweep combinations selected by MODEL_FILTER=${MODEL_FILTER}, STEP_FILTER=${STEP_FILTER}, NUM_ENSEMBLES_FILTER=${NUM_ENSEMBLES_FILTER}, PROTEIN_NOISE_STD_FILTER=${PROTEIN_NOISE_STD_FILTER}." >&2
+  echo "No sweep combinations selected by MODEL_FILTER=${MODEL_FILTER}, ENSEMBLE_MODE_FILTER=${ENSEMBLE_MODE_FILTER}, NUM_ENSEMBLES_FILTER=${NUM_ENSEMBLES_FILTER}, PROTEIN_NOISE_STD_FILTER=${PROTEIN_NOISE_STD_FILTER}." >&2
   print_valid_filters
   exit 2
 fi
@@ -78,10 +97,12 @@ fi
 NUM_TASKS=$((NUM_COMBOS * NUM_CHUNKS))
 
 if [[ "${PRINT_ARRAY_PLAN}" == "true" ]]; then
-  echo "Selected exp5 nativeval sm-metal sequence-recovery ensemble-conditioning sweep: NUM_COMBOS=${NUM_COMBOS}, NUM_TASKS=${NUM_TASKS}"
+  echo "Selected exp5 nativeval sm-metal sequence-recovery ensemble/no-ensemble sweep: NUM_COMBOS=${NUM_COMBOS}, NUM_TASKS=${NUM_TASKS}"
+  echo "Checkpoint selector: start_step=${START_STEP}, end_step=${END_STEP}, eval_every_n_ckpts=${EVAL_EVERY_N_CKPTS}"
+  echo "Expected eval steps for ${CHECKPOINT_STEP_INTERVAL}-step checkpoint cadence: $(expected_eval_steps)"
   for COMBO_IDX in "${!SWEEP_COMBOS[@]}"; do
-    IFS=: read -r PLAN_MODEL PLAN_STEP PLAN_NUM_ENSEMBLES PLAN_PROTEIN_NOISE_STD <<< "${SWEEP_COMBOS[$COMBO_IDX]}"
-    echo "combo_idx=${COMBO_IDX} model=${PLAN_MODEL} step=${PLAN_STEP} num_ensembles=${PLAN_NUM_ENSEMBLES} protein_noise_std=${PLAN_PROTEIN_NOISE_STD}"
+    IFS=: read -r PLAN_MODEL PLAN_ENSEMBLE_MODE PLAN_NUM_ENSEMBLES PLAN_PROTEIN_NOISE_STD <<< "${SWEEP_COMBOS[$COMBO_IDX]}"
+    echo "combo_idx=${COMBO_IDX} model=${PLAN_MODEL} ensemble_mode=${PLAN_ENSEMBLE_MODE} num_ensembles=${PLAN_NUM_ENSEMBLES} protein_noise_std=${PLAN_PROTEIN_NOISE_STD}"
   done
   exit 0
 fi
@@ -93,7 +114,7 @@ fi
 
 COMBO_IDX=$((TASK_ID / NUM_CHUNKS))
 CHUNK_IDX=$((TASK_ID % NUM_CHUNKS))
-IFS=: read -r MODEL_NAME STEP NUM_ENSEMBLES PROTEIN_NOISE_STD <<< "${SWEEP_COMBOS[$COMBO_IDX]}"
+IFS=: read -r MODEL_NAME ENSEMBLE_MODE NUM_ENSEMBLES PROTEIN_NOISE_STD <<< "${SWEEP_COMBOS[$COMBO_IDX]}"
 NOISE_LABEL=${PROTEIN_NOISE_STD//./p}
 
 BASE_DIR="${PROJECT_ROOT:-/home/users/zhkim216/code/elix}"
@@ -111,7 +132,23 @@ POCKET_DISTANCES_FOR_SEQ_RECOVERY="[4.0,6.0,8.0,10.0]"
 POCKET_DISTANCE_BINS="[[0.0,4.0],[4.0,6.0],[6.0,8.0],[8.0,10.0]]"
 
 DENOISER_TRAIN_DIR=/scratch/users/zhkim216/out_dir/ligand_seq_des/${MODEL_NAME}
-EXP_NAME=${MODEL_NAME}_step${STEP}_${VALSET_NAME}_seqrec_ensemble_n${NUM_ENSEMBLES}_protein_noise${NOISE_LABEL}_numseqs${NUM_SEQS_PER_PDB}
+if [[ "${ENSEMBLE_MODE}" == "baseline" ]]; then
+  EXP_NAME=${MODEL_NAME}_steps${START_STEP}to${END_STEP}_every${EVAL_EVERY_N_CKPTS}ckpts_${VALSET_NAME}_seqrec_no_ensemble_numseqs${NUM_SEQS_PER_PDB}
+  ENSEMBLE_OVERRIDES=(
+    "sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.enabled=false"
+  )
+else
+  EXP_NAME=${MODEL_NAME}_steps${START_STEP}to${END_STEP}_every${EVAL_EVERY_N_CKPTS}ckpts_${VALSET_NAME}_seqrec_ensemble_n${NUM_ENSEMBLES}_protein_noise${NOISE_LABEL}_numseqs${NUM_SEQS_PER_PDB}
+  ENSEMBLE_OVERRIDES=(
+    "sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.enabled=true"
+    "sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.num_ensembles=${NUM_ENSEMBLES}"
+    "sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.reduce=mean"
+    "sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.noise_seed=null"
+    "sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.noise_std.protein=${PROTEIN_NOISE_STD}"
+    "sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.noise_std.metal=0.0"
+    "sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.noise_std.nonpolymer=0.0"
+  )
+fi
 HYDRA_DIR=${HYDRA_ROOT}/${EXP_NAME}/chunk_${CHUNK_IDX}
 
 checkpoint_exists_for_step() {
@@ -120,16 +157,24 @@ checkpoint_exists_for_step() {
     compgen -G "${DENOISER_TRAIN_DIR}/checkpoints/sd-step${step}-epoch*.ckpt" >/dev/null
 }
 
+validate_checkpoint_cadence() {
+  local step
+  for ((step = START_STEP; step <= END_STEP; step += CHECKPOINT_STEP_INTERVAL)); do
+    checkpoint_exists_for_step "${step}" || {
+      echo "Missing checkpoint for MODEL_NAME=${MODEL_NAME}, STEP=${step} under ${DENOISER_TRAIN_DIR}/checkpoints or checkpoints/ema" >&2
+      echo "eval_every_n_ckpts=${EVAL_EVERY_N_CKPTS} is index-based over sorted checkpoints, so a complete ${CHECKPOINT_STEP_INTERVAL}-step checkpoint cadence is required." >&2
+      return 1
+    }
+  done
+}
+
 mkdir -p /scratch/users/zhkim216/job_output/eval_ligand_seq_des "${HYDRA_ROOT}" "${BASE_OUT_DIR}"
 
 [[ -d "${PDB_DIR}" ]] || { echo "Missing PDB_DIR=${PDB_DIR}" >&2; exit 1; }
 [[ -f "${PDB_NAME_LIST}" ]] || { echo "Missing PDB_NAME_LIST=${PDB_NAME_LIST}" >&2; exit 1; }
 [[ -f "${SAMPLING_INPUTS_CSV}" ]] || { echo "Missing SAMPLING_INPUTS_CSV=${SAMPLING_INPUTS_CSV}" >&2; exit 1; }
 [[ -d "${DENOISER_TRAIN_DIR}" ]] || { echo "Missing DENOISER_TRAIN_DIR=${DENOISER_TRAIN_DIR}" >&2; exit 1; }
-checkpoint_exists_for_step "${STEP}" || {
-  echo "Missing checkpoint for MODEL_NAME=${MODEL_NAME}, STEP=${STEP} under ${DENOISER_TRAIN_DIR}/checkpoints or checkpoints/ema" >&2
-  exit 1
-}
+validate_checkpoint_cadence
 
 cd "${BASE_DIR}"
 
@@ -137,8 +182,8 @@ export PYTHONWARNINGS="ignore"
 WANDB_ID=zhkim216
 PROJECT=eval_ligand_seq_des
 
-echo "Starting exp5 nativeval sm-metal sequence-recovery ensemble-conditioning eval: model=${MODEL_NAME}, step=${STEP}, num_ensembles=${NUM_ENSEMBLES}, protein_noise_std=${PROTEIN_NOISE_STD}, chunk=${CHUNK_IDX}/${NUM_CHUNKS}, selected_task=${TASK_ID}/${NUM_TASKS}"
-echo "Filters: MODEL_FILTER=${MODEL_FILTER}, STEP_FILTER=${STEP_FILTER}, NUM_ENSEMBLES_FILTER=${NUM_ENSEMBLES_FILTER}, PROTEIN_NOISE_STD_FILTER=${PROTEIN_NOISE_STD_FILTER}"
+echo "Starting exp5 nativeval sm-metal sequence-recovery eval: model=${MODEL_NAME}, ensemble_mode=${ENSEMBLE_MODE}, start_step=${START_STEP}, end_step=${END_STEP}, eval_every_n_ckpts=${EVAL_EVERY_N_CKPTS}, expected_steps=$(expected_eval_steps), num_ensembles=${NUM_ENSEMBLES}, protein_noise_std=${PROTEIN_NOISE_STD}, chunk=${CHUNK_IDX}/${NUM_CHUNKS}, selected_task=${TASK_ID}/${NUM_TASKS}"
+echo "Filters: MODEL_FILTER=${MODEL_FILTER}, ENSEMBLE_MODE_FILTER=${ENSEMBLE_MODE_FILTER}, NUM_ENSEMBLES_FILTER=${NUM_ENSEMBLES_FILTER}, PROTEIN_NOISE_STD_FILTER=${PROTEIN_NOISE_STD_FILTER}"
 echo "AF3 disabled: evaluate_self_consistency=false, evaluate_docking_consistency=false"
 echo "PDB_DIR=${PDB_DIR}"
 echo "PDB_NAME_LIST=${PDB_NAME_LIST}"
@@ -162,22 +207,16 @@ WANDB__SERVICE_WAIT=300 python3 allatom_design/eval/sampling/run_elix.py \
     base_out_dir=${BASE_OUT_DIR} \
     model_cfg.model_name=elix_mpnn \
     model_cfg.denoiser_train_dir=${DENOISER_TRAIN_DIR} \
-    model_cfg.ckpt_cfg.start_step=${STEP} \
-    model_cfg.ckpt_cfg.end_step=${STEP} \
-    model_cfg.ckpt_cfg.eval_every_n_ckpts=1 \
+    model_cfg.ckpt_cfg.start_step=${START_STEP} \
+    model_cfg.ckpt_cfg.end_step=${END_STEP} \
+    model_cfg.ckpt_cfg.eval_every_n_ckpts=${EVAL_EVERY_N_CKPTS} \
     model_cfg.ckpt_cfg.eval_last_ckpt=false \
     model_cfg.ckpt_cfg.use_ema=true \
     sampling_cfg.base_cfg_path="${BASE_DIR}/allatom_design/configs/seq_des/elix_mpnn_inference.yaml" \
     sampling_cfg.overrides.batch_size=${BATCH_SIZE} \
     sampling_cfg.overrides.num_seqs_per_pdb=${NUM_SEQS_PER_PDB} \
     sampling_cfg.overrides.use_potts_sampling=true \
-    sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.enabled=true \
-    sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.num_ensembles=${NUM_ENSEMBLES} \
-    sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.reduce=mean \
-    sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.noise_seed=null \
-    sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.noise_std.protein=${PROTEIN_NOISE_STD} \
-    sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.noise_std.metal=0.0 \
-    sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.noise_std.nonpolymer=0.0 \
+    "${ENSEMBLE_OVERRIDES[@]}" \
     sampling_cfg.guidance.enabled=false \
     sampling_inputs_csv=${SAMPLING_INPUTS_CSV} \
     pos_constraint_csv=null \
@@ -204,4 +243,4 @@ WANDB__SERVICE_WAIT=300 python3 allatom_design/eval/sampling/run_elix.py \
     struct_pred_cfg.calculate_metrics_only=false \
     hydra.run.dir=${HYDRA_DIR}
 
-echo "Sequence-recovery evaluation complete: model=${MODEL_NAME}, step=${STEP}, num_ensembles=${NUM_ENSEMBLES}, protein_noise_std=${PROTEIN_NOISE_STD}, chunk=${CHUNK_IDX}/${NUM_CHUNKS}"
+echo "Sequence-recovery evaluation complete: model=${MODEL_NAME}, ensemble_mode=${ENSEMBLE_MODE}, start_step=${START_STEP}, end_step=${END_STEP}, eval_every_n_ckpts=${EVAL_EVERY_N_CKPTS}, num_ensembles=${NUM_ENSEMBLES}, protein_noise_std=${PROTEIN_NOISE_STD}, chunk=${CHUNK_IDX}/${NUM_CHUNKS}"
