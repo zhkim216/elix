@@ -1,0 +1,41 @@
+dataset_name: denovoval_sm_metal_debug
+
+source_roots:
+  small_molecule: /home/yjhk/model-dev/datasets/val_cifs/denovoval_cifs/denovoval_generation/no_metal_single_ligands_fixed_conformers
+  metal: /home/yjhk/model-dev/datasets/val_cifs/denovoval_cifs/denovoval_generation/metal_ions_buried
+
+work_dir: /home/yjhk/model-dev/datasets/val_cifs/denovoval_cifs/denovoval_generation/denovoval_sm_metal_debug_work
+final_cif_dir: /home/yjhk/model-dev/datasets/val_cifs/denovoval_cifs/denovoval_sm_metal_debug/cifs
+
+debug_num_samples: 10
+overwrite: true
+
+filters:
+  lengths: []
+  ccd_codes: []
+
+foldseek:
+  bin: foldseek
+  coverage: 0.9
+  threads: 8
+  use_gpu: true
+  extra_args: []
+
+metal_rasa:
+  probe_radius: 1.4
+  point_number: 200
+  workers: 2
+
+selection:
+  allow_underfilled: true
+  small_molecule:
+    target_per_length_ccd: 20
+  metal:
+    target_per_length_ccd: 50
+    max_rasa: 0.25
+
+hydra:
+  run:
+    dir: ${work_dir}/hydra
+  job:
+    chdir: false
