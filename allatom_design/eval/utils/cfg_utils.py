@@ -1,6 +1,12 @@
 from omegaconf import DictConfig, OmegaConf
 from typing import Any
 
+def _select_cfg_value(cfg: DictConfig | dict | None, key: str, default=None):
+    if cfg is None:
+        return default
+    selectable_cfg = cfg if isinstance(cfg, DictConfig) else OmegaConf.create(cfg)
+    return OmegaConf.select(selectable_cfg, key, default=default)
+
 def require_cfg_value(cfg: DictConfig | dict, key: str, owner: str) -> Any:
     if cfg is None or key not in cfg or cfg.get(key) is None:
         raise ValueError(f"{owner}.{key} is required")
@@ -54,29 +60,16 @@ def resolve_input_cfgs(cfg: DictConfig) -> tuple[DictConfig, DictConfig]:
     return cfg.cif_cfg.parse.native, cfg.preprocess_cfg.native
 
 def get_stage2_potts_only_cond(stage2_design_cfg: DictConfig) -> Any:
-    sampling_cfg = stage2_design_cfg.get("sampling_cfg", None)
-    if sampling_cfg is None:
-        return None
-    overrides = sampling_cfg.get("overrides", None)
-    if overrides is None:
-        return None
-    potts_cfg = overrides.get("potts_sampling_cfg", None)
-    if potts_cfg is None:
-        return None
-    return potts_cfg.get("potts_only_cond", None)
+    return _select_cfg_value(
+        stage2_design_cfg,
+        "sampling_cfg.overrides.potts_sampling_cfg.potts_only_cond",
+        default=None,
+    )
 
 def guidance_is_enabled(cfg: DictConfig | dict | None) -> bool:
-    if cfg is None:
-        return False
-
-    if cfg.get("enabled", None) is not None:
-        guidance_cfg = cfg
-    else:
-        sampling_cfg = cfg.get("sampling_cfg", None)
-        if sampling_cfg is None:
-            return False
-        guidance_cfg = sampling_cfg.get("guidance", None)
-        if guidance_cfg is None:
-            return False
-
-    return guidance_cfg.get("enabled", False)
+    direct_enabled = _select_cfg_value(cfg, "enabled", default=None)
+    if direct_enabled is not None:
+        return config_value_as_bool(direct_enabled)
+    return config_value_as_bool(
+        _select_cfg_value(cfg, "sampling_cfg.guidance.enabled", default=False)
+    )

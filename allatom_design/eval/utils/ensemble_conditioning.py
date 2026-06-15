@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import Any, Callable
 
@@ -22,6 +23,19 @@ _ENSEMBLE_NOISE_KEYS = (
     "noised_o_coords",
     "noised_pseudo_cb_coords",
 )
+
+DEFAULT_ENSEMBLE_CONDITIONING_CFG: dict[str, Any] = {
+    "enabled": False,
+    "num_ensembles": 1,
+    "reduce": "mean",
+    "noise_seed": None,
+    "save_noisy_inputs_dir": None,
+    "noise_std": {
+        "protein": 0.0,
+        "metal": 0.0,
+        "nonpolymer": 0.0,
+    },
+}
 
 
 def ensemble_conditioning_enabled(sampling_inputs: dict[str, Any]) -> bool:
@@ -63,6 +77,8 @@ def normalize_ensemble_conditioning_cfg(
     else:
         cfg_dict = dict(cfg)
 
+    normalized = copy.deepcopy(DEFAULT_ENSEMBLE_CONDITIONING_CFG)
+
     noise_std_raw = cfg_dict.get("noise_std", {}) or {}
     if isinstance(noise_std_raw, (int, float)):
         noise_std = {
@@ -73,18 +89,18 @@ def normalize_ensemble_conditioning_cfg(
     else:
         noise_std = dict(noise_std_raw)
 
-    normalized = {
-        "enabled": bool(cfg_dict.get("enabled", False)),
-        "num_ensembles": int(cfg_dict.get("num_ensembles", 1)),
-        "reduce": str(cfg_dict.get("reduce", "mean")),
-        "noise_seed": cfg_dict.get("noise_seed", None),
-        "save_noisy_inputs_dir": cfg_dict.get("save_noisy_inputs_dir", None),
-        "noise_std": {
-            "protein": float(noise_std.get("protein", 0.0)),
-            "metal": float(noise_std.get("metal", 0.0)),
-            "nonpolymer": float(noise_std.get("nonpolymer", 0.0)),
-        },
-    }
+    normalized["enabled"] = bool(cfg_dict.get("enabled", normalized["enabled"]))
+    normalized["num_ensembles"] = int(
+        cfg_dict.get("num_ensembles", normalized["num_ensembles"])
+    )
+    normalized["reduce"] = str(cfg_dict.get("reduce", normalized["reduce"]))
+    normalized["noise_seed"] = cfg_dict.get("noise_seed", normalized["noise_seed"])
+    normalized["save_noisy_inputs_dir"] = cfg_dict.get(
+        "save_noisy_inputs_dir",
+        normalized["save_noisy_inputs_dir"],
+    )
+    for key, default_value in normalized["noise_std"].items():
+        normalized["noise_std"][key] = float(noise_std.get(key, default_value))
 
     if normalized["num_ensembles"] < 1:
         raise ValueError(

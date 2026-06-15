@@ -1,11 +1,23 @@
+from pathlib import Path
+
 import numpy as np
 import torch
 from biotite.structure import AtomArray
+from omegaconf import OmegaConf
 
+from allatom_design.eval.utils.cfg_utils import (
+    get_stage2_potts_only_cond,
+    guidance_is_enabled,
+)
 from allatom_design.eval.utils.ensemble_conditioning import (
+    DEFAULT_ENSEMBLE_CONDITIONING_CFG,
     apply_ensemble_noise,
+    normalize_ensemble_conditioning_cfg,
     repeat_batch_for_ensembles,
 )
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _make_atom_array(n_atoms: int = 4) -> AtomArray:
@@ -47,6 +59,78 @@ def _make_batch() -> dict:
         "example_id": ["example"],
     }
     return batch
+
+
+def test_normalize_ensemble_conditioning_cfg_uses_canonical_defaults():
+    assert normalize_ensemble_conditioning_cfg(None) == DEFAULT_ENSEMBLE_CONDITIONING_CFG
+
+
+def test_normalize_ensemble_conditioning_cfg_merges_partial_config():
+    normalized = normalize_ensemble_conditioning_cfg(
+        {
+            "enabled": True,
+            "num_ensembles": 4,
+            "noise_std": {
+                "protein": 0.2,
+            },
+        }
+    )
+
+    assert normalized == {
+        **DEFAULT_ENSEMBLE_CONDITIONING_CFG,
+        "enabled": True,
+        "num_ensembles": 4,
+        "noise_std": {
+            "protein": 0.2,
+            "metal": 0.0,
+            "nonpolymer": 0.0,
+        },
+    }
+
+
+def test_normalize_ensemble_conditioning_cfg_expands_scalar_noise_std():
+    normalized = normalize_ensemble_conditioning_cfg({"noise_std": 0.3})
+
+    assert normalized["noise_std"] == {
+        "protein": 0.3,
+        "metal": 0.3,
+        "nonpolymer": 0.3,
+    }
+
+
+def test_seq_des_yaml_ensemble_conditioning_defaults_match_runtime_defaults():
+    cfg = OmegaConf.load(REPO_ROOT / "allatom_design/configs/seq_des/elix_mpnn_inference.yaml")
+
+    assert (
+        OmegaConf.to_container(
+            cfg.potts_sampling_cfg.ensemble_conditioning,
+            resolve=True,
+        )
+        == DEFAULT_ENSEMBLE_CONDITIONING_CFG
+    )
+
+
+def test_cfg_utils_reads_nested_stage_and_guidance_flags():
+    assert get_stage2_potts_only_cond({}) is None
+    assert (
+        get_stage2_potts_only_cond(
+            {
+                "sampling_cfg": {
+                    "overrides": {
+                        "potts_sampling_cfg": {
+                            "potts_only_cond": True,
+                        },
+                    },
+                },
+            }
+        )
+        is True
+    )
+
+    assert guidance_is_enabled(None) is False
+    assert guidance_is_enabled({"enabled": True}) is True
+    assert guidance_is_enabled({"enabled": "false"}) is False
+    assert guidance_is_enabled({"sampling_cfg": {"guidance": {"enabled": True}}}) is True
 
 
 def test_repeat_batch_for_ensembles_repeats_tensors_and_lists():
