@@ -7,15 +7,15 @@
 #   CONFIG_IDX=4 <submit command above>
 # Fixed exp7_cfg6 pocket step 82500 / exp1_cfg0 scaffold step 32500.
 # Array layout is CONFIG_IDX x CHUNK_IDX = 7 x 8.
-#SBATCH --job-name=eval_exp7c6_exp1c0_ts_ens_cfg
+#SBATCH --job-name=eval_exp7c6_exp1c0_ts_ens_cfg_half
 #SBATCH -p possu,bioe
 #SBATCH --array=0-55
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 #SBATCH --time=08:00:00
-#SBATCH --output=/scratch/users/zhkim216/job_output/eval_ligand_seq_des/eval_exp7c6_exp1c0_ts_ens_cfg_%A_%a.out
-#SBATCH --error=/scratch/users/zhkim216/job_output/eval_ligand_seq_des/eval_exp7c6_exp1c0_ts_ens_cfg_%A_%a.err
+#SBATCH --output=/scratch/users/zhkim216/job_output/eval_ligand_seq_des/eval_exp7c6_exp1c0_ts_ens_cfg_half_%A_%a.out
+#SBATCH --error=/scratch/users/zhkim216/job_output/eval_ligand_seq_des/eval_exp7c6_exp1c0_ts_ens_cfg_half_%A_%a.err
 
 set -euo pipefail
 
@@ -48,6 +48,8 @@ POCKET_DISTANCE_BINS="[[0.0,4.0],[4.0,6.0],[6.0,8.0],[8.0,10.0]]"
 AF3_RECYCLES=10
 AF3_DIFFUSION_SAMPLES=5
 
+HALF_DATASET_ROOT=/scratch/users/zhkim216/datasets/val_cifs/denovoval_cifs/denovoval_sm_metal_half
+
 CONFIG_LABELS=(
   "gauss_p0p0_sm0p0_m0p0"
   "gauss_p0p0_sm0p0_m0p1"
@@ -68,8 +70,33 @@ CONFIGS=(
   "++two_stage.pocket.sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.protein.mode=gaussian_noise ++two_stage.pocket.sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.protein.noise_std=0.0 ++two_stage.pocket.sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.small_molecule.mode=ligand_conformer ++two_stage.pocket.sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.small_molecule.rmsd_cluster_cutoff=2.0 ++two_stage.pocket.sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.small_molecule.num_conformer_candidates=50 ++two_stage.pocket.sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.small_molecule.num_threads=8 ++two_stage.pocket.sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.small_molecule.clash_target_atoms=backbone ++two_stage.pocket.sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.small_molecule.exclude_clashing_decoys=false ++two_stage.pocket.sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.metal.mode=gaussian_noise ++two_stage.pocket.sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.metal.noise_std=0.1"
 )
 
+VALSET_NAMES=(
+  "denovoval_sm_metal_half"
+  "denovoval_metal_half"
+  "denovoval_sm_half"
+  "denovoval_sm_half"
+  "denovoval_sm_half"
+  "denovoval_sm_half"
+  "denovoval_sm_half"
+)
+
+PDB_NAME_LISTS=(
+  "${HALF_DATASET_ROOT}/denovoval_sm_metal_half.txt"
+  "${HALF_DATASET_ROOT}/denovoval_metal_half.txt"
+  "${HALF_DATASET_ROOT}/denovoval_sm_half.txt"
+  "${HALF_DATASET_ROOT}/denovoval_sm_half.txt"
+  "${HALF_DATASET_ROOT}/denovoval_sm_half.txt"
+  "${HALF_DATASET_ROOT}/denovoval_sm_half.txt"
+  "${HALF_DATASET_ROOT}/denovoval_sm_half.txt"
+)
+
 NUM_CONFIGS=${#CONFIGS[@]}
 NUM_TASKS=$((NUM_CONFIGS * NUM_CHUNKS))
+
+if [[ "${#CONFIG_LABELS[@]}" -ne "${NUM_CONFIGS}" || "${#VALSET_NAMES[@]}" -ne "${NUM_CONFIGS}" || "${#PDB_NAME_LISTS[@]}" -ne "${NUM_CONFIGS}" ]]; then
+  echo "CONFIG_LABELS, CONFIGS, VALSET_NAMES, and PDB_NAME_LISTS must have the same length." >&2
+  exit 2
+fi
 
 USER_CONFIG_IDX_SET=false
 if [[ -z "${CONFIG_IDX:-}" ]]; then
@@ -99,25 +126,25 @@ if [[ "${CHUNK_IDX}" -lt 0 || "${CHUNK_IDX}" -ge "${NUM_CHUNKS}" ]]; then
 fi
 
 if [[ "${PRINT_ARRAY_PLAN}" == "true" ]]; then
-  echo "Selected exp7_cfg6 pocket / exp1_cfg0 scaffold denovoval sm-metal ensemble config sweep: NUM_CONFIGS=${NUM_CONFIGS}, NUM_CHUNKS=${NUM_CHUNKS}, NUM_TASKS=${NUM_TASKS}"
+  echo "Selected exp7_cfg6 pocket / exp1_cfg0 scaffold denovoval sm-metal-half ensemble config sweep: NUM_CONFIGS=${NUM_CONFIGS}, NUM_CHUNKS=${NUM_CHUNKS}, NUM_TASKS=${NUM_TASKS}"
   for PLAN_CONFIG_IDX in "${!CONFIGS[@]}"; do
-    echo "config_idx=${PLAN_CONFIG_IDX} label=${CONFIG_LABELS[$PLAN_CONFIG_IDX]} pocket_total_members=${POCKET_TOTAL_MEMBERS} pocket_step=${POCKET_STEP} scaffold_total_members=${SCAFFOLD_TOTAL_MEMBERS} scaffold_step=${SCAFFOLD_STEP}"
+    echo "config_idx=${PLAN_CONFIG_IDX} label=${CONFIG_LABELS[$PLAN_CONFIG_IDX]} valset=${VALSET_NAMES[$PLAN_CONFIG_IDX]} pdb_name_list=${PDB_NAME_LISTS[$PLAN_CONFIG_IDX]} pocket_total_members=${POCKET_TOTAL_MEMBERS} pocket_step=${POCKET_STEP} scaffold_total_members=${SCAFFOLD_TOTAL_MEMBERS} scaffold_step=${SCAFFOLD_STEP}"
     echo "  ${CONFIGS[$PLAN_CONFIG_IDX]}"
   done
   exit 0
 fi
 
 CONFIG_LABEL=${CONFIG_LABELS[$CONFIG_IDX]}
+VALSET_NAME=${VALSET_NAMES[$CONFIG_IDX]}
+PDB_NAME_LIST=${PDB_NAME_LISTS[$CONFIG_IDX]}
 read -r -a POCKET_CONFIG_OVERRIDES <<< "${CONFIGS[$CONFIG_IDX]}"
 
 SCAFFOLD_PROTEIN_NOISE_LABEL=${SCAFFOLD_PROTEIN_NOISE_STD//./p}
 
 BASE_DIR="${PROJECT_ROOT:-/home/users/zhkim216/code/elix}"
-HYDRA_ROOT=/scratch/users/zhkim216/hydra_outputs/eval_elix_exp7_cfg6_pocket_exp1_cfg0_scaffold_denovoval_sm_metal_ensemble_config_sweep
+HYDRA_ROOT=/scratch/users/zhkim216/hydra_outputs/eval_elix_exp7_cfg6_pocket_exp1_cfg0_scaffold_denovoval_sm_metal_half_ensemble_config_sweep
 BASE_OUT_DIR=/scratch/users/zhkim216/out_dir/eval_ligand_seq_des
-VALSET_NAME=denovoval_sm_metal
-PDB_DIR=/scratch/users/zhkim216/datasets/val_cifs/denovoval_cifs/denovoval_sm_metal/cifs
-PDB_NAME_LIST=null
+PDB_DIR=${HALF_DATASET_ROOT}/cifs
 
 POCKET_DENOISER_TRAIN_DIR=/scratch/users/zhkim216/out_dir/ligand_seq_des/${POCKET_MODEL_NAME}
 SCAFFOLD_DENOISER_TRAIN_DIR=/scratch/users/zhkim216/out_dir/ligand_seq_des/${SCAFFOLD_MODEL_NAME}
@@ -134,6 +161,7 @@ checkpoint_exists_for_step() {
 mkdir -p /scratch/users/zhkim216/job_output/eval_ligand_seq_des "${HYDRA_ROOT}" "${BASE_OUT_DIR}"
 
 [[ -d "${PDB_DIR}" ]] || { echo "Missing PDB_DIR=${PDB_DIR}" >&2; exit 1; }
+[[ -f "${PDB_NAME_LIST}" ]] || { echo "Missing PDB_NAME_LIST=${PDB_NAME_LIST}" >&2; exit 1; }
 [[ -d "${POCKET_DENOISER_TRAIN_DIR}" ]] || { echo "Missing POCKET_DENOISER_TRAIN_DIR=${POCKET_DENOISER_TRAIN_DIR}" >&2; exit 1; }
 [[ -d "${SCAFFOLD_DENOISER_TRAIN_DIR}" ]] || { echo "Missing SCAFFOLD_DENOISER_TRAIN_DIR=${SCAFFOLD_DENOISER_TRAIN_DIR}" >&2; exit 1; }
 checkpoint_exists_for_step "${POCKET_DENOISER_TRAIN_DIR}" "${POCKET_STEP}" || {
@@ -161,7 +189,7 @@ else
     export XLA_FLAGS="${XLA_FLAGS:+${XLA_FLAGS} }--xla_disable_hlo_passes=custom-kernel-fusion-rewriter"
 fi
 
-echo "Starting exp7_cfg6 pocket / exp1_cfg0 scaffold denovoval sm-metal ensemble config sweep: task=${TASK_ID}/${NUM_TASKS}, config_idx=${CONFIG_IDX}/${NUM_CONFIGS}, chunk=${CHUNK_IDX}/${NUM_CHUNKS}"
+echo "Starting exp7_cfg6 pocket / exp1_cfg0 scaffold denovoval sm-metal-half ensemble config sweep: task=${TASK_ID}/${NUM_TASKS}, config_idx=${CONFIG_IDX}/${NUM_CONFIGS}, chunk=${CHUNK_IDX}/${NUM_CHUNKS}"
 echo "Stage1 pocket: model=${POCKET_MODEL_NAME}, step=${POCKET_STEP}, total_members=${POCKET_TOTAL_MEMBERS}, config_label=${CONFIG_LABEL}"
 echo "Stage1 pocket config: ${CONFIGS[$CONFIG_IDX]}"
 echo "Stage2 scaffold: model=${SCAFFOLD_MODEL_NAME}, step=${SCAFFOLD_STEP}, total_members=${SCAFFOLD_TOTAL_MEMBERS}, protein_noise_std=${SCAFFOLD_PROTEIN_NOISE_STD}"
