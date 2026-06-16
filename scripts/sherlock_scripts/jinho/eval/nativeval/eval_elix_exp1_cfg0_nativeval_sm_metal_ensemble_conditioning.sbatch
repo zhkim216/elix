@@ -16,7 +16,7 @@
 set -euo pipefail
 
 STEP_FILTER="${STEP_FILTER:-all}"
-NUM_ENSEMBLES_FILTER="${NUM_ENSEMBLES_FILTER:-all}"
+TOTAL_MEMBERS_FILTER="${TOTAL_MEMBERS_FILTER:-all}"
 PROTEIN_NOISE_STD_FILTER="${PROTEIN_NOISE_STD_FILTER:-all}"
 PRINT_ARRAY_PLAN="${PRINT_ARRAY_PLAN:-false}"
 TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
@@ -24,7 +24,7 @@ CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-8}"
 
 MODEL_NAME=elix_exp1_cfg0
 STEPS=(2500 12500 22500 32500)
-NUM_ENSEMBLES_LIST=(2 4 8)
+TOTAL_MEMBERS_LIST=(2 4 8)
 PROTEIN_NOISE_STD_LIST=(0.1 0.2 0.3 0.4 0.5)
 NUM_CHUNKS=1
 
@@ -36,25 +36,25 @@ matches_filter() {
 
 print_valid_filters() {
   echo "Valid STEP_FILTER values: all ${STEPS[*]}" >&2
-  echo "Valid NUM_ENSEMBLES_FILTER values: all ${NUM_ENSEMBLES_LIST[*]}" >&2
+  echo "Valid TOTAL_MEMBERS_FILTER values: all ${TOTAL_MEMBERS_LIST[*]}" >&2
   echo "Valid PROTEIN_NOISE_STD_FILTER values: all ${PROTEIN_NOISE_STD_LIST[*]}" >&2
 }
 
 SWEEP_COMBOS=()
 for CANDIDATE_STEP in "${STEPS[@]}"; do
   matches_filter "${CANDIDATE_STEP}" "${STEP_FILTER}" || continue
-  for CANDIDATE_NUM_ENSEMBLES in "${NUM_ENSEMBLES_LIST[@]}"; do
-    matches_filter "${CANDIDATE_NUM_ENSEMBLES}" "${NUM_ENSEMBLES_FILTER}" || continue
+  for CANDIDATE_TOTAL_MEMBERS in "${TOTAL_MEMBERS_LIST[@]}"; do
+    matches_filter "${CANDIDATE_TOTAL_MEMBERS}" "${TOTAL_MEMBERS_FILTER}" || continue
     for CANDIDATE_PROTEIN_NOISE_STD in "${PROTEIN_NOISE_STD_LIST[@]}"; do
       matches_filter "${CANDIDATE_PROTEIN_NOISE_STD}" "${PROTEIN_NOISE_STD_FILTER}" || continue
-      SWEEP_COMBOS+=("${CANDIDATE_STEP}:${CANDIDATE_NUM_ENSEMBLES}:${CANDIDATE_PROTEIN_NOISE_STD}")
+      SWEEP_COMBOS+=("${CANDIDATE_STEP}:${CANDIDATE_TOTAL_MEMBERS}:${CANDIDATE_PROTEIN_NOISE_STD}")
     done
   done
 done
 
 NUM_COMBOS=${#SWEEP_COMBOS[@]}
 if [[ "${NUM_COMBOS}" -eq 0 ]]; then
-  echo "No sweep combinations selected by STEP_FILTER=${STEP_FILTER}, NUM_ENSEMBLES_FILTER=${NUM_ENSEMBLES_FILTER}, PROTEIN_NOISE_STD_FILTER=${PROTEIN_NOISE_STD_FILTER}." >&2
+  echo "No sweep combinations selected by STEP_FILTER=${STEP_FILTER}, TOTAL_MEMBERS_FILTER=${TOTAL_MEMBERS_FILTER}, PROTEIN_NOISE_STD_FILTER=${PROTEIN_NOISE_STD_FILTER}." >&2
   print_valid_filters
   exit 2
 fi
@@ -64,8 +64,8 @@ NUM_TASKS=$((NUM_COMBOS * NUM_CHUNKS))
 if [[ "${PRINT_ARRAY_PLAN}" == "true" ]]; then
   echo "Selected nativeval ensemble-conditioning sweep for ${MODEL_NAME}: NUM_COMBOS=${NUM_COMBOS}, NUM_TASKS=${NUM_TASKS}"
   for COMBO_IDX in "${!SWEEP_COMBOS[@]}"; do
-    IFS=: read -r PLAN_STEP PLAN_NUM_ENSEMBLES PLAN_PROTEIN_NOISE_STD <<< "${SWEEP_COMBOS[$COMBO_IDX]}"
-    echo "combo_idx=${COMBO_IDX} step=${PLAN_STEP} num_ensembles=${PLAN_NUM_ENSEMBLES} protein_noise_std=${PLAN_PROTEIN_NOISE_STD}"
+    IFS=: read -r PLAN_STEP PLAN_TOTAL_MEMBERS PLAN_PROTEIN_NOISE_STD <<< "${SWEEP_COMBOS[$COMBO_IDX]}"
+    echo "combo_idx=${COMBO_IDX} step=${PLAN_STEP} total_members=${PLAN_TOTAL_MEMBERS} protein_noise_std=${PLAN_PROTEIN_NOISE_STD}"
   done
   exit 0
 fi
@@ -77,7 +77,7 @@ fi
 
 COMBO_IDX=$((TASK_ID / NUM_CHUNKS))
 CHUNK_IDX=$((TASK_ID % NUM_CHUNKS))
-IFS=: read -r STEP NUM_ENSEMBLES PROTEIN_NOISE_STD <<< "${SWEEP_COMBOS[$COMBO_IDX]}"
+IFS=: read -r STEP TOTAL_MEMBERS PROTEIN_NOISE_STD <<< "${SWEEP_COMBOS[$COMBO_IDX]}"
 NOISE_LABEL=${PROTEIN_NOISE_STD//./p}
 
 BASE_DIR="${PROJECT_ROOT:-/home/users/zhkim216/code/elix}"
@@ -97,7 +97,7 @@ AF3_RECYCLES=10
 AF3_DIFFUSION_SAMPLES=5
 
 DENOISER_TRAIN_DIR=/scratch/users/zhkim216/out_dir/ligand_seq_des/${MODEL_NAME}
-EXP_NAME=${MODEL_NAME}_step${STEP}_${VALSET_NAME}_ensemble_n${NUM_ENSEMBLES}_protein_noise${NOISE_LABEL}_numseqs${NUM_SEQS_PER_PDB}
+EXP_NAME=${MODEL_NAME}_step${STEP}_${VALSET_NAME}_ensemble_n${TOTAL_MEMBERS}_protein_noise${NOISE_LABEL}_numseqs${NUM_SEQS_PER_PDB}
 HYDRA_DIR=${HYDRA_ROOT}/${EXP_NAME}/chunk_${CHUNK_IDX}
 
 mkdir -p /scratch/users/zhkim216/job_output/eval_ligand_seq_des "${HYDRA_ROOT}" "${BASE_OUT_DIR}"
@@ -123,8 +123,8 @@ else
     export XLA_FLAGS="${XLA_FLAGS:+${XLA_FLAGS} }--xla_disable_hlo_passes=custom-kernel-fusion-rewriter"
 fi
 
-echo "Starting nativeval sm-metal ensemble-conditioning eval: model=${MODEL_NAME}, step=${STEP}, num_ensembles=${NUM_ENSEMBLES}, protein_noise_std=${PROTEIN_NOISE_STD}, chunk=${CHUNK_IDX}/${NUM_CHUNKS}, selected_task=${TASK_ID}/${NUM_TASKS}"
-echo "Filters: STEP_FILTER=${STEP_FILTER}, NUM_ENSEMBLES_FILTER=${NUM_ENSEMBLES_FILTER}, PROTEIN_NOISE_STD_FILTER=${PROTEIN_NOISE_STD_FILTER}"
+echo "Starting nativeval sm-metal ensemble-conditioning eval: model=${MODEL_NAME}, step=${STEP}, total_members=${TOTAL_MEMBERS}, protein_noise_std=${PROTEIN_NOISE_STD}, chunk=${CHUNK_IDX}/${NUM_CHUNKS}, selected_task=${TASK_ID}/${NUM_TASKS}"
+echo "Filters: STEP_FILTER=${STEP_FILTER}, TOTAL_MEMBERS_FILTER=${TOTAL_MEMBERS_FILTER}, PROTEIN_NOISE_STD_FILTER=${PROTEIN_NOISE_STD_FILTER}"
 echo "GPU compute capability: ${COMPUTE_CAP}, using flash_attention_implementation=${FLASH_ATTN_IMPL}"
 echo "PDB_DIR=${PDB_DIR}"
 echo "PDB_NAME_LIST=${PDB_NAME_LIST}"
@@ -158,8 +158,8 @@ WANDB__SERVICE_WAIT=300 python3 allatom_design/eval/sampling/run_elix.py \
     sampling_cfg.overrides.num_seqs_per_pdb=${NUM_SEQS_PER_PDB} \
     sampling_cfg.overrides.use_potts_sampling=true \
     sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.enabled=true \
-    sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.num_ensembles=${NUM_ENSEMBLES} \
-    sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.reduce=mean \
+    sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.total_members=${TOTAL_MEMBERS} \
+    sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.weights.scheme=mean \
     sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.noise_seed=null \
     sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.noise_std.protein=${PROTEIN_NOISE_STD} \
     sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.noise_std.metal=0.0 \
@@ -194,4 +194,4 @@ WANDB__SERVICE_WAIT=300 python3 allatom_design/eval/sampling/run_elix.py \
     struct_pred_cfg.af3.inference_config.ss.num_diffusion_samples=${AF3_DIFFUSION_SAMPLES} \
     hydra.run.dir=${HYDRA_DIR}
 
-echo "Evaluation complete: model=${MODEL_NAME}, step=${STEP}, num_ensembles=${NUM_ENSEMBLES}, protein_noise_std=${PROTEIN_NOISE_STD}, chunk=${CHUNK_IDX}/${NUM_CHUNKS}"
+echo "Evaluation complete: model=${MODEL_NAME}, step=${STEP}, total_members=${TOTAL_MEMBERS}, protein_noise_std=${PROTEIN_NOISE_STD}, chunk=${CHUNK_IDX}/${NUM_CHUNKS}"

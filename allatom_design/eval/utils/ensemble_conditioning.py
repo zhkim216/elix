@@ -26,10 +26,34 @@ _ENSEMBLE_NOISE_KEYS = (
 
 DEFAULT_ENSEMBLE_CONDITIONING_CFG: dict[str, Any] = {
     "enabled": False,
-    "num_ensembles": 1,
-    "reduce": "mean",
+    "total_members": 1,
+    "weights": {
+        "scheme": "mean",
+        "ref_weight": 0.7,
+        "decoy_total_weight": 0.3,
+    },
     "noise_seed": None,
     "save_noisy_inputs_dir": None,
+    "protein": {
+        "mode": "gaussian_noise",
+        "noise_std": 0.0,
+    },
+    "metal": {
+        "mode": "gaussian_noise",
+        "noise_std": 0.0,
+    },
+    "small_molecule": {
+        "mode": "gaussian_noise",
+        "noise_std": 0.0,
+        "num_conformer_candidates": 50,
+        "rmsd_cluster_cutoff": 2.0,
+        "seed": None,
+        "num_threads": 1,
+        "uff_optimize": True,
+        "clash_target_atoms": "all_protein",
+        "vdw_overlap_cutoff": 0.5,
+        "exclude_clashing_decoys": False,
+    },
     "noise_std": {
         "protein": 0.0,
         "metal": 0.0,
@@ -40,7 +64,18 @@ DEFAULT_ENSEMBLE_CONDITIONING_CFG: dict[str, Any] = {
 
 def ensemble_conditioning_enabled(sampling_inputs: dict[str, Any]) -> bool:
     cfg = _raw_ensemble_cfg(sampling_inputs)
-    return bool(cfg) and bool(cfg.get("enabled", False))
+    return bool(cfg) and _as_bool(cfg.get("enabled", False))
+
+
+def ligand_conformer_conditioning_enabled(sampling_inputs: dict[str, Any]) -> bool:
+    cfg = _raw_ensemble_cfg(sampling_inputs)
+    if not cfg:
+        return False
+    normalized = normalize_ensemble_conditioning_cfg(cfg)
+    return (
+        bool(normalized["enabled"])
+        and normalized["small_molecule"]["mode"] == "ligand_conformer"
+    )
 
 
 def make_ensemble_potts_aux_provider(
@@ -78,6 +113,7 @@ def normalize_ensemble_conditioning_cfg(
         cfg_dict = dict(cfg)
 
     normalized = copy.deepcopy(DEFAULT_ENSEMBLE_CONDITIONING_CFG)
+    _reject_legacy_ensemble_keys(cfg_dict)
 
     noise_std_raw = cfg_dict.get("noise_std", {}) or {}
     if isinstance(noise_std_raw, (int, float)):
@@ -88,32 +124,128 @@ def normalize_ensemble_conditioning_cfg(
         }
     else:
         noise_std = dict(noise_std_raw)
+    weights_raw = cfg_dict.get("weights", {}) or {}
+    if not isinstance(weights_raw, dict):
+        raise ValueError("ensemble_conditioning.weights must be a mapping")
+    weights = dict(weights_raw)
 
-    normalized["enabled"] = bool(cfg_dict.get("enabled", normalized["enabled"]))
-    normalized["num_ensembles"] = int(
-        cfg_dict.get("num_ensembles", normalized["num_ensembles"])
+    normalized["enabled"] = _as_bool(cfg_dict.get("enabled", normalized["enabled"]))
+    total_members_raw = cfg_dict.get("total_members", normalized["total_members"])
+    normalized["total_members"] = int(total_members_raw)
+    normalized["weights"]["scheme"] = str(
+        weights.get("scheme", normalized["weights"]["scheme"])
     )
-    normalized["reduce"] = str(cfg_dict.get("reduce", normalized["reduce"]))
+    normalized["weights"]["ref_weight"] = float(
+        weights.get("ref_weight", normalized["weights"]["ref_weight"])
+    )
+    normalized["weights"]["decoy_total_weight"] = float(
+        weights.get(
+            "decoy_total_weight",
+            normalized["weights"]["decoy_total_weight"],
+        )
+    )
     normalized["noise_seed"] = cfg_dict.get("noise_seed", normalized["noise_seed"])
     normalized["save_noisy_inputs_dir"] = cfg_dict.get(
         "save_noisy_inputs_dir",
         normalized["save_noisy_inputs_dir"],
     )
-    for key, default_value in normalized["noise_std"].items():
-        normalized["noise_std"][key] = float(noise_std.get(key, default_value))
 
-    if normalized["num_ensembles"] < 1:
+    _merge_entity_cfg(
+        normalized,
+        cfg_dict,
+        entity_key="protein",
+        flat_noise_key="protein",
+        noise_std=noise_std,
+    )
+    _merge_entity_cfg(
+        normalized,
+        cfg_dict,
+        entity_key="metal",
+        flat_noise_key="metal",
+        noise_std=noise_std,
+    )
+    _merge_entity_cfg(
+        normalized,
+        cfg_dict,
+        entity_key="small_molecule",
+        flat_noise_key="nonpolymer",
+        noise_std=noise_std,
+    )
+    _refresh_legacy_noise_std(normalized)
+
+    if normalized["total_members"] < 1:
         raise ValueError(
-            "ensemble_conditioning.num_ensembles must be >= 1, "
-            f"got {normalized['num_ensembles']}"
+            "ensemble_conditioning.total_members must be >= 1, "
+            f"got {normalized['total_members']}"
         )
-    if normalized["reduce"] not in {"mean", "sqrt"}:
+    weights_cfg = normalized["weights"]
+    if weights_cfg["scheme"] not in {"mean", "sqrt", "weighted_mean"}:
         raise ValueError(
-            "ensemble_conditioning.reduce must be 'mean' or 'sqrt', "
-            f"got {normalized['reduce']!r}"
+            "ensemble_conditioning.weights.scheme must be 'mean', 'sqrt', "
+            f"or 'weighted_mean', got {weights_cfg['scheme']!r}"
+        )
+    if weights_cfg["ref_weight"] < 0:
+        raise ValueError(
+            "ensemble_conditioning.weights.ref_weight must be non-negative, "
+            f"got {weights_cfg['ref_weight']}"
+        )
+    if weights_cfg["decoy_total_weight"] < 0:
+        raise ValueError(
+            "ensemble_conditioning.weights.decoy_total_weight must be non-negative, "
+            f"got {weights_cfg['decoy_total_weight']}"
+        )
+    if weights_cfg["ref_weight"] + weights_cfg["decoy_total_weight"] <= 0:
+        raise ValueError("ensemble_conditioning weights must have positive total")
+    _validate_entity_cfg(
+        normalized,
+        "protein",
+        allowed_modes={"gaussian_noise", "none"},
+    )
+    _validate_entity_cfg(normalized, "metal", allowed_modes={"gaussian_noise", "none"})
+    _validate_entity_cfg(
+        normalized,
+        "small_molecule",
+        allowed_modes={"gaussian_noise", "ligand_conformer", "none"},
+    )
+    if (
+        weights_cfg["scheme"] == "weighted_mean"
+        and normalized["small_molecule"]["mode"] != "ligand_conformer"
+    ):
+        raise ValueError(
+            "ensemble_conditioning.weights.scheme='weighted_mean' requires "
+            "small_molecule.mode='ligand_conformer'"
+        )
+    small_molecule_cfg = normalized["small_molecule"]
+    if int(small_molecule_cfg["num_conformer_candidates"]) < 1:
+        raise ValueError(
+            "ensemble_conditioning.small_molecule.num_conformer_candidates "
+            "must be >= 1"
+        )
+    if float(small_molecule_cfg["rmsd_cluster_cutoff"]) <= 0:
+        raise ValueError(
+            "ensemble_conditioning.small_molecule.rmsd_cluster_cutoff "
+            "must be positive"
+        )
+    if int(small_molecule_cfg["num_threads"]) < 1:
+        raise ValueError(
+            "ensemble_conditioning.small_molecule.num_threads must be >= 1"
+        )
+    if float(small_molecule_cfg["vdw_overlap_cutoff"]) < 0:
+        raise ValueError(
+            "ensemble_conditioning.small_molecule.vdw_overlap_cutoff "
+            "must be non-negative"
+        )
+    if small_molecule_cfg["clash_target_atoms"] not in {
+        "sidechain",
+        "backbone",
+        "all_protein",
+    }:
+        raise ValueError(
+            "ensemble_conditioning.small_molecule.clash_target_atoms must be "
+            "'sidechain', 'backbone', or 'all_protein'"
         )
     for key, value in normalized["noise_std"].items():
-        if value < 0:
+        if float(value) < 0:
             raise ValueError(
                 f"ensemble_conditioning.noise_std.{key} must be non-negative, got {value}"
             )
@@ -131,13 +263,14 @@ def compute_ensemble_potts_params(
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]:
     cfg = normalize_ensemble_conditioning_cfg(ensemble_cfg)
     if "tied_sampling_ids" in batch:
-        raise NotImplementedError(
-            "ensemble_conditioning is not supported for batches that already "
-            "contain tied_sampling_ids"
+        noised_batch = apply_ensemble_noise(batch, cfg)
+        return denoiser.compute_potts_params(
+            noised_batch,
+            sampling_inputs,
         )
 
-    num_ensembles = cfg["num_ensembles"]
-    repeated_batch = repeat_batch_for_ensembles(batch, num_ensembles)
+    total_members = cfg["total_members"]
+    repeated_batch = repeat_batch_for_ensembles(batch, total_members)
     repeated_batch = apply_ensemble_noise(repeated_batch, cfg)
 
     _save_noisy_inputs_if_requested(
@@ -154,7 +287,7 @@ def compute_ensemble_potts_params(
     inverse = torch.arange(
         original_batch_size,
         device=potts_decoder_aux["h"].device,
-    ).repeat_interleave(num_ensembles)
+    ).repeat_interleave(total_members)
     tied_sampling_inputs = {
         "inverse": inverse,
         "unique_ids": torch.arange(original_batch_size, device=inverse.device),
@@ -162,10 +295,12 @@ def compute_ensemble_potts_params(
     potts_decoder_aux = _aggregate_potts_params(
         potts_decoder_aux,
         tied_sampling_inputs,
-        reduce=cfg["reduce"],
+        reduce=cfg["weights"]["scheme"],
     )
 
-    representative_indices = list(range(0, original_batch_size * num_ensembles, num_ensembles))
+    representative_indices = list(
+        range(0, original_batch_size * total_members, total_members)
+    )
     representative_batch = slice_feats(repeated_batch, representative_indices)
     output_batch = dict(batch)
     output_batch["protein_residue_node_mask"] = representative_batch["protein_residue_node_mask"]
@@ -175,17 +310,17 @@ def compute_ensemble_potts_params(
 
 def repeat_batch_for_ensembles(
     batch: dict[str, Any],
-    num_ensembles: int,
+    total_members: int,
 ) -> dict[str, Any]:
     repeated = {}
     for key, value in batch.items():
         if torch.is_tensor(value):
-            repeated[key] = value.repeat_interleave(num_ensembles, dim=0)
+            repeated[key] = value.repeat_interleave(total_members, dim=0)
         elif isinstance(value, list):
             repeated[key] = [
                 item
                 for item in value
-                for _ in range(num_ensembles)
+                for _ in range(total_members)
             ]
         else:
             repeated[key] = value
@@ -262,6 +397,114 @@ def _atom_noise_scale(
     )
 
 
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _reject_legacy_ensemble_keys(cfg_dict: dict[str, Any]) -> None:
+    legacy_keys = {
+        "num_ensembles": "total_members",
+        "reduce": "weights.scheme",
+        "original_weight": "weights.ref_weight",
+        "decoy_total_weight": "weights.decoy_total_weight",
+    }
+    present = [
+        f"{key} -> {replacement}"
+        for key, replacement in legacy_keys.items()
+        if key in cfg_dict
+    ]
+    if present:
+        raise ValueError(
+            "Unsupported legacy ensemble_conditioning keys: "
+            + ", ".join(present)
+        )
+
+
+def _merge_entity_cfg(
+    normalized: dict[str, Any],
+    cfg_dict: dict[str, Any],
+    *,
+    entity_key: str,
+    flat_noise_key: str,
+    noise_std: dict[str, Any],
+) -> None:
+    entity_cfg = dict(cfg_dict.get(entity_key, {}) or {})
+    default_entity = normalized[entity_key]
+    default_entity["mode"] = str(entity_cfg.get("mode", default_entity["mode"]))
+    if "noise_std" in entity_cfg:
+        default_entity["noise_std"] = float(entity_cfg["noise_std"])
+    else:
+        default_entity["noise_std"] = float(
+            noise_std.get(flat_noise_key, default_entity["noise_std"])
+        )
+    if entity_key != "small_molecule":
+        return
+
+    for key in (
+        "num_conformer_candidates",
+        "num_threads",
+    ):
+        default_entity[key] = int(entity_cfg.get(key, default_entity[key]))
+    for key in (
+        "rmsd_cluster_cutoff",
+        "vdw_overlap_cutoff",
+    ):
+        default_entity[key] = float(entity_cfg.get(key, default_entity[key]))
+    default_entity["seed"] = entity_cfg.get("seed", default_entity["seed"])
+    default_entity["uff_optimize"] = _as_bool(
+        entity_cfg.get("uff_optimize", default_entity["uff_optimize"])
+    )
+    default_entity["exclude_clashing_decoys"] = _as_bool(
+        entity_cfg.get(
+            "exclude_clashing_decoys",
+            default_entity["exclude_clashing_decoys"],
+        )
+    )
+    default_entity["clash_target_atoms"] = str(
+        entity_cfg.get("clash_target_atoms", default_entity["clash_target_atoms"])
+    )
+
+
+def _refresh_legacy_noise_std(normalized: dict[str, Any]) -> None:
+    normalized["noise_std"]["protein"] = (
+        normalized["protein"]["noise_std"]
+        if normalized["protein"]["mode"] == "gaussian_noise"
+        else 0.0
+    )
+    normalized["noise_std"]["metal"] = (
+        normalized["metal"]["noise_std"]
+        if normalized["metal"]["mode"] == "gaussian_noise"
+        else 0.0
+    )
+    normalized["noise_std"]["nonpolymer"] = (
+        normalized["small_molecule"]["noise_std"]
+        if normalized["small_molecule"]["mode"] == "gaussian_noise"
+        else 0.0
+    )
+
+
+def _validate_entity_cfg(
+    normalized: dict[str, Any],
+    entity_key: str,
+    *,
+    allowed_modes: set[str],
+) -> None:
+    entity_cfg = normalized[entity_key]
+    if entity_cfg["mode"] not in allowed_modes:
+        allowed = ", ".join(sorted(allowed_modes))
+        raise ValueError(
+            f"ensemble_conditioning.{entity_key}.mode must be one of "
+            f"{allowed}; got {entity_cfg['mode']!r}"
+        )
+    if float(entity_cfg["noise_std"]) < 0:
+        raise ValueError(
+            f"ensemble_conditioning.{entity_key}.noise_std must be "
+            f"non-negative, got {entity_cfg['noise_std']}"
+        )
+
+
 def _recompute_noised_backbone_fields(batch: dict[str, Any]) -> None:
     coords = batch["noised_coords"]
     batch_size, num_tokens, _ = batch["noised_ca_coords"].shape
@@ -332,18 +575,18 @@ def _save_noisy_inputs_if_requested(
         return
 
     save_root = Path(str(save_root_raw))
-    num_ensembles = cfg["num_ensembles"]
-    if len(batch["atom_array"]) % num_ensembles != 0:
-        raise ValueError("Repeated batch size is not divisible by num_ensembles")
+    total_members = cfg["total_members"]
+    if len(batch["atom_array"]) % total_members != 0:
+        raise ValueError("Repeated batch size is not divisible by total_members")
 
     label = _ensemble_label(cfg)
-    num_examples = len(batch["atom_array"]) // num_ensembles
+    num_examples = len(batch["atom_array"]) // total_members
     for example_idx in range(num_examples):
-        first_member_idx = example_idx * num_ensembles
+        first_member_idx = example_idx * total_members
         example_id = str(batch["example_id"][first_member_idx])
         out_dir = save_root / example_id / label
         out_dir.mkdir(parents=True, exist_ok=True)
-        for member_idx in range(num_ensembles):
+        for member_idx in range(total_members):
             batch_idx = first_member_idx + member_idx
             atom_array = batch["atom_array"][batch_idx].copy()
             n_atoms = len(atom_array)
@@ -365,9 +608,9 @@ def _ensemble_label(cfg: dict[str, Any]) -> str:
         noise_std["nonpolymer"],
     ]
     if values[0] == values[1] == values[2]:
-        return f"M{cfg['num_ensembles']}_std{_format_float_label(values[0])}"
+        return f"M{cfg['total_members']}_std{_format_float_label(values[0])}"
     return (
-        f"M{cfg['num_ensembles']}"
+        f"M{cfg['total_members']}"
         f"_p{_format_float_label(noise_std['protein'])}"
         f"_m{_format_float_label(noise_std['metal'])}"
         f"_n{_format_float_label(noise_std['nonpolymer'])}"

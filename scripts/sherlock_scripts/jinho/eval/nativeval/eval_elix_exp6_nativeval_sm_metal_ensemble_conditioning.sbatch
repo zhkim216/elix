@@ -24,7 +24,7 @@ CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-8}"
 # Mirrors scripts/sherlock_scripts/jinho/train/elix_exp6.sbatch.
 MODEL_NAMES=(elix_exp6_cfg0 elix_exp6_cfg1 elix_exp6_cfg2)
 STEPS=(2500 12500 22500 32500 42500 52500)
-NUM_ENSEMBLES=16
+TOTAL_MEMBERS=16
 PROTEIN_NOISE_STD=0.5
 NUM_CHUNKS=1
 
@@ -58,10 +58,10 @@ fi
 NUM_TASKS=$((NUM_COMBOS * NUM_CHUNKS))
 
 if [[ "${PRINT_ARRAY_PLAN}" == "true" ]]; then
-  echo "Selected nativeval ensemble-conditioning sweep: NUM_COMBOS=${NUM_COMBOS}, NUM_TASKS=${NUM_TASKS}, num_ensembles=${NUM_ENSEMBLES}, protein_noise_std=${PROTEIN_NOISE_STD}"
+  echo "Selected nativeval ensemble-conditioning sweep: NUM_COMBOS=${NUM_COMBOS}, NUM_TASKS=${NUM_TASKS}, total_members=${TOTAL_MEMBERS}, protein_noise_std=${PROTEIN_NOISE_STD}"
   for COMBO_IDX in "${!MODEL_STEP_COMBOS[@]}"; do
     IFS=: read -r PLAN_MODEL PLAN_STEP <<< "${MODEL_STEP_COMBOS[$COMBO_IDX]}"
-    echo "combo_idx=${COMBO_IDX} model=${PLAN_MODEL} step=${PLAN_STEP} num_ensembles=${NUM_ENSEMBLES} protein_noise_std=${PROTEIN_NOISE_STD}"
+    echo "combo_idx=${COMBO_IDX} model=${PLAN_MODEL} step=${PLAN_STEP} total_members=${TOTAL_MEMBERS} protein_noise_std=${PROTEIN_NOISE_STD}"
   done
   exit 0
 fi
@@ -93,7 +93,7 @@ AF3_RECYCLES=10
 AF3_DIFFUSION_SAMPLES=5
 
 DENOISER_TRAIN_DIR=/scratch/users/zhkim216/out_dir/ligand_seq_des/${MODEL_NAME}
-EXP_NAME=${MODEL_NAME}_${VALSET_NAME}_ensemble_n${NUM_ENSEMBLES}_protein_noise${NOISE_LABEL}_numseqs${NUM_SEQS_PER_PDB}
+EXP_NAME=${MODEL_NAME}_${VALSET_NAME}_ensemble_n${TOTAL_MEMBERS}_protein_noise${NOISE_LABEL}_numseqs${NUM_SEQS_PER_PDB}
 HYDRA_DIR=${HYDRA_ROOT}/${EXP_NAME}/chunk_${CHUNK_IDX}
 
 mkdir -p /scratch/users/zhkim216/job_output/eval_ligand_seq_des "${HYDRA_ROOT}" "${BASE_OUT_DIR}"
@@ -119,7 +119,7 @@ else
     export XLA_FLAGS="${XLA_FLAGS:+${XLA_FLAGS} }--xla_disable_hlo_passes=custom-kernel-fusion-rewriter"
 fi
 
-echo "Starting nativeval sm-metal ensemble-conditioning eval: model=${MODEL_NAME}, step=${STEP}, num_ensembles=${NUM_ENSEMBLES}, protein_noise_std=${PROTEIN_NOISE_STD}, chunk=${CHUNK_IDX}/${NUM_CHUNKS}, selected_task=${TASK_ID}/${NUM_TASKS}"
+echo "Starting nativeval sm-metal ensemble-conditioning eval: model=${MODEL_NAME}, step=${STEP}, total_members=${TOTAL_MEMBERS}, protein_noise_std=${PROTEIN_NOISE_STD}, chunk=${CHUNK_IDX}/${NUM_CHUNKS}, selected_task=${TASK_ID}/${NUM_TASKS}"
 echo "Filters: MODEL_FILTER=${MODEL_FILTER}, STEP_FILTER=${STEP_FILTER}"
 echo "GPU compute capability: ${COMPUTE_CAP}, using flash_attention_implementation=${FLASH_ATTN_IMPL}"
 echo "PDB_DIR=${PDB_DIR}"
@@ -154,8 +154,8 @@ WANDB__SERVICE_WAIT=300 python3 allatom_design/eval/sampling/run_elix.py \
     sampling_cfg.overrides.num_seqs_per_pdb=${NUM_SEQS_PER_PDB} \
     sampling_cfg.overrides.use_potts_sampling=true \
     sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.enabled=true \
-    sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.num_ensembles=${NUM_ENSEMBLES} \
-    sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.reduce=mean \
+    sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.total_members=${TOTAL_MEMBERS} \
+    sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.weights.scheme=mean \
     sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.noise_seed=null \
     sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.noise_std.protein=${PROTEIN_NOISE_STD} \
     sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.noise_std.metal=0.0 \
@@ -190,4 +190,4 @@ WANDB__SERVICE_WAIT=300 python3 allatom_design/eval/sampling/run_elix.py \
     struct_pred_cfg.af3.inference_config.ss.num_diffusion_samples=${AF3_DIFFUSION_SAMPLES} \
     hydra.run.dir=${HYDRA_DIR}
 
-echo "Evaluation complete: model=${MODEL_NAME}, step=${STEP}, num_ensembles=${NUM_ENSEMBLES}, protein_noise_std=${PROTEIN_NOISE_STD}, chunk=${CHUNK_IDX}/${NUM_CHUNKS}"
+echo "Evaluation complete: model=${MODEL_NAME}, step=${STEP}, total_members=${TOTAL_MEMBERS}, protein_noise_std=${PROTEIN_NOISE_STD}, chunk=${CHUNK_IDX}/${NUM_CHUNKS}"

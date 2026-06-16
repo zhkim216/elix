@@ -50,8 +50,9 @@ two_stage:
           potts_only_cond: false
           ensemble_conditioning:
             enabled: true
-            num_ensembles: 16
-            reduce: "mean"
+            total_members: 16
+            weights:
+              scheme: "mean"
             noise_seed: null
             save_noisy_inputs_dir: null
             noise_std:
@@ -83,8 +84,9 @@ two_stage:
           potts_only_cond: true
           ensemble_conditioning:
             enabled: true
-            num_ensembles: 16
-            reduce: "mean"
+            total_members: 16
+            weights:
+              scheme: "mean"
             noise_seed: null
             save_noisy_inputs_dir: null
             noise_std:

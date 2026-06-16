@@ -16,7 +16,7 @@ from allatom_design.utils.atom_array_utils import (
     insert_unk_residues_for_gaps_in_atom_array,
 )
 
-from allatom_design.eval.utils.cfg_utils import require_cfg_value, resolve_sampling_cfg
+from allatom_design.eval.utils.cfg_utils import guidance_is_enabled
 from allatom_design.eval.utils.eval_setup_utils import get_checkpoints, load_seq_des_model, ckpt_label, _parallel_context
 from allatom_design.eval.utils.mask_utils import initialize_sampling_masks
 from allatom_design.eval.utils.constraint_utils import (
@@ -25,7 +25,11 @@ from allatom_design.eval.utils.constraint_utils import (
 )
 from allatom_design.eval.utils.ensemble_conditioning import (
     ensemble_conditioning_enabled,
+    ligand_conformer_conditioning_enabled,
     make_ensemble_potts_aux_provider,
+)
+from allatom_design.eval.utils.ligand_conformer_retrieval import (
+    stage_ligand_conformer_ensembles,
 )
 from allatom_design.eval.utils.data_utils import (
     collect_design_outputs,
@@ -97,6 +101,34 @@ def design_sequence(
     sample_out_dir_for_af3_tc = f"{out_dir}/samples_for_af3_tc"
     Path(sample_out_dir_for_af3_tc).mkdir(parents=True, exist_ok=True)
 
+    sampling_inputs_for_setup = OmegaConf.to_container(sampling_cfg, resolve=True)
+    sampling_inputs_for_setup.pop("sample_token_prefix", None)
+    ligand_conformer_staging = None
+    if ligand_conformer_conditioning_enabled(sampling_inputs_for_setup):
+        if guidance_is_enabled(guidance_cfg):
+            raise NotImplementedError(
+                "ligand_conformer ensemble_conditioning is not supported "
+                "together with Potts guidance"
+            )
+        ensemble_cfg = sampling_inputs_for_setup["potts_sampling_cfg"]["ensemble_conditioning"]
+        ligand_conformer_staging = stage_ligand_conformer_ensembles(
+            pdb_paths=pdb_paths,
+            out_dir=out_dir,
+            ensemble_cfg=ensemble_cfg,
+            sampling_inputs_df=sampling_inputs_df,
+            cif_parse_cfg=cif_parse_cfg,
+            cif_save_cfg=cif_save_cfg,
+            csv_suffix=csv_suffix,
+        )
+        pdb_paths = ligand_conformer_staging.pdb_paths
+        sampling_inputs_df = ligand_conformer_staging.sampling_inputs_df
+        pos_constraint_df = ligand_conformer_staging.expand_pos_constraints(pos_constraint_df)
+        print(
+            "Staged ligand conformer ensemble members in "
+            f"{ligand_conformer_staging.root_dir}; manifest: "
+            f"{ligand_conformer_staging.manifest_path}"
+        )
+
     # Validate pos_constraint_df.
     if pos_constraint_df is not None:
         valid_columns = ["pdb_key", "fixed_pos_seq", "fixed_pos_scn", "fixed_pos_override_seq", "pos_restrict_aatype"]
@@ -122,15 +154,32 @@ def design_sequence(
     parallel_context = _parallel_context(sampling_cfg.num_workers)
 
     # Begin sampling.
-    pbar = tqdm(
-        total=len(pdb_paths),
-        desc=f"Sampling {len(pdb_paths)} PDBs, {sampling_cfg.num_seqs_per_pdb} sequences per PDB...",
+    n_sampling_targets = (
+        ligand_conformer_staging.target_count()
+        if ligand_conformer_staging is not None
+        else len(pdb_paths)
     )
+    pbar = tqdm(
+        total=n_sampling_targets,
+        desc=f"Sampling {n_sampling_targets} PDBs, {sampling_cfg.num_seqs_per_pdb} sequences per PDB...",
+    )
+    if ligand_conformer_staging is not None:
+        batch_iter = ligand_conformer_staging.iter_member_batches(
+            max_members=int(sampling_cfg.batch_size),
+        )
+    else:
+        batch_iter = (
+            pdb_paths[bi : bi + sampling_cfg.batch_size]
+            for bi in range(0, len(pdb_paths), sampling_cfg.batch_size)
+        )
 
     with parallel_context as parallel_pool:
-        for bi in range(0, len(pdb_paths), sampling_cfg.batch_size):
-            batch_pdb_paths = pdb_paths[bi : bi + sampling_cfg.batch_size]
-            B = len(batch_pdb_paths)
+        for batch_pdb_paths in batch_iter:
+            B = (
+                ligand_conformer_staging.target_count(batch_pdb_paths)
+                if ligand_conformer_staging is not None
+                else len(batch_pdb_paths)
+            )
 
             batch = get_sd_batch(pdb_paths = batch_pdb_paths,
                                  sample_is_designed = input_sample_is_designed,
@@ -140,6 +189,12 @@ def design_sequence(
                                  device=device,
                                  parallel_pool=parallel_pool,
                                  sampling_inputs_df=sampling_inputs_df)
+            if ligand_conformer_staging is not None:
+                batch = ligand_conformer_staging.annotate_batch(
+                    batch,
+                    batch_pdb_paths=batch_pdb_paths,
+                    device=device,
+                )
 
             # Initialize seq_cond and atom_cond masks.
             batch = initialize_sampling_masks(batch, protein_only=protein_only)

@@ -1,19 +1,41 @@
 from pathlib import Path
+from types import SimpleNamespace
 
+import atomworks.enums as aw_enums
 import numpy as np
 import torch
+import pandas as pd
+import pytest
+from atomworks.constants import METAL_ELEMENTS as ATOMWORKS_METAL_ELEMENTS
 from biotite.structure import AtomArray
 from omegaconf import OmegaConf
+from rdkit import Chem
 
+from allatom_design.data.transform.ligand_conformers import (
+    compute_ligand_protein_clash_metrics,
+    select_target_ligand,
+    _conformer_coords,
+    _generate_candidate_mol,
+    _select_native_threshold_conformers,
+)
+from allatom_design.data.const import METAL_ELEMENTS
 from allatom_design.eval.utils.cfg_utils import (
     get_stage2_potts_only_cond,
     guidance_is_enabled,
+    resolve_sampling_cfg,
 )
+from allatom_design.eval.utils import ensemble_conditioning as ensemble_conditioning_module
 from allatom_design.eval.utils.ensemble_conditioning import (
     DEFAULT_ENSEMBLE_CONDITIONING_CFG,
     apply_ensemble_noise,
+    ligand_conformer_conditioning_enabled,
     normalize_ensemble_conditioning_cfg,
     repeat_batch_for_ensembles,
+)
+from allatom_design.eval.utils.ligand_conformer_retrieval import (
+    LigandConformerStagingResult,
+    compute_ligand_conformer_member_coefficients,
+    _manifest_row,
 )
 
 
@@ -69,7 +91,8 @@ def test_normalize_ensemble_conditioning_cfg_merges_partial_config():
     normalized = normalize_ensemble_conditioning_cfg(
         {
             "enabled": True,
-            "num_ensembles": 4,
+            "total_members": 4,
+            "weights": {"scheme": "sqrt"},
             "noise_std": {
                 "protein": 0.2,
             },
@@ -79,13 +102,33 @@ def test_normalize_ensemble_conditioning_cfg_merges_partial_config():
     assert normalized == {
         **DEFAULT_ENSEMBLE_CONDITIONING_CFG,
         "enabled": True,
-        "num_ensembles": 4,
+        "total_members": 4,
+        "weights": {
+            **DEFAULT_ENSEMBLE_CONDITIONING_CFG["weights"],
+            "scheme": "sqrt",
+        },
+        "protein": {
+            **DEFAULT_ENSEMBLE_CONDITIONING_CFG["protein"],
+            "noise_std": 0.2,
+        },
         "noise_std": {
             "protein": 0.2,
             "metal": 0.0,
             "nonpolymer": 0.0,
         },
     }
+
+
+@pytest.mark.parametrize(
+    "legacy_key",
+    ["num_ensembles", "reduce", "original_weight", "decoy_total_weight"],
+)
+def test_normalize_ensemble_conditioning_cfg_rejects_legacy_public_keys(legacy_key):
+    with pytest.raises(
+        ValueError,
+        match="Unsupported legacy ensemble_conditioning keys",
+    ):
+        normalize_ensemble_conditioning_cfg({legacy_key: 1})
 
 
 def test_normalize_ensemble_conditioning_cfg_expands_scalar_noise_std():
@@ -96,14 +139,97 @@ def test_normalize_ensemble_conditioning_cfg_expands_scalar_noise_std():
         "metal": 0.3,
         "nonpolymer": 0.3,
     }
+    assert normalized["protein"]["noise_std"] == 0.3
+    assert normalized["metal"]["noise_std"] == 0.3
+    assert normalized["small_molecule"]["noise_std"] == 0.3
 
 
-def test_seq_des_yaml_ensemble_conditioning_defaults_match_runtime_defaults():
-    cfg = OmegaConf.load(REPO_ROOT / "allatom_design/configs/seq_des/elix_mpnn_inference.yaml")
+def test_normalize_ensemble_conditioning_cfg_supports_ligand_conformer_mode():
+    normalized = normalize_ensemble_conditioning_cfg(
+        {
+            "enabled": True,
+            "total_members": 8,
+            "weights": {
+                "scheme": "weighted_mean",
+                "ref_weight": 0.7,
+                "decoy_total_weight": 0.3,
+            },
+            "protein": {"mode": "gaussian_noise", "noise_std": 0.1},
+            "small_molecule": {
+                "mode": "ligand_conformer",
+                "num_conformer_candidates": 50,
+                "rmsd_cluster_cutoff": 2.0,
+                "clash_target_atoms": "all_protein",
+            },
+        }
+    )
+
+    assert normalized["total_members"] == 8
+    assert normalized["weights"]["scheme"] == "weighted_mean"
+    assert normalized["small_molecule"]["mode"] == "ligand_conformer"
+    assert normalized["noise_std"] == {
+        "protein": 0.1,
+        "metal": 0.0,
+        "nonpolymer": 0.0,
+    }
+
+
+def test_weighted_mean_is_ligand_conformer_only():
+    with pytest.raises(
+        ValueError,
+        match="requires small_molecule.mode='ligand_conformer'",
+    ):
+        normalize_ensemble_conditioning_cfg(
+            {
+                "weights": {"scheme": "weighted_mean"},
+                "small_molecule": {"mode": "gaussian_noise"},
+            }
+        )
+
+
+def test_ligand_conformer_conditioning_enabled_reads_sampling_inputs():
+    sampling_inputs = {
+        "potts_sampling_cfg": {
+            "ensemble_conditioning": {
+                "enabled": True,
+                "small_molecule": {"mode": "ligand_conformer"},
+            }
+        }
+    }
+
+    assert ligand_conformer_conditioning_enabled(sampling_inputs) is True
+
+
+@pytest.mark.parametrize(
+    "config_path",
+    [
+        "allatom_design/configs/seq_des/elix_mpnn_inference.yaml",
+        "allatom_design/configs_local/seq_des/elix_mpnn_inference.yaml",
+    ],
+)
+def test_seq_des_yaml_ensemble_conditioning_defaults_match_runtime_defaults(config_path):
+    cfg = OmegaConf.load(REPO_ROOT / config_path)
 
     assert (
         OmegaConf.to_container(
             cfg.potts_sampling_cfg.ensemble_conditioning,
+            resolve=True,
+        )
+        == DEFAULT_ENSEMBLE_CONDITIONING_CFG
+    )
+
+
+def test_run_elix_resolved_sampling_ensemble_conditioning_defaults_match_runtime_defaults():
+    cfg = OmegaConf.load(REPO_ROOT / "allatom_design/configs/eval/sampling/run_elix.yaml")
+    cfg.sampling_cfg.base_cfg_path = str(
+        REPO_ROOT / "allatom_design/configs/seq_des/elix_mpnn_inference.yaml"
+    )
+
+    resolved_sampling_cfg = resolve_sampling_cfg(cfg)
+
+    assert (
+        OmegaConf.to_container(
+            resolved_sampling_cfg.potts_sampling_cfg.ensemble_conditioning,
             resolve=True,
         )
         == DEFAULT_ENSEMBLE_CONDITIONING_CFG
@@ -155,8 +281,8 @@ def test_apply_ensemble_noise_uses_category_specific_std():
         batch,
         {
             "enabled": True,
-            "num_ensembles": 1,
-            "reduce": "mean",
+            "total_members": 1,
+            "weights": {"scheme": "mean"},
             "noise_seed": 11,
             "noise_std": {
                 "protein": 0.0,
@@ -180,8 +306,8 @@ def test_apply_ensemble_noise_recomputes_token_backbone_fields_from_noised_atoms
         batch,
         {
             "enabled": True,
-            "num_ensembles": 1,
-            "reduce": "mean",
+            "total_members": 1,
+            "weights": {"scheme": "mean"},
             "noise_seed": 7,
             "noise_std": {
                 "protein": 0.1,
@@ -207,3 +333,393 @@ def test_apply_ensemble_noise_recomputes_token_backbone_fields_from_noised_atoms
         + noised_coords[1]
     )
     torch.testing.assert_close(noised["noised_pseudo_cb_coords"][0, 0], expected_pseudo_cb)
+
+
+def test_save_noisy_inputs_uses_total_members_in_label(monkeypatch, tmp_path):
+    batch = repeat_batch_for_ensembles(_make_batch(), 2)
+    saved_paths = []
+
+    def fake_save_cif_file(atom_array, out_file, cif_save_cfg=None):
+        saved_paths.append(Path(out_file))
+
+    monkeypatch.setattr(
+        ensemble_conditioning_module,
+        "save_cif_file",
+        fake_save_cif_file,
+    )
+    cfg = normalize_ensemble_conditioning_cfg(
+        {
+            "total_members": 2,
+            "save_noisy_inputs_dir": str(tmp_path),
+            "noise_std": 0.0,
+        }
+    )
+
+    ensemble_conditioning_module._save_noisy_inputs_if_requested(
+        batch,
+        cfg,
+        cif_save_cfg=None,
+    )
+
+    assert saved_paths == [
+        tmp_path / "example" / "M2_std0" / "ensemble_000.cif",
+        tmp_path / "example" / "M2_std0" / "ensemble_001.cif",
+    ]
+
+
+def _make_atom_array_for_clash() -> AtomArray:
+    atom_array = AtomArray(4)
+    atom_array.coord = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [11.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    atom_array.atom_name = np.array(["C1", "N", "CA", "CB"])
+    atom_array.element = np.array(["C", "N", "C", "C"])
+    atom_array.res_name = np.array(["LIG", "ALA", "ALA", "ALA"])
+    atom_array.hetero = np.array([True, False, False, False])
+    atom_array.occupancy = np.ones(4, dtype=np.float32)
+    atom_array.set_annotation(
+        "chain_type",
+        np.array(
+            [
+                aw_enums.ChainType.NON_POLYMER.value,
+                aw_enums.ChainType.POLYPEPTIDE_L.value,
+                aw_enums.ChainType.POLYPEPTIDE_L.value,
+                aw_enums.ChainType.POLYPEPTIDE_L.value,
+            ]
+        ),
+    )
+    atom_array.set_annotation("pn_unit_iid", np.array(["L_1", "A_1", "A_1", "A_1"]))
+    return atom_array
+
+
+def test_clash_target_atoms_flag_controls_protein_atom_set():
+    atom_array = _make_atom_array_for_clash()
+    ligand_mask = atom_array.pn_unit_iid == "L_1"
+
+    all_metrics = compute_ligand_protein_clash_metrics(
+        atom_array,
+        ligand_mask=ligand_mask,
+        clash_target_atoms="all_protein",
+        vdw_overlap_cutoff=0.5,
+    )
+    sidechain_metrics = compute_ligand_protein_clash_metrics(
+        atom_array,
+        ligand_mask=ligand_mask,
+        clash_target_atoms="sidechain",
+        vdw_overlap_cutoff=0.5,
+    )
+    backbone_metrics = compute_ligand_protein_clash_metrics(
+        atom_array,
+        ligand_mask=ligand_mask,
+        clash_target_atoms="backbone",
+        vdw_overlap_cutoff=0.5,
+    )
+
+    assert all_metrics["has_clash"] is True
+    assert sidechain_metrics["has_clash"] is True
+    assert backbone_metrics["has_clash"] is False
+
+
+def _make_atom_array_for_metal_ligand_selection() -> AtomArray:
+    atom_array = AtomArray(2)
+    atom_array.coord = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [5.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    atom_array.atom_name = np.array(["U", "C1"])
+    atom_array.element = np.array(["U", "C"])
+    atom_array.res_name = np.array(["U", "LIG"])
+    atom_array.hetero = np.ones(2, dtype=bool)
+    atom_array.occupancy = np.ones(2, dtype=np.float32)
+    atom_array.set_annotation(
+        "chain_type",
+        np.array(
+            [
+                aw_enums.ChainType.NON_POLYMER.value,
+                aw_enums.ChainType.NON_POLYMER.value,
+            ]
+        ),
+    )
+    atom_array.set_annotation("pn_unit_iid", np.array(["U_1", "L_1"]))
+    return atom_array
+
+
+def test_atomworks_only_metal_elements_are_excluded_from_ligand_selection():
+    assert "U" in METAL_ELEMENTS
+    atom_array = _make_atom_array_for_metal_ligand_selection()
+
+    target = select_target_ligand(atom_array)
+
+    assert target.pn_unit_iid == "L_1"
+    with pytest.raises(ValueError, match="found 0"):
+        select_target_ligand(atom_array, query_pn_unit_iids=["U_1"])
+
+
+def test_metal_elements_constant_aliases_atomworks_source_of_truth():
+    assert METAL_ELEMENTS is ATOMWORKS_METAL_ELEMENTS
+
+
+def _heavy_atom_indices(mol: Chem.Mol) -> list[int]:
+    return [atom.GetIdx() for atom in mol.GetAtoms() if atom.GetAtomicNum() > 1]
+
+
+def test_generate_candidate_mol_uses_distinct_nonzero_seed_per_candidate():
+    mol = Chem.MolFromSmiles("CCCOCCCO")
+
+    work_mol, metadata = _generate_candidate_mol(
+        mol,
+        num_candidates=5,
+        seed=0,
+        num_threads=1,
+        uff_optimize=False,
+    )
+
+    assert metadata["generated_candidates"] == 5
+    assert metadata["candidate_seed_start"] == 1
+    assert metadata["candidate_seed_end"] == 5
+    assert [entry["candidate_seed"] for entry in metadata["conformers"]] == [
+        1,
+        2,
+        3,
+        4,
+        5,
+    ]
+
+    heavy_atom_indices = _heavy_atom_indices(work_mol)
+    coords = np.stack(
+        [
+            _conformer_coords(conformer, heavy_atom_indices)
+            for conformer in work_mol.GetConformers()
+        ]
+    )
+    raw_rms_to_first = np.sqrt(((coords - coords[0]) ** 2).sum(axis=-1).mean(axis=-1))
+    assert np.max(raw_rms_to_first) > 0.1
+
+
+def test_select_native_threshold_conformers_uses_get_best_rms_cutoff():
+    mol = Chem.MolFromSmiles("CCCOCCCO")
+    work_mol, _ = _generate_candidate_mol(
+        mol,
+        num_candidates=4,
+        seed=0,
+        num_threads=1,
+        uff_optimize=False,
+    )
+    heavy_atom_indices = _heavy_atom_indices(work_mol)
+    native_coords = _conformer_coords(work_mol.GetConformer(0), heavy_atom_indices)
+
+    selected, hit_count = _select_native_threshold_conformers(
+        work_mol,
+        atom_ids=heavy_atom_indices,
+        native_coords=native_coords,
+        rmsd_cutoff=1e-6,
+        target_count=1,
+        num_threads=1,
+    )
+
+    assert hit_count >= 1
+    assert len(selected) == 1
+    assert selected[0].position == 0
+    assert selected[0].get_best_rms_to_native == pytest.approx(0.0, abs=1e-6)
+    assert selected[0].aligned_coords.shape == native_coords.shape
+
+
+def test_select_native_threshold_conformers_returns_empty_when_no_hit():
+    mol = Chem.MolFromSmiles("CCCOCCCO")
+    work_mol, _ = _generate_candidate_mol(
+        mol,
+        num_candidates=4,
+        seed=0,
+        num_threads=1,
+        uff_optimize=False,
+    )
+    heavy_atom_indices = _heavy_atom_indices(work_mol)
+    native_coords = _conformer_coords(work_mol.GetConformer(0), heavy_atom_indices)
+    distorted_native_coords = native_coords * 5.0
+
+    selected, hit_count = _select_native_threshold_conformers(
+        work_mol,
+        atom_ids=heavy_atom_indices,
+        native_coords=distorted_native_coords,
+        rmsd_cutoff=0.01,
+        target_count=4,
+        num_threads=1,
+    )
+
+    assert selected == []
+    assert hit_count == 0
+
+
+def test_ligand_conformer_manifest_records_native_threshold_selection_metadata():
+    row = _manifest_row(
+        target_sample_id="input",
+        member_sample_id="input_ligconf_1",
+        member_path=Path("/tmp/staged/input_ligconf_1.cif"),
+        member_role="ligand_conformer_decoy",
+        member_coefficient=0.3,
+        target_ligand=SimpleNamespace(pn_unit_iid="L_1", res_name="LIG"),
+        clash_metrics={
+            "has_clash": False,
+            "num_clashing_pairs": 0,
+            "min_heavy_atom_distance": None,
+            "max_vdw_overlap": None,
+            "clash_target_atoms": "all_protein",
+            "vdw_overlap_cutoff": 0.5,
+        },
+        warning="",
+        cluster_id=None,
+        generation_metadata={
+            "conformer_selection_metric": "rdkit_get_best_rms_to_native_heavy",
+            "conformer_selection_cutoff": 2.0,
+        },
+    )
+
+    assert row["conformer_selection_metric"] == "rdkit_get_best_rms_to_native_heavy"
+    assert row["conformer_selection_cutoff"] == 2.0
+    assert row["cluster_id"] is None
+
+
+def test_compute_ligand_conformer_member_coefficients_uses_weighted_mean_split():
+    coefficients = compute_ligand_conformer_member_coefficients(
+        num_decoys=7,
+        scheme="weighted_mean",
+        ref_weight=0.7,
+        decoy_total_weight=0.3,
+    )
+
+    assert coefficients[0] == pytest.approx(0.7)
+    assert coefficients[1:] == pytest.approx([0.3 / 7] * 7)
+    assert sum(coefficients) == pytest.approx(1.0)
+
+
+def test_compute_ligand_conformer_member_coefficients_mean_and_sqrt():
+    assert compute_ligand_conformer_member_coefficients(
+        num_decoys=3,
+        scheme="mean",
+        ref_weight=0.7,
+        decoy_total_weight=0.3,
+    ) == pytest.approx([0.25] * 4)
+    assert compute_ligand_conformer_member_coefficients(
+        num_decoys=3,
+        scheme="sqrt",
+        ref_weight=0.7,
+        decoy_total_weight=0.3,
+    ) == pytest.approx([0.5] * 4)
+
+
+def test_compute_ligand_conformer_member_coefficients_original_only_fallback():
+    assert compute_ligand_conformer_member_coefficients(
+        num_decoys=0,
+        scheme="weighted_mean",
+        ref_weight=0.7,
+        decoy_total_weight=0.3,
+    ) == [1.0]
+
+
+def test_ligand_conformer_staging_result_owns_runtime_sampling_contract():
+    staging_result = LigandConformerStagingResult(
+        root_dir=Path("/tmp/staged"),
+        pdb_paths=[
+            "/tmp/staged/input.cif",
+            "/tmp/staged/input_ligconf_1.cif",
+            "/tmp/staged/other.cif",
+            "/tmp/staged/other_ligconf_1.cif",
+            "/tmp/staged/single.cif",
+        ],
+        member_groups=[
+            ["/tmp/staged/input.cif", "/tmp/staged/input_ligconf_1.cif"],
+            ["/tmp/staged/other.cif", "/tmp/staged/other_ligconf_1.cif"],
+            ["/tmp/staged/single.cif"],
+        ],
+        sampling_inputs_df=None,
+        member_to_group_id={
+            "input": 0,
+            "input_ligconf_1": 0,
+            "other": 1,
+            "other_ligconf_1": 1,
+            "single": 2,
+        },
+        member_to_coefficient={
+            "input": 0.7,
+            "input_ligconf_1": 0.3,
+            "other": 0.7,
+            "other_ligconf_1": 0.3,
+            "single": 1.0,
+        },
+        member_to_target_id={
+            "input": "input",
+            "input_ligconf_1": "input",
+            "other": "other",
+            "other_ligconf_1": "other",
+            "single": "single",
+        },
+        aggregation_scheme="weighted_mean",
+        manifest_path=Path("/tmp/staged/ligand_conformer_manifest.csv"),
+    )
+    pos_constraint_df = pd.DataFrame(
+        [{"pdb_key": "input", "fixed_pos_seq": "A:1", "fixed_pos_scn": ""}]
+    )
+
+    assert staging_result.target_count() == 3
+    assert staging_result.target_count(
+        ["/tmp/staged/input.cif", "/tmp/staged/input_ligconf_1.cif"]
+    ) == 1
+    assert list(staging_result.iter_member_batches(max_members=3)) == [
+        ["/tmp/staged/input.cif", "/tmp/staged/input_ligconf_1.cif"],
+        [
+            "/tmp/staged/other.cif",
+            "/tmp/staged/other_ligconf_1.cif",
+            "/tmp/staged/single.cif",
+        ],
+    ]
+
+    expanded = staging_result.expand_pos_constraints(pos_constraint_df)
+
+    assert set(expanded["pdb_key"]) == {"input", "input_ligconf_1"}
+    decoy_row = expanded.set_index("pdb_key").loc["input_ligconf_1"]
+    assert decoy_row["fixed_pos_seq"] == "A:1"
+
+    batch = staging_result.annotate_batch(
+        {},
+        batch_pdb_paths=["/tmp/staged/input.cif", "/tmp/staged/input_ligconf_1.cif"],
+        device="cpu",
+    )
+
+    torch.testing.assert_close(batch["tied_sampling_ids"], torch.tensor([0, 0]))
+    assert batch["tied_sampling_aggregation_scheme"] == "weighted_mean"
+    torch.testing.assert_close(
+        batch["tied_sampling_weights"],
+        torch.tensor([0.7, 0.3]),
+    )
+
+
+def test_ligand_conformer_mean_annotation_omits_tied_weights():
+    staging_result = LigandConformerStagingResult(
+        root_dir=Path("/tmp/staged"),
+        pdb_paths=["/tmp/staged/input.cif", "/tmp/staged/input_ligconf_1.cif"],
+        member_groups=[["/tmp/staged/input.cif", "/tmp/staged/input_ligconf_1.cif"]],
+        sampling_inputs_df=None,
+        member_to_group_id={"input": 0, "input_ligconf_1": 0},
+        member_to_coefficient={"input": 0.5, "input_ligconf_1": 0.5},
+        member_to_target_id={"input": "input", "input_ligconf_1": "input"},
+        aggregation_scheme="mean",
+        manifest_path=Path("/tmp/staged/ligand_conformer_manifest.csv"),
+    )
+
+    batch = staging_result.annotate_batch(
+        {},
+        batch_pdb_paths=["/tmp/staged/input.cif", "/tmp/staged/input_ligconf_1.cif"],
+        device="cpu",
+    )
+
+    assert batch["tied_sampling_aggregation_scheme"] == "mean"
+    assert "tied_sampling_weights" not in batch

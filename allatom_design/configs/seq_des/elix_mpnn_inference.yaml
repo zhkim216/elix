@@ -8,7 +8,6 @@ num_workers: 8  # number of workers for data loading
 
 # Sequence design options
 use_potts_sampling: true
-use_mlm_sampling: false  # if true, use MLM (order-agnostic autoregressive) sampling instead of Potts
 
 skip_sampling: false  # if true, skip sampling and just return potts parameters
 save_potts_params: false
@@ -31,10 +30,30 @@ potts_sampling_cfg:
   # CIF coordinates still come from the original unnoised input batch.
   ensemble_conditioning:
     enabled: false
-    num_ensembles: 1
-    reduce: "mean"  # mean = 1/M, sqrt = 1/sqrt(M)
+    total_members: 1
+    weights:
+      scheme: "mean"  # mean = 1/M, sqrt = 1/sqrt(M), weighted_mean = ref/decoy split
+      ref_weight: 0.7
+      decoy_total_weight: 0.3
     noise_seed: null
     save_noisy_inputs_dir: null
+    protein:
+      mode: "gaussian_noise"
+      noise_std: 0.0
+    metal:
+      mode: "gaussian_noise"
+      noise_std: 0.0
+    small_molecule:
+      mode: "gaussian_noise"  # gaussian_noise, ligand_conformer, or none
+      noise_std: 0.0
+      num_conformer_candidates: 50
+      rmsd_cluster_cutoff: 2.0
+      seed: null
+      num_threads: 1
+      uff_optimize: true
+      clash_target_atoms: "all_protein"  # sidechain, backbone, or all_protein
+      vdw_overlap_cutoff: 0.5
+      exclude_clashing_decoys: false
     noise_std:
       protein: 0.0
       metal: 0.0
@@ -56,14 +75,3 @@ potts_sampling_cfg:
     gamma_list: [0.0, 0.5, 1.0, 1.5, 2.0]   # gamma > 1 = CFG extrapolation
     uncond_mode: "protein_only"              # cond_uncond negative branch
     pocket_distance: 10.0                    # Å from any ligand atom to C-alpha for the pocket mask
-
-mlm_sampling_cfg:
-  num_steps: 50
-  temperature: 0.1
-  aatype_decoding_order_mode: "random"
-
-  timestep_schedule:
-    num_steps: ${mlm_sampling_cfg.num_steps}
-    mode: "linear"
-    t_start: 0.0
-    t_end: 1.0
