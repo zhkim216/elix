@@ -8,8 +8,16 @@ cutlass
 .agents/
 .codex/
 AGENTS.md
+CLAUDE.md
 PLANS.md
 code_review.md
+
+# Generated outputs and local scratch
+outputs/
+hydra_outputs/
+_workspace/
+rounds/
+euclidean_fast_attention/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -250,6 +258,7 @@ claude-code-best-practice/
 
 # Local Codex/agent harness files
 AGENTS.md
+CLAUDE.md
 PLANS.md
 code_review.md
 .agents/
