@@ -13,6 +13,7 @@ from rdkit import Chem
 
 from allatom_design.data.transform.ligand_conformers import (
     compute_ligand_protein_clash_metrics,
+    find_query_small_molecule_ligands,
     select_target_ligand,
     _conformer_coords,
     _generate_candidate_mol,
@@ -25,6 +26,7 @@ from allatom_design.eval.utils.cfg_utils import (
     resolve_sampling_cfg,
 )
 from allatom_design.eval.utils import ensemble_conditioning as ensemble_conditioning_module
+from allatom_design.eval.utils import ligand_conformer_retrieval as ligand_conformer_retrieval_module
 from allatom_design.eval.utils.ensemble_conditioning import (
     DEFAULT_ENSEMBLE_CONDITIONING_CFG,
     apply_ensemble_noise,
@@ -35,6 +37,7 @@ from allatom_design.eval.utils.ensemble_conditioning import (
 from allatom_design.eval.utils.ligand_conformer_retrieval import (
     LigandConformerStagingResult,
     compute_ligand_conformer_member_coefficients,
+    stage_ligand_conformer_ensembles,
     _manifest_row,
 )
 
@@ -453,6 +456,42 @@ def _make_atom_array_for_metal_ligand_selection() -> AtomArray:
     return atom_array
 
 
+def _make_atom_array_for_metal_only_query() -> AtomArray:
+    atom_array = AtomArray(5)
+    atom_array.coord = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.4, 0.0, 0.0],
+            [2.0, 1.0, 0.0],
+            [2.0, 2.0, 0.0],
+            [5.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    atom_array.atom_name = np.array(["N", "CA", "C", "O", "CA"])
+    atom_array.element = np.array(["N", "C", "C", "O", "CA"])
+    atom_array.res_name = np.array(["ALA", "ALA", "ALA", "ALA", "CA"])
+    atom_array.hetero = np.array([False, False, False, False, True])
+    atom_array.occupancy = np.ones(5, dtype=np.float32)
+    atom_array.set_annotation(
+        "chain_type",
+        np.array(
+            [
+                aw_enums.ChainType.POLYPEPTIDE_L.value,
+                aw_enums.ChainType.POLYPEPTIDE_L.value,
+                aw_enums.ChainType.POLYPEPTIDE_L.value,
+                aw_enums.ChainType.POLYPEPTIDE_L.value,
+                aw_enums.ChainType.NON_POLYMER.value,
+            ]
+        ),
+    )
+    atom_array.set_annotation(
+        "pn_unit_iid",
+        np.array(["A_1", "A_1", "A_1", "A_1", "M_1"]),
+    )
+    return atom_array
+
+
 def test_atomworks_only_metal_elements_are_excluded_from_ligand_selection():
     assert "U" in METAL_ELEMENTS
     atom_array = _make_atom_array_for_metal_ligand_selection()
@@ -462,6 +501,20 @@ def test_atomworks_only_metal_elements_are_excluded_from_ligand_selection():
     assert target.pn_unit_iid == "L_1"
     with pytest.raises(ValueError, match="found 0"):
         select_target_ligand(atom_array, query_pn_unit_iids=["U_1"])
+
+
+def test_query_small_molecule_ligand_helper_can_return_zero_for_metal_query():
+    atom_array = _make_atom_array_for_metal_only_query()
+
+    assert (
+        find_query_small_molecule_ligands(
+            atom_array,
+            query_pn_unit_iids=["A_1", "M_1"],
+        )
+        == []
+    )
+    with pytest.raises(ValueError, match="found 0"):
+        select_target_ligand(atom_array, query_pn_unit_iids=["A_1", "M_1"])
 
 
 def test_metal_elements_constant_aliases_atomworks_source_of_truth():
@@ -601,6 +654,19 @@ def test_compute_ligand_conformer_member_coefficients_uses_weighted_mean_split()
     assert sum(coefficients) == pytest.approx(1.0)
 
 
+def test_compute_ligand_conformer_member_coefficients_splits_fallback_copies():
+    coefficients = compute_ligand_conformer_member_coefficients(
+        num_decoys=1,
+        num_fallback_copies=2,
+        scheme="weighted_mean",
+        ref_weight=0.7,
+        decoy_total_weight=0.3,
+    )
+
+    assert coefficients == pytest.approx([0.7, 0.1, 0.1, 0.1])
+    assert sum(coefficients) == pytest.approx(1.0)
+
+
 def test_compute_ligand_conformer_member_coefficients_mean_and_sqrt():
     assert compute_ligand_conformer_member_coefficients(
         num_decoys=3,
@@ -623,6 +689,70 @@ def test_compute_ligand_conformer_member_coefficients_original_only_fallback():
         ref_weight=0.7,
         decoy_total_weight=0.3,
     ) == [1.0]
+
+
+def test_ligand_conformer_staging_uses_fallback_original_copies_for_metal_query(
+    monkeypatch,
+    tmp_path,
+):
+    atom_array = _make_atom_array_for_metal_only_query()
+    saved_paths = []
+
+    def fake_load_example_with_parse(path, cif_parse_cfg):
+        return {"atom_array": atom_array.copy()}
+
+    def fake_save_cif_file(atom_array, out_file, cif_save_cfg=None):
+        out_file = Path(out_file)
+        saved_paths.append(out_file)
+        out_file.write_text(out_file.stem)
+
+    monkeypatch.setattr(
+        ligand_conformer_retrieval_module,
+        "load_example_with_parse",
+        fake_load_example_with_parse,
+    )
+    monkeypatch.setattr(
+        ligand_conformer_retrieval_module,
+        "save_cif_file",
+        fake_save_cif_file,
+    )
+    sampling_inputs_df = pd.DataFrame(
+        [{"pdb_id": "metal", "query_pn_unit_iids": "['A_1', 'M_1']"}]
+    )
+
+    staging = stage_ligand_conformer_ensembles(
+        pdb_paths=["/inputs/metal.cif"],
+        out_dir=tmp_path,
+        ensemble_cfg={
+            "enabled": True,
+            "total_members": 3,
+            "weights": {"scheme": "mean"},
+            "small_molecule": {"mode": "ligand_conformer"},
+        },
+        sampling_inputs_df=sampling_inputs_df,
+        cif_parse_cfg=None,
+        cif_save_cfg=None,
+    )
+    manifest = pd.read_csv(staging.manifest_path)
+
+    assert [Path(path).name for path in staging.member_groups[0]] == [
+        "metal.cif",
+        "metal_ligconf_1.cif",
+        "metal_ligconf_2.cif",
+    ]
+    assert [path.name for path in saved_paths] == [
+        "metal.cif",
+        "metal_ligconf_1.cif",
+        "metal_ligconf_2.cif",
+    ]
+    assert manifest["member_role"].tolist() == [
+        "original",
+        "fallback_original_copy",
+        "fallback_original_copy",
+    ]
+    assert manifest["member_coefficient"].tolist() == pytest.approx([1 / 3] * 3)
+    assert manifest["target_ligand_pn_unit_iid"].isna().all()
+    assert manifest["warning"].str.contains("fallback_original_copy: count=2").all()
 
 
 def test_ligand_conformer_staging_result_owns_runtime_sampling_contract():

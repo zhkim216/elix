@@ -10,8 +10,8 @@ from omegaconf import DictConfig
 
 from allatom_design.data.transform.ligand_conformers import (
     compute_ligand_protein_clash_metrics,
+    find_query_small_molecule_ligands,
     generate_ligand_conformer_decoys,
-    select_target_ligand,
 )
 from allatom_design.eval.utils.data_utils import (
     _matched_sampling_input_row,
@@ -115,7 +115,8 @@ def stage_ligand_conformer_ensembles(
     root_dir = Path(out_dir) / "samples_with_ligand_conformers"
     root_dir.mkdir(parents=True, exist_ok=True)
 
-    max_decoys = max(int(cfg["total_members"]) - 1, 0)
+    total_members = int(cfg["total_members"])
+    max_decoys = max(total_members - 1, 0)
     seed = small_molecule_cfg["seed"]
     if seed is None:
         seed = cfg["noise_seed"]
@@ -146,21 +147,34 @@ def stage_ligand_conformer_ensembles(
 
         example = load_example_with_parse(str(input_path), cif_parse_cfg)
         atom_array = example["atom_array"]
-        target_ligand = select_target_ligand(
+        target_ligand_candidates = find_query_small_molecule_ligands(
             atom_array,
             query_pn_unit_iids=query_pn_unit_iids or None,
         )
-        original_clash_metrics = compute_ligand_protein_clash_metrics(
-            atom_array,
-            ligand_mask=target_ligand.heavy_mask,
-            clash_target_atoms=small_molecule_cfg["clash_target_atoms"],
-            vdw_overlap_cutoff=small_molecule_cfg["vdw_overlap_cutoff"],
-        )
-
         warnings: list[str] = []
+        if len(target_ligand_candidates) > 1:
+            raise ValueError(
+                "Expected at most one query small-molecule ligand for "
+                "ligand_conformer ensemble conditioning, found "
+                f"{len(target_ligand_candidates)} for target_sample_id="
+                f"{target_sample_id}"
+            )
+        if target_ligand_candidates:
+            target_ligand = target_ligand_candidates[0]
+            original_clash_metrics = compute_ligand_protein_clash_metrics(
+                atom_array,
+                ligand_mask=target_ligand.heavy_mask,
+                clash_target_atoms=small_molecule_cfg["clash_target_atoms"],
+                vdw_overlap_cutoff=small_molecule_cfg["vdw_overlap_cutoff"],
+            )
+        else:
+            target_ligand = None
+            original_clash_metrics = None
+            warnings.append("no_query_small_molecule_ligand")
+
         decoys = []
         generation_metadata: dict[str, Any] = {}
-        if max_decoys > 0:
+        if target_ligand is not None and max_decoys > 0:
             try:
                 generation_result = generate_ligand_conformer_decoys(
                     atom_array,
@@ -201,9 +215,16 @@ def stage_ligand_conformer_ensembles(
                 "fewer_ligand_conformer_decoys_than_requested: "
                 f"requested={max_decoys}, selected={len(selected_decoys)}"
             )
+        num_fallback_copies = max_decoys - len(selected_decoys)
+        if num_fallback_copies > 0:
+            warnings.append(
+                "fallback_original_copy: "
+                f"count={num_fallback_copies}"
+            )
 
         coefficients = compute_ligand_conformer_member_coefficients(
             num_decoys=len(selected_decoys),
+            num_fallback_copies=num_fallback_copies,
             scheme=cfg["weights"]["scheme"],
             ref_weight=cfg["weights"]["ref_weight"],
             decoy_total_weight=cfg["weights"]["decoy_total_weight"],
@@ -227,7 +248,9 @@ def stage_ligand_conformer_ensembles(
             )
         )
 
-        for decoy_idx, decoy in enumerate(selected_decoys, start=1):
+        member_idx = 1
+        for decoy in selected_decoys:
+            decoy_idx = member_idx
             decoy_out_path = root_dir / f"{target_sample_id}_ligconf_{decoy_idx}.cif"
             save_cif_file(decoy.atom_array, decoy_out_path, cif_save_cfg=cif_save_cfg)
             group_paths.append(str(decoy_out_path))
@@ -247,6 +270,25 @@ def stage_ligand_conformer_ensembles(
                     candidate_seed=decoy.candidate_seed,
                     rmsd_to_native=decoy.rmsd_to_native,
                     atom_order_rmsd_to_native=decoy.atom_order_rmsd_to_native,
+                    generation_metadata=generation_metadata,
+                )
+            )
+            member_idx += 1
+
+        for fallback_idx in range(member_idx, max_decoys + 1):
+            fallback_out_path = root_dir / f"{target_sample_id}_ligconf_{fallback_idx}.cif"
+            save_cif_file(atom_array, fallback_out_path, cif_save_cfg=cif_save_cfg)
+            group_paths.append(str(fallback_out_path))
+            manifest_rows.append(
+                _manifest_row(
+                    target_sample_id=target_sample_id,
+                    member_sample_id=fallback_out_path.stem,
+                    member_path=fallback_out_path,
+                    member_role="fallback_original_copy",
+                    member_coefficient=coefficients[fallback_idx],
+                    target_ligand=target_ligand,
+                    clash_metrics=original_clash_metrics,
+                    warning="; ".join(warnings),
                     generation_metadata=generation_metadata,
                 )
             )
@@ -299,13 +341,17 @@ def stage_ligand_conformer_ensembles(
 def compute_ligand_conformer_member_coefficients(
     *,
     num_decoys: int,
+    num_fallback_copies: int = 0,
     scheme: str,
     ref_weight: float,
     decoy_total_weight: float,
 ) -> list[float]:
     if num_decoys < 0:
         raise ValueError("num_decoys must be non-negative")
-    num_members = num_decoys + 1
+    if num_fallback_copies < 0:
+        raise ValueError("num_fallback_copies must be non-negative")
+    num_non_original_members = num_decoys + num_fallback_copies
+    num_members = num_non_original_members + 1
     if scheme == "mean":
         return [1.0 / num_members] * num_members
     if scheme == "sqrt":
@@ -317,14 +363,17 @@ def compute_ligand_conformer_member_coefficients(
         )
     if ref_weight < 0 or decoy_total_weight < 0:
         raise ValueError("member coefficients must be non-negative")
-    if num_decoys == 0:
+    if num_non_original_members == 0:
         return [1.0]
     total = float(ref_weight) + float(decoy_total_weight)
     if total <= 0:
         raise ValueError("member coefficients must have positive total")
     return [
         float(ref_weight) / total,
-        *([float(decoy_total_weight) / total / num_decoys] * num_decoys),
+        *(
+            [float(decoy_total_weight) / total / num_non_original_members]
+            * num_non_original_members
+        ),
     ]
 
 
@@ -449,8 +498,8 @@ def _manifest_row(
     member_path: Path,
     member_role: str,
     member_coefficient: float,
-    target_ligand: Any,
-    clash_metrics: dict[str, Any],
+    target_ligand: Any | None,
+    clash_metrics: dict[str, Any] | None,
     warning: str,
     rank: int | None = None,
     cluster_id: int | None = None,
@@ -466,8 +515,12 @@ def _manifest_row(
         "member_path": str(member_path),
         "member_role": member_role,
         "member_coefficient": float(member_coefficient),
-        "target_ligand_pn_unit_iid": target_ligand.pn_unit_iid,
-        "target_ligand_res_name": target_ligand.res_name,
+        "target_ligand_pn_unit_iid": (
+            None if target_ligand is None else target_ligand.pn_unit_iid
+        ),
+        "target_ligand_res_name": (
+            None if target_ligand is None else target_ligand.res_name
+        ),
         "rank": rank,
         "cluster_id": cluster_id,
         "rdkit_conformer_id": rdkit_conformer_id,
@@ -475,12 +528,22 @@ def _manifest_row(
         "rmsd_to_native": rmsd_to_native,
         "get_best_rms_to_native": rmsd_to_native,
         "atom_order_rmsd_to_native": atom_order_rmsd_to_native,
-        "has_clash": bool(clash_metrics["has_clash"]),
-        "num_clashing_pairs": int(clash_metrics["num_clashing_pairs"]),
-        "min_heavy_atom_distance": clash_metrics["min_heavy_atom_distance"],
-        "max_vdw_overlap": clash_metrics["max_vdw_overlap"],
-        "clash_target_atoms": clash_metrics["clash_target_atoms"],
-        "vdw_overlap_cutoff": clash_metrics["vdw_overlap_cutoff"],
+        "has_clash": None if clash_metrics is None else bool(clash_metrics["has_clash"]),
+        "num_clashing_pairs": (
+            None if clash_metrics is None else int(clash_metrics["num_clashing_pairs"])
+        ),
+        "min_heavy_atom_distance": (
+            None if clash_metrics is None else clash_metrics["min_heavy_atom_distance"]
+        ),
+        "max_vdw_overlap": (
+            None if clash_metrics is None else clash_metrics["max_vdw_overlap"]
+        ),
+        "clash_target_atoms": (
+            None if clash_metrics is None else clash_metrics["clash_target_atoms"]
+        ),
+        "vdw_overlap_cutoff": (
+            None if clash_metrics is None else clash_metrics["vdw_overlap_cutoff"]
+        ),
         "warning": warning,
     }
     if generation_metadata:

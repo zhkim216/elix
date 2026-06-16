@@ -59,13 +59,11 @@ def select_target_ligand(
     query_pn_unit_iids: list[str] | None = None,
 ) -> TargetLigand:
     """Select one non-metal small-molecule ligand for conformer generation."""
-    candidates = _small_molecule_ligand_groups(atom_array)
+    candidates = find_query_small_molecule_ligands(
+        atom_array,
+        query_pn_unit_iids=query_pn_unit_iids,
+    )
     if query_pn_unit_iids:
-        query_ids = {str(pn_unit_iid) for pn_unit_iid in query_pn_unit_iids}
-        candidates = [
-            candidate for candidate in candidates
-            if candidate.pn_unit_iid in query_ids
-        ]
         if len(candidates) != 1:
             raise ValueError(
                 "Expected exactly one query small-molecule ligand, "
@@ -79,6 +77,22 @@ def select_target_ligand(
             f"non-metal small-molecule ligand, found {len(candidates)}"
         )
     return candidates[0]
+
+
+def find_query_small_molecule_ligands(
+    atom_array: AtomArray,
+    *,
+    query_pn_unit_iids: list[str] | None = None,
+) -> list[TargetLigand]:
+    """Return non-metal small-molecule ligands matching query PN-unit IDs."""
+    candidates = _small_molecule_ligand_groups(atom_array)
+    if not query_pn_unit_iids:
+        return candidates
+    query_ids = {str(pn_unit_iid) for pn_unit_iid in query_pn_unit_iids}
+    return [
+        candidate for candidate in candidates
+        if candidate.pn_unit_iid in query_ids
+    ]
 
 
 def generate_ligand_conformer_decoys(
