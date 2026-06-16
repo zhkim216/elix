@@ -6,10 +6,10 @@
 # Optional focused run:
 #   CONFIG_IDX=4 <submit command above>
 # Fixed exp7_cfg6 pocket step 82500 / exp1_cfg0 scaffold step 32500.
-# Array layout is CONFIG_IDX x CHUNK_IDX = 7 x 4.
+# Array layout is CONFIG_IDX x CHUNK_IDX = 7 x 8.
 #SBATCH --job-name=eval_exp7c6_exp1c0_native_ens_cfg
 #SBATCH -p possu,bioe
-#SBATCH --array=0-27
+#SBATCH --array=0-55
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
@@ -37,7 +37,7 @@ SCAFFOLD_METAL_NOISE_STD=0.0
 DIRECTION=ps
 POCKET_DISTANCE=10.0
 POCKET_ANNOTATION_METHOD=calpha
-NUM_CHUNKS=4
+NUM_CHUNKS=8
 
 BATCH_SIZE=8
 NUM_POCKET_SEQS_PER_PDB=2
