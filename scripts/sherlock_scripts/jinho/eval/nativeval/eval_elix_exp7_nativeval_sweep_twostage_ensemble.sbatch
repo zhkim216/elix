@@ -6,11 +6,11 @@
 # Optional focused runs:
 #   POCKET_MODEL_FILTER=elix_exp7_cfg6_context_skip_decoder_skip STEP_FILTER=82500 <submit command above>
 #   POCKET_MODEL_FILTER=6 STEP_FILTER=82500 <submit command above>
-# Sweeps exp7 cfg0-7 pocket models x pocket steps x chunks.
-# Array layout for the full sweep is 8 x 5 x 4 = 160 tasks.
+# Sweeps existing exp7 cfg2-7 pocket models x pocket steps x chunks.
+# Array layout for the full sweep is 6 x 5 x 4 = 120 tasks.
 #SBATCH --job-name=eval_exp7_native_ts_ens
 #SBATCH -p possu,bioe
-#SBATCH --array=0-159
+#SBATCH --array=0-119
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
@@ -27,14 +27,12 @@ TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-8}"
 
 POCKET_MODEL_ROWS=(
-  "0|elix_exp7_cfg0_node_concat_base"
-  "1|elix_exp7_cfg1_node_concat_edge_update"
-  "2|elix_exp7_cfg2_node_concat_decoder_skip"
-  "3|elix_exp7_cfg3_node_concat_edge_update_decoder_skip"
-  "4|elix_exp7_cfg4_context_skip_potts_only"
-  "5|elix_exp7_cfg5_context_skip_edge_update"
-  "6|elix_exp7_cfg6_context_skip_decoder_skip"
-  "7|elix_exp7_cfg7_context_skip_edge_update_decoder_skip"
+  "2|elix_exp7_cfg2_node_concat_decoder_skip|mg_proto_no_filter"
+  "3|elix_exp7_cfg3_node_concat_edge_update_decoder_skip|mg_proto_pertokenavg_gpt"
+  "4|elix_exp7_cfg4_context_skip_potts_only|mg_proto_pertokenavg_no_filter"
+  "5|elix_exp7_cfg5_context_skip_edge_update|mg_proto_pertokenavg_substring"
+  "6|elix_exp7_cfg6_context_skip_decoder_skip|mg_proto_substring"
+  "7|elix_exp7_cfg7_context_skip_edge_update_decoder_skip|"
 )
 POCKET_STEPS=(22500 42500 62500 82500 102500)
 POCKET_TOTAL_MEMBERS=16
@@ -76,21 +74,21 @@ matches_model_filter() {
 
 print_valid_filters() {
   echo "Valid STEP_FILTER values: all ${POCKET_STEPS[*]}" >&2
-  echo "Valid POCKET_MODEL_FILTER values: all, cfg index 0-7, cfg0-cfg7, or full model name:" >&2
+  echo "Valid POCKET_MODEL_FILTER values: all, cfg index 2-7, cfg2-cfg7, or full model name:" >&2
   for ROW in "${POCKET_MODEL_ROWS[@]}"; do
-    IFS='|' read -r FILTER_CFG_IDX FILTER_MODEL_NAME <<< "${ROW}"
+    IFS='|' read -r FILTER_CFG_IDX FILTER_MODEL_NAME FILTER_MODEL_NOTE <<< "${ROW}"
     echo "  ${FILTER_CFG_IDX} cfg${FILTER_CFG_IDX} ${FILTER_MODEL_NAME}" >&2
   done
 }
 
-# Each combo is "cfg_idx|pocket_model|pocket_step".
+# Each combo is "cfg_idx|pocket_model|model_note|pocket_step".
 COMBOS=()
 for ROW in "${POCKET_MODEL_ROWS[@]}"; do
-  IFS='|' read -r CANDIDATE_CFG_IDX CANDIDATE_MODEL_NAME <<< "${ROW}"
+  IFS='|' read -r CANDIDATE_CFG_IDX CANDIDATE_MODEL_NAME CANDIDATE_MODEL_NOTE <<< "${ROW}"
   matches_model_filter "${CANDIDATE_CFG_IDX}" "${CANDIDATE_MODEL_NAME}" || continue
   for CANDIDATE_POCKET_STEP in "${POCKET_STEPS[@]}"; do
     matches_step_filter "${CANDIDATE_POCKET_STEP}" || continue
-    COMBOS+=("${CANDIDATE_CFG_IDX}|${CANDIDATE_MODEL_NAME}|${CANDIDATE_POCKET_STEP}")
+    COMBOS+=("${CANDIDATE_CFG_IDX}|${CANDIDATE_MODEL_NAME}|${CANDIDATE_MODEL_NOTE}|${CANDIDATE_POCKET_STEP}")
   done
 done
 
@@ -106,8 +104,8 @@ NUM_TASKS=$((NUM_COMBOS * NUM_CHUNKS))
 if [[ "${PRINT_ARRAY_PLAN}" == "true" ]]; then
   echo "Selected exp7 pocket / exp1_cfg0 scaffold nativeval two-stage ensemble sweep: NUM_COMBOS=${NUM_COMBOS}, NUM_CHUNKS=${NUM_CHUNKS}, NUM_TASKS=${NUM_TASKS}"
   for COMBO_IDX in "${!COMBOS[@]}"; do
-    IFS='|' read -r PLAN_CFG_IDX PLAN_MODEL_NAME PLAN_POCKET_STEP <<< "${COMBOS[$COMBO_IDX]}"
-    echo "combo_idx=${COMBO_IDX} cfg=${PLAN_CFG_IDX} pocket_model=${PLAN_MODEL_NAME} pocket_step=${PLAN_POCKET_STEP} pocket_total_members=${POCKET_TOTAL_MEMBERS} pocket_noise(p:sm:m)=${POCKET_PROTEIN_NOISE_STD}:${POCKET_SMALL_MOLECULE_NOISE_STD}:${POCKET_METAL_NOISE_STD} scaffold_model=${SCAFFOLD_MODEL_NAME} scaffold_step=${SCAFFOLD_STEP}"
+    IFS='|' read -r PLAN_CFG_IDX PLAN_MODEL_NAME PLAN_MODEL_NOTE PLAN_POCKET_STEP <<< "${COMBOS[$COMBO_IDX]}"
+    echo "combo_idx=${COMBO_IDX} cfg=${PLAN_CFG_IDX} pocket_model=${PLAN_MODEL_NAME} model_note=${PLAN_MODEL_NOTE:-none} pocket_step=${PLAN_POCKET_STEP} pocket_total_members=${POCKET_TOTAL_MEMBERS} pocket_noise(p:sm:m)=${POCKET_PROTEIN_NOISE_STD}:${POCKET_SMALL_MOLECULE_NOISE_STD}:${POCKET_METAL_NOISE_STD} scaffold_model=${SCAFFOLD_MODEL_NAME} scaffold_step=${SCAFFOLD_STEP}"
   done
   exit 0
 fi
@@ -119,7 +117,7 @@ fi
 
 COMBO_IDX=$((TASK_ID / NUM_CHUNKS))
 CHUNK_IDX=$((TASK_ID % NUM_CHUNKS))
-IFS='|' read -r POCKET_CFG_IDX POCKET_MODEL_NAME POCKET_STEP <<< "${COMBOS[$COMBO_IDX]}"
+IFS='|' read -r POCKET_CFG_IDX POCKET_MODEL_NAME POCKET_MODEL_NOTE POCKET_STEP <<< "${COMBOS[$COMBO_IDX]}"
 
 POCKET_PROTEIN_NOISE_LABEL=${POCKET_PROTEIN_NOISE_STD//./p}
 POCKET_SMALL_MOLECULE_NOISE_LABEL=${POCKET_SMALL_MOLECULE_NOISE_STD//./p}
@@ -179,7 +177,7 @@ else
 fi
 
 echo "Starting exp7 pocket / exp1_cfg0 scaffold nativeval two-stage ensemble sweep: task=${TASK_ID}/${NUM_TASKS}, combo=${COMBO_IDX}/${NUM_COMBOS}, chunk=${CHUNK_IDX}/${NUM_CHUNKS}"
-echo "Stage1 pocket: cfg=${POCKET_CFG_IDX}, model=${POCKET_MODEL_NAME}, step=${POCKET_STEP}, total_members=${POCKET_TOTAL_MEMBERS}, protein_noise_std=${POCKET_PROTEIN_NOISE_STD}, small_molecule_noise_std=${POCKET_SMALL_MOLECULE_NOISE_STD}, metal_noise_std=${POCKET_METAL_NOISE_STD}"
+echo "Stage1 pocket: cfg=${POCKET_CFG_IDX}, model=${POCKET_MODEL_NAME}, model_note=${POCKET_MODEL_NOTE:-none}, step=${POCKET_STEP}, total_members=${POCKET_TOTAL_MEMBERS}, protein_noise_std=${POCKET_PROTEIN_NOISE_STD}, small_molecule_noise_std=${POCKET_SMALL_MOLECULE_NOISE_STD}, metal_noise_std=${POCKET_METAL_NOISE_STD}"
 echo "Stage2 scaffold: model=${SCAFFOLD_MODEL_NAME}, step=${SCAFFOLD_STEP}, total_members=${SCAFFOLD_TOTAL_MEMBERS}, protein_noise_std=${SCAFFOLD_PROTEIN_NOISE_STD}, small_molecule_noise_std=${SCAFFOLD_SMALL_MOLECULE_NOISE_STD}, metal_noise_std=${SCAFFOLD_METAL_NOISE_STD}"
 echo "Filters: POCKET_MODEL_FILTER=${POCKET_MODEL_FILTER}, STEP_FILTER=${STEP_FILTER}"
 echo "Stage sampling counts: pocket=${NUM_POCKET_SEQS_PER_PDB}, scaffold=${NUM_SCAFFOLD_SEQS_PER_PDB}"
