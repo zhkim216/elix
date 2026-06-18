@@ -26,7 +26,7 @@ echo "Starting shard ${SLURM_ARRAY_TASK_ID}/${NUM_SHARDS} for atomworks_pdb_full
 
 # Run script
 python3 allatom_design/data/preprocessing/atomworks/preprocess_examples.py \
-    --config-path=/home/users/zhkim216/code/allatom-design/allatom_design/configs/data/preprocessing/atomworks \
+    --config-path=/home/users/zhkim216/code/allatom-design/allatom_design/configs/preprocessing \
     --config-name=preprocess_examples \
     mmcif_dir=${PDB_MIRROR_PATH} \
     out_dir=/scratch/users/zhkim216/datasets/atomworks_pdb_full_v8 \

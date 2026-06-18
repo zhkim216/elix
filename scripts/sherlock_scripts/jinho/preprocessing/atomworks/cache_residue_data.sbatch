@@ -28,8 +28,8 @@ echo "[sbatch] NUM_SHARDS=$NUM_SHARDS (from array [$MIN-$MAX])"
 
 # Run script
 python3 allatom_design/data/preprocessing/atomworks/cache_residue_data.py \
-    --config-dir allatom_design/configs/data/preprocessing/atomworks \
-    --config-name cache_residue_data.yaml \
+    --config-path=/home/users/zhkim216/code/allatom-design/allatom_design/configs/preprocessing \
+    --config-name cache_residue_data \
     out_dir=/scratch/users/zhkim216/datasets \
     ccd_dir=/scratch/users/zhkim216/datasets/ccd_mirror \
     num_workers=${SLURM_CPUS_PER_TASK} \
@@ -42,4 +42,3 @@ python3 allatom_design/data/preprocessing/atomworks/cache_residue_data.py \
     generate_conformers_kwargs.optimize=true \
     generate_conformers_kwargs.num_threads=2 \
     generate_conformers_kwargs.hydrogen_policy=remove
-    
