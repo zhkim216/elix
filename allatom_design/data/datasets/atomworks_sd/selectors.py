@@ -28,6 +28,21 @@ def _get_allowed_ccd_codes(allowed_ccd_codes: list[str] | None) -> set[str]:
 
 def metal_center_mask(metadata_df: pd.DataFrame, cfg: dict | DictConfig) -> pd.Series:
     cfg = cfg or {}
+    if "bml_center" in cfg:
+        cfg = {
+            "external_evidence_policy": cfg.get("bml_center", {}).get("metal", {}).get(
+                "external_evidence_policy",
+                "no_filter",
+            ),
+            "allowed_ccd_codes": cfg.get("bml_center", {}).get("metal", {}).get(
+                "allowed_ccd_codes",
+                None,
+            ),
+            "min_avg_occupancy_nonpolymer": cfg.get("bml_center", {}).get("metal", {}).get(
+                "min_avg_occupancy_nonpolymer",
+                0.5,
+            ),
+        }
     allowed_codes = _get_allowed_ccd_codes(cfg.get("allowed_ccd_codes", None))
     min_occupancy = float(cfg.get("min_avg_occupancy_nonpolymer", 0.5))
     evidence_policy = cfg.get(
@@ -56,13 +71,31 @@ def metal_center_mask(metadata_df: pd.DataFrame, cfg: dict | DictConfig) -> pd.S
 
 def small_molecule_center_mask(metadata_df: pd.DataFrame, cfg: dict | DictConfig) -> pd.Series:
     cfg = cfg or {}
+    if "bml_center" in cfg:
+        cfg = {
+            "small_molecule_artifact_external_evidence_policy": cfg.get("bml_center", {})
+            .get("small_molecule", {})
+            .get("artifact_external_evidence_policy", "no_filter"),
+            "min_contacting_protein_atoms_small_molecule": cfg.get("bml_center", {})
+            .get("small_molecule", {})
+            .get("min_contacting_protein_atoms", 20),
+            "min_contacting_protein_atom_ratio_small_molecule": cfg.get("bml_center", {})
+            .get("small_molecule", {})
+            .get("min_contacting_protein_atom_ratio", None),
+            "min_avg_occupancy_nonpolymer_small_molecule": cfg.get("bml_center", {})
+            .get("small_molecule", {})
+            .get("min_avg_occupancy_nonpolymer", 0.5),
+            "max_missing_atom_fraction_small_molecule": cfg.get("bml_center", {})
+            .get("small_molecule", {})
+            .get("max_missing_atom_fraction", 0.2),
+        }
     min_contacts = cfg.get("min_contacting_protein_atoms_small_molecule", 20)
     min_contact_ratio = cfg.get("min_contacting_protein_atom_ratio_small_molecule", None)
     min_occupancy = cfg.get("min_avg_occupancy_nonpolymer_small_molecule", 0.5)
     max_missing_fraction = cfg.get("max_missing_atom_fraction_small_molecule", 0.2)
     evidence_policy = cfg.get(
         "small_molecule_artifact_external_evidence_policy",
-        cfg.get("small_molecule_artifact_external_evidence_policy", "no_filter"),
+        cfg.get("small_molecule_external_evidence_policy", "no_filter"),
     )
 
     is_small_molecule = metadata_df["q_pn_unit_is_small_molecule"].fillna(False).astype(bool)

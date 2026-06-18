@@ -30,12 +30,19 @@ from allatom_design.data.utils.pn_unit import (
     series_has_any_exact_ccd,
 )
 
+from allatom_design.data.datasets.atomworks_sd.bml_context import (
+    BMLPolicy,
+    BML_CENTER_METAL_COL,
+    BML_CENTER_SMALL_MOLECULE_COL,
+    CONTEXT_FLAG_COLUMNS,
+    annotate_bml_context,
+    ensure_bml_context_annotations,
+    has_nested_bml_config,
+)
 from allatom_design.data.datasets.atomworks_sd.interface import build_interface_df
 from allatom_design.data.datasets.atomworks_sd.selectors import (
-    metal_center_mask,
     nucleic_acid_ligand_center_mask,
     peptide_center_mask,
-    small_molecule_center_mask,
 )
 
 logger = logging.getLogger(__name__)
@@ -114,6 +121,7 @@ def add_derived_pn_unit_flags(
 ) -> pd.DataFrame:
     out = metadata_df.copy()
     cfg = cfg or {}
+    bml_policy = BMLPolicy.from_cfg(cfg) if has_nested_bml_config(cfg) else None
     nuc_chain_types = [chain_type.value for chain_type in aw_enums.ChainType.get_nucleic_acids()]
     if "q_pn_unit_is_nuc" not in out.columns:
         out["q_pn_unit_is_nuc"] = (
@@ -121,19 +129,33 @@ def add_derived_pn_unit_flags(
             & out.get("q_pn_unit_type", pd.Series(np.nan, index=out.index)).isin(nuc_chain_types)
         )
     if "q_pn_unit_nucleic_acid_group_id" not in out.columns:
+        nucleic_acid_policy = bml_policy.center.nucleic_acid if bml_policy is not None else None
         out = add_nucleic_acid_group_columns(
             out,
-            nucleic_acid_dist_threshold=cfg.get(
-                "nucleic_acid_group_distance_cutoff",
-                DEFAULT_NUCLEIC_ACID_GROUP_DISTANCE_CUTOFF,
+            nucleic_acid_dist_threshold=(
+                nucleic_acid_policy.group_distance_cutoff
+                if nucleic_acid_policy is not None
+                else cfg.get(
+                    "nucleic_acid_group_distance_cutoff",
+                    DEFAULT_NUCLEIC_ACID_GROUP_DISTANCE_CUTOFF,
+                )
             ),
-            nucleic_acid_ligand_max_residues=cfg.get(
-                "nucleic_acid_ligand_max_residues",
-                DEFAULT_NUCLEIC_ACID_LIGAND_MAX_RESIDUES,
+            nucleic_acid_ligand_max_residues=(
+                nucleic_acid_policy.ligand_max_residues
+                if nucleic_acid_policy is not None
+                else cfg.get(
+                    "nucleic_acid_ligand_max_residues",
+                    DEFAULT_NUCLEIC_ACID_LIGAND_MAX_RESIDUES,
+                )
             ),
         )
     if "q_pn_unit_is_artifact" not in out.columns:
-        artifact_codes = load_small_molecule_artifact_codes(cfg)
+        artifact_cfg = (
+            bml_policy.center.small_molecule.as_selector_cfg()
+            if bml_policy is not None
+            else cfg
+        )
+        artifact_codes = load_small_molecule_artifact_codes(artifact_cfg)
         out["q_pn_unit_is_artifact"] = series_has_any_exact_ccd(
             out.get("q_pn_unit_non_polymer_res_names"),
             artifact_codes,
@@ -180,7 +202,7 @@ def add_chain_counts_info(df: pd.DataFrame) -> pd.DataFrame:
     if "protein_cluster_multiset" in df.columns:
         df["n_prot"] = df["protein_cluster_multiset"].apply(lambda clusters: len(clusters))
         interface_type = df.get("interface_type", pd.Series("", index=df.index)).fillna("")
-        df["n_nuc"] = 0 # (interface_type == "nuc_lig_protein").astype(int) #! need to change 260608
+        df["n_nuc"] = (interface_type == "nuc_lig_protein").astype(int)
         df["n_nuc_ligand"] = (interface_type == "nuc_lig_protein").astype(int)
         df["n_peptide"] = (interface_type == "peptide_protein").astype(int)
         df["n_small_molecule"] = (interface_type == "bmsm_protein").astype(int)
@@ -249,6 +271,7 @@ def process_train_metadata_df(
     allowed_evidence_columns: list[str],
     phase: str,
 ) -> tuple[pd.DataFrame, list]:
+    BMLPolicy.from_cfg(cfg)
     metadata_df = read_parquet_with_metadata(metadata_path)
     metadata_df = ensure_example_id_column(metadata_df)
     metadata_df = add_cluster_id_columns(metadata_df, cfg)
@@ -262,6 +285,7 @@ def process_train_metadata_df(
     metadata_df, val_cluster_ids = add_phase_split(metadata_df, cfg)
     metadata_df = metadata_df[metadata_df["phase"] == phase]
     metadata_df = apply_filters(cfg.train_filters.metadata_filter, metadata_df)
+    metadata_df = annotate_bml_context(metadata_df, cfg)
     if cfg.query_pn_unit_iids_only:
         metadata_df = filter_metadata_to_query_pn_unit_iids_only(metadata_df, cfg)
     return metadata_df, val_cluster_ids
@@ -345,21 +369,27 @@ def filter_metadata_to_query_pn_unit_iids_only(
     metadata_df: pd.DataFrame,
     cfg: DictConfig,
 ) -> pd.DataFrame:
+    metadata_df = ensure_bml_context_annotations(metadata_df, cfg)
     protein_df = apply_filters(
         cfg.train_filters.protein_monomer_chain_filter,
         metadata_df.copy(),
     )
     protein_mask = pd.Series(metadata_df.index.isin(protein_df.index), index=metadata_df.index)
-    metal_mask = metal_center_mask(metadata_df, cfg)
-    small_molecule_mask = small_molecule_center_mask(metadata_df, cfg)
+    metal_mask = metadata_df[BML_CENTER_METAL_COL].fillna(False).astype(bool)
+    small_molecule_mask = metadata_df[BML_CENTER_SMALL_MOLECULE_COL].fillna(False).astype(bool)
     peptide_mask = peptide_center_mask(metadata_df, cfg)
     nuc_ligand_mask = nucleic_acid_ligand_center_mask(metadata_df, cfg)
+    context_mask = pd.Series(False, index=metadata_df.index)
+    for col in CONTEXT_FLAG_COLUMNS:
+        if col in metadata_df.columns:
+            context_mask = context_mask | metadata_df[col].fillna(False).astype(bool)
     keep_mask = (
         protein_mask
         | metal_mask
         | small_molecule_mask
         | peptide_mask
         | nuc_ligand_mask
+        | context_mask
     )
 
     out = metadata_df[keep_mask].copy()
@@ -369,7 +399,7 @@ def filter_metadata_to_query_pn_unit_iids_only(
         "Filtered train metadata to scope: %d -> %d rows "
         "(protein_monomer_candidates=%d, metal_center_candidates=%d, "
         "small_molecule_center_candidates=%d, peptide_center_candidates=%d, "
-        "nuc_ligand_center_candidates=%d).",
+        "nuc_ligand_center_candidates=%d, context_candidates=%d).",
         len(metadata_df),
         len(out),
         int(protein_mask.sum()),
@@ -377,6 +407,7 @@ def filter_metadata_to_query_pn_unit_iids_only(
         int(small_molecule_mask.sum()),
         int(peptide_mask.sum()),
         int(nuc_ligand_mask.sum()),
+        int(context_mask.sum()),
     )
     return out
 
@@ -430,6 +461,9 @@ def parse_train_dfs(
         parsed["query_pn_unit_iids"] = list(row["query_pn_unit_iids"])
         parsed["ligand_pn_unit_iids"] = list(row["ligand_pn_unit_iids"])
         parsed["protein_pn_unit_iids"] = list(row["protein_pn_unit_iids"])
+        crop_center_iids = row.get("crop_center_pn_unit_iids", None)
+        if not _is_missing_scalar(crop_center_iids):
+            parsed["crop_center_pn_unit_iids"] = list(crop_center_iids)
         row_query_only = row.get("query_pn_unit_iids_only", False)
         if isinstance(row_query_only, (float, np.floating)) and pd.isna(row_query_only):
             row_query_only = False
@@ -458,6 +492,10 @@ def parse_train_dfs(
         len(interface_df),
     )
     return parsed_df
+
+
+def _is_missing_scalar(value) -> bool:
+    return value is None or (isinstance(value, (float, np.floating)) and pd.isna(value))
 
 
 # --------------------------------------------------------------------------- #

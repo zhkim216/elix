@@ -19,11 +19,18 @@ from allatom_design.data.utils.pn_unit import (
     split_components,
 )
 
+from allatom_design.data.datasets.atomworks_sd.bml_context import (
+    BMLContextExpansionStats,
+    BMLPolicy,
+    BML_CENTER_METAL_COL,
+    BML_CENTER_SMALL_MOLECULE_COL,
+    build_pn_unit_index_lookup,
+    ensure_bml_context_annotations,
+    expand_bml_context_query_iids,
+)
 from allatom_design.data.datasets.atomworks_sd.selectors import (
-    metal_center_mask,
     nucleic_acid_ligand_center_mask,
     peptide_center_mask,
-    small_molecule_center_mask,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,6 +44,10 @@ def build_interface_df(
 ) -> pd.DataFrame:
 
     cfg = cfg or {}
+    policy = BMLPolicy.from_cfg(cfg)
+    metadata_df = ensure_bml_context_annotations(metadata_df, cfg)
+    context_lookup = build_pn_unit_index_lookup(metadata_df)
+    context_stats = BMLContextExpansionStats()
 
     protein_interface_distance_cutoff = float(cfg.get("protein_interface_distance_cutoff", 5.0))
     ligand_contact_distance_cutoff = float(cfg.get("ligand_contact_distance_cutoff", 5.0))
@@ -51,13 +62,17 @@ def build_interface_df(
         metadata_df=metadata_df,
         protein_lookup=protein_lookup,
         dataset_name=dataset_name,
-        cfg=cfg,
+        policy=policy,
+        context_lookup=context_lookup,
+        context_stats=context_stats,
     )
     small_molecule_rows = _build_small_molecule_interface_rows(
         metadata_df=metadata_df,
         protein_lookup=protein_lookup,
         dataset_name=dataset_name,
-        cfg=cfg,
+        policy=policy,
+        context_lookup=context_lookup,
+        context_stats=context_stats,
     )
     peptide_rows = _build_peptide_interface_rows(
         metadata_df=metadata_df,
@@ -65,6 +80,9 @@ def build_interface_df(
         dataset_name=dataset_name,
         distance_cutoff=ligand_contact_distance_cutoff,
         cfg=cfg,
+        policy=policy,
+        context_lookup=context_lookup,
+        context_stats=context_stats,
     )
     nuc_ligand_rows = _build_nucleic_acid_ligand_interface_rows(
         metadata_df=metadata_df,
@@ -72,6 +90,9 @@ def build_interface_df(
         dataset_name=dataset_name,
         distance_cutoff=ligand_contact_distance_cutoff,
         cfg=cfg,
+        policy=policy,
+        context_lookup=context_lookup,
+        context_stats=context_stats,
     )
     protein_rows = _build_protein_interface_rows(
         protein_df=protein_df,
@@ -93,6 +114,7 @@ def build_interface_df(
         "assembly_id",
         "path",
         "query_pn_unit_iids",
+        "crop_center_pn_unit_iids",
         "ligand_pn_unit_iids",
         "protein_pn_unit_iids",
         "protein_cluster_multiset",
@@ -123,6 +145,13 @@ def build_interface_df(
         len(nuc_ligand_rows),
         len(protein_rows),
     )
+    if context_stats.missing_partner_rows or context_stats.skipped_ineligible_partners:
+        logger.info(
+            "BML context expansion skipped %d missing partner rows and %d "
+            "ineligible non-protein partners.",
+            context_stats.missing_partner_rows,
+            context_stats.skipped_ineligible_partners,
+        )
     return interface_df
 
 
@@ -130,10 +159,12 @@ def _build_protein_metal_interface_rows(
     metadata_df: pd.DataFrame,
     protein_lookup: dict,
     dataset_name: str,
-    cfg: dict | DictConfig,
+    policy: BMLPolicy,
+    context_lookup: dict,
+    context_stats: BMLContextExpansionStats,
 ) -> tuple[list[dict], int]:
-    min_donors = int(cfg.get("min_protein_donor_atoms", 3))
-    metal_center_df = metadata_df[metal_center_mask(metadata_df, cfg)].copy()
+    min_donors = int(policy.center.metal.min_protein_donor_atoms)
+    metal_center_df = metadata_df[metadata_df[BML_CENTER_METAL_COL].fillna(False).astype(bool)].copy()
 
     rows = []
     for center in metal_center_df.itertuples(index=False):
@@ -144,13 +175,22 @@ def _build_protein_metal_interface_rows(
         protein_rows = sorted(protein_rows, key=lambda row: row.q_pn_unit_iid)
         protein_iids = tuple(row.q_pn_unit_iid for row in protein_rows)
         protein_clusters = tuple(row.q_pn_unit_cluster_id for row in protein_rows)
-        query_iids = [center.q_pn_unit_iid, *protein_iids]
+        crop_center_iids = [center.q_pn_unit_iid, *protein_iids]
+        query_iids = expand_bml_context_query_iids(
+            source_rows=[center],
+            crop_center_pn_unit_iids=crop_center_iids,
+            metadata_df=metadata_df,
+            lookup=context_lookup,
+            policy=policy,
+            stats=context_stats,
+        )
 
         row = center._asdict()
         row.pop("crop_center_pn_unit_iids", None)
         row.update(
             {
                 "query_pn_unit_iids": query_iids,
+                "crop_center_pn_unit_iids": tuple(crop_center_iids),
                 "ligand_pn_unit_iids": (center.q_pn_unit_iid,),
                 "protein_pn_unit_iids": protein_iids,
                 "protein_cluster_multiset": protein_clusters,
@@ -164,7 +204,7 @@ def _build_protein_metal_interface_rows(
             [dataset_name, "interface"],
             row["pdb_id"],
             row["assembly_id"],
-            row["query_pn_unit_iids"],
+            list(row["crop_center_pn_unit_iids"]),
         )
         rows.append(row)
 
@@ -175,11 +215,13 @@ def _build_small_molecule_interface_rows(
     metadata_df: pd.DataFrame,
     protein_lookup: dict,
     dataset_name: str,
-    cfg: dict | DictConfig,
+    policy: BMLPolicy,
+    context_lookup: dict,
+    context_stats: BMLContextExpansionStats,
 ) -> list[dict]:
-    center_mask = small_molecule_center_mask(metadata_df, cfg)
+    center_mask = metadata_df[BML_CENTER_SMALL_MOLECULE_COL].fillna(False).astype(bool)
     center_df = metadata_df[center_mask].copy()
-    min_contacts = (cfg or {}).get("min_contacting_protein_atoms_small_molecule", 20)
+    min_contacts = policy.center.small_molecule.min_contacting_protein_atoms
 
     rows = []
     for center in center_df.itertuples(index=False):
@@ -194,13 +236,22 @@ def _build_small_molecule_interface_rows(
         protein_rows = sorted(protein_rows, key=lambda row: row.q_pn_unit_iid)
         protein_iids = tuple(row.q_pn_unit_iid for row in protein_rows)
         protein_clusters = tuple(row.q_pn_unit_cluster_id for row in protein_rows)
-        query_iids = [center.q_pn_unit_iid, *protein_iids]
+        crop_center_iids = [center.q_pn_unit_iid, *protein_iids]
+        query_iids = expand_bml_context_query_iids(
+            source_rows=[center],
+            crop_center_pn_unit_iids=crop_center_iids,
+            metadata_df=metadata_df,
+            lookup=context_lookup,
+            policy=policy,
+            stats=context_stats,
+        )
 
         row = center._asdict()
         row.pop("crop_center_pn_unit_iids", None)
         row.update(
             {
                 "query_pn_unit_iids": query_iids,
+                "crop_center_pn_unit_iids": tuple(crop_center_iids),
                 "ligand_pn_unit_iids": (center.q_pn_unit_iid,),
                 "protein_pn_unit_iids": protein_iids,
                 "protein_cluster_multiset": protein_clusters,
@@ -218,7 +269,7 @@ def _build_small_molecule_interface_rows(
             [dataset_name, "interface"],
             row["pdb_id"],
             row["assembly_id"],
-            row["query_pn_unit_iids"],
+            list(row["crop_center_pn_unit_iids"]),
         )
         rows.append(row)
 
@@ -231,6 +282,9 @@ def _build_peptide_interface_rows(
     dataset_name: str,
     distance_cutoff: float,
     cfg: dict | DictConfig,
+    policy: BMLPolicy,
+    context_lookup: dict,
+    context_stats: BMLContextExpansionStats,
 ) -> list[dict]:
     center_df = metadata_df[peptide_center_mask(metadata_df, cfg)].copy()
 
@@ -247,13 +301,22 @@ def _build_peptide_interface_rows(
         protein_rows = sorted(protein_rows, key=lambda row: row.q_pn_unit_iid)
         protein_iids = tuple(row.q_pn_unit_iid for row in protein_rows)
         protein_clusters = tuple(row.q_pn_unit_cluster_id for row in protein_rows)
-        query_iids = [center.q_pn_unit_iid, *protein_iids]
+        crop_center_iids = [center.q_pn_unit_iid, *protein_iids]
+        query_iids = expand_bml_context_query_iids(
+            source_rows=[center],
+            crop_center_pn_unit_iids=crop_center_iids,
+            metadata_df=metadata_df,
+            lookup=context_lookup,
+            policy=policy,
+            stats=context_stats,
+        )
 
         row = center._asdict()
         row.pop("crop_center_pn_unit_iids", None)
         row.update(
             {
                 "query_pn_unit_iids": query_iids,
+                "crop_center_pn_unit_iids": tuple(crop_center_iids),
                 "ligand_pn_unit_iids": (center.q_pn_unit_iid,),
                 "protein_pn_unit_iids": protein_iids,
                 "protein_cluster_multiset": protein_clusters,
@@ -267,7 +330,7 @@ def _build_peptide_interface_rows(
             [dataset_name, "interface"],
             row["pdb_id"],
             row["assembly_id"],
-            row["query_pn_unit_iids"],
+            list(row["crop_center_pn_unit_iids"]),
         )
         rows.append(row)
 
@@ -280,6 +343,9 @@ def _build_nucleic_acid_ligand_interface_rows(
     dataset_name: str,
     distance_cutoff: float,
     cfg: dict | DictConfig,
+    policy: BMLPolicy,
+    context_lookup: dict,
+    context_stats: BMLContextExpansionStats,
 ) -> list[dict]:
     center_df = metadata_df[nucleic_acid_ligand_center_mask(metadata_df, cfg)].copy()
     if center_df.empty:
@@ -306,7 +372,15 @@ def _build_nucleic_acid_ligand_interface_rows(
         protein_rows = sorted(protein_rows, key=lambda row: row.q_pn_unit_iid)
         protein_iids = tuple(row.q_pn_unit_iid for row in protein_rows)
         protein_clusters = tuple(row.q_pn_unit_cluster_id for row in protein_rows)
-        query_iids = [*ligand_iids, *protein_iids]
+        crop_center_iids = [*ligand_iids, *protein_iids]
+        query_iids = expand_bml_context_query_iids(
+            source_rows=group_rows,
+            crop_center_pn_unit_iids=crop_center_iids,
+            metadata_df=metadata_df,
+            lookup=context_lookup,
+            policy=policy,
+            stats=context_stats,
+        )
         center = group_rows[0]
 
         row = center._asdict()
@@ -314,6 +388,7 @@ def _build_nucleic_acid_ligand_interface_rows(
         row.update(
             {
                 "query_pn_unit_iids": query_iids,
+                "crop_center_pn_unit_iids": tuple(crop_center_iids),
                 "ligand_pn_unit_iids": ligand_iids,
                 "protein_pn_unit_iids": protein_iids,
                 "protein_cluster_multiset": protein_clusters,
@@ -327,7 +402,7 @@ def _build_nucleic_acid_ligand_interface_rows(
             [dataset_name, "interface"],
             row["pdb_id"],
             row["assembly_id"],
-            row["query_pn_unit_iids"],
+            list(row["crop_center_pn_unit_iids"]),
         )
         rows.append(row)
 
