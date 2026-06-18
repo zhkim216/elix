@@ -53,6 +53,12 @@ DEFAULT_ENSEMBLE_CONDITIONING_CFG: dict[str, Any] = {
         "clash_target_atoms": "all_protein",
         "vdw_overlap_cutoff": 0.5,
         "exclude_clashing_decoys": False,
+        "pharm_retrieval": {
+            "cif_root": None,
+            "selected_queries_tsv": None,
+            "rank_indices": [],
+            "query_pn_unit_iids": None,
+        },
     },
     "noise_std": {
         "protein": 0.0,
@@ -75,6 +81,17 @@ def ligand_conformer_conditioning_enabled(sampling_inputs: dict[str, Any]) -> bo
     return (
         bool(normalized["enabled"])
         and normalized["small_molecule"]["mode"] == "ligand_conformer"
+    )
+
+
+def pharm_retrieval_conditioning_enabled(sampling_inputs: dict[str, Any]) -> bool:
+    cfg = _raw_ensemble_cfg(sampling_inputs)
+    if not cfg:
+        return False
+    normalized = normalize_ensemble_conditioning_cfg(cfg)
+    return (
+        bool(normalized["enabled"])
+        and normalized["small_molecule"]["mode"] == "pharm_retrieval"
     )
 
 
@@ -205,7 +222,7 @@ def normalize_ensemble_conditioning_cfg(
     _validate_entity_cfg(
         normalized,
         "small_molecule",
-        allowed_modes={"gaussian_noise", "ligand_conformer", "none"},
+        allowed_modes={"gaussian_noise", "ligand_conformer", "pharm_retrieval", "none"},
     )
     if (
         weights_cfg["scheme"] == "weighted_mean"
@@ -216,6 +233,9 @@ def normalize_ensemble_conditioning_cfg(
             "small_molecule.mode='ligand_conformer'"
         )
     small_molecule_cfg = normalized["small_molecule"]
+    pharm_cfg = small_molecule_cfg["pharm_retrieval"]
+    if small_molecule_cfg["mode"] == "pharm_retrieval":
+        _validate_pharm_retrieval_cfg(pharm_cfg)
     if int(small_molecule_cfg["num_conformer_candidates"]) < 1:
         raise ValueError(
             "ensemble_conditioning.small_molecule.num_conformer_candidates "
@@ -465,6 +485,24 @@ def _merge_entity_cfg(
     default_entity["clash_target_atoms"] = str(
         entity_cfg.get("clash_target_atoms", default_entity["clash_target_atoms"])
     )
+    pharm_cfg = dict(entity_cfg.get("pharm_retrieval", {}) or {})
+    default_entity["pharm_retrieval"] = dict(default_entity["pharm_retrieval"])
+    default_entity["pharm_retrieval"]["cif_root"] = pharm_cfg.get(
+        "cif_root",
+        default_entity["pharm_retrieval"]["cif_root"],
+    )
+    default_entity["pharm_retrieval"]["selected_queries_tsv"] = pharm_cfg.get(
+        "selected_queries_tsv",
+        default_entity["pharm_retrieval"]["selected_queries_tsv"],
+    )
+    default_entity["pharm_retrieval"]["rank_indices"] = pharm_cfg.get(
+        "rank_indices",
+        default_entity["pharm_retrieval"]["rank_indices"],
+    )
+    default_entity["pharm_retrieval"]["query_pn_unit_iids"] = pharm_cfg.get(
+        "query_pn_unit_iids",
+        default_entity["pharm_retrieval"]["query_pn_unit_iids"],
+    )
 
 
 def _refresh_legacy_noise_std(normalized: dict[str, Any]) -> None:
@@ -503,6 +541,42 @@ def _validate_entity_cfg(
             f"ensemble_conditioning.{entity_key}.noise_std must be "
             f"non-negative, got {entity_cfg['noise_std']}"
         )
+
+
+def _validate_pharm_retrieval_cfg(pharm_cfg: dict[str, Any]) -> None:
+    rank_indices = pharm_cfg.get("rank_indices", [])
+    if not isinstance(rank_indices, (list, tuple)):
+        raise ValueError(
+            "ensemble_conditioning.small_molecule.pharm_retrieval.rank_indices "
+            "must be a list of non-negative integers"
+        )
+    normalized_ranks = []
+    for value in rank_indices:
+        if isinstance(value, bool):
+            raise ValueError(
+                "ensemble_conditioning.small_molecule.pharm_retrieval.rank_indices "
+                "cannot contain booleans"
+            )
+        try:
+            rank = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "ensemble_conditioning.small_molecule.pharm_retrieval.rank_indices "
+                "must be non-negative integers"
+            ) from exc
+        if rank < 0:
+            raise ValueError(
+                "ensemble_conditioning.small_molecule.pharm_retrieval.rank_indices "
+                f"must be non-negative, got {rank}"
+            )
+        normalized_ranks.append(rank)
+    duplicates = sorted({rank for rank in normalized_ranks if normalized_ranks.count(rank) > 1})
+    if duplicates:
+        raise ValueError(
+            "ensemble_conditioning.small_molecule.pharm_retrieval.rank_indices "
+            f"contains duplicate ranks: {duplicates}"
+        )
+    pharm_cfg["rank_indices"] = normalized_ranks
 
 
 def _recompute_noised_backbone_fields(batch: dict[str, Any]) -> None:

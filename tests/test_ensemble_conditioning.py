@@ -32,6 +32,7 @@ from allatom_design.eval.utils.ensemble_conditioning import (
     apply_ensemble_noise,
     ligand_conformer_conditioning_enabled,
     normalize_ensemble_conditioning_cfg,
+    pharm_retrieval_conditioning_enabled,
     repeat_batch_for_ensembles,
 )
 from allatom_design.eval.utils.ligand_conformer_retrieval import (
@@ -39,6 +40,9 @@ from allatom_design.eval.utils.ligand_conformer_retrieval import (
     compute_ligand_conformer_member_coefficients,
     stage_ligand_conformer_ensembles,
     _manifest_row,
+)
+from allatom_design.eval.utils.pharm_retrieval import (
+    stage_pharm_retrieval_ensembles,
 )
 
 
@@ -154,8 +158,8 @@ def test_normalize_ensemble_conditioning_cfg_supports_ligand_conformer_mode():
             "total_members": 8,
             "weights": {
                 "scheme": "weighted_mean",
-                "ref_weight": 0.7,
-                "decoy_total_weight": 0.3,
+                "ref_weight": 0.8,
+                "decoy_total_weight": 0.2,
             },
             "protein": {"mode": "gaussian_noise", "noise_std": 0.1},
             "small_molecule": {
@@ -169,9 +173,42 @@ def test_normalize_ensemble_conditioning_cfg_supports_ligand_conformer_mode():
 
     assert normalized["total_members"] == 8
     assert normalized["weights"]["scheme"] == "weighted_mean"
+    assert normalized["weights"]["ref_weight"] == 0.8
+    assert normalized["weights"]["decoy_total_weight"] == 0.2
     assert normalized["small_molecule"]["mode"] == "ligand_conformer"
     assert normalized["noise_std"] == {
         "protein": 0.1,
+        "metal": 0.0,
+        "nonpolymer": 0.0,
+    }
+
+
+def test_normalize_ensemble_conditioning_cfg_supports_pharm_retrieval_mode():
+    normalized = normalize_ensemble_conditioning_cfg(
+        {
+            "enabled": True,
+            "total_members": 3,
+            "small_molecule": {
+                "mode": "pharm_retrieval",
+                "pharm_retrieval": {
+                    "cif_root": "/tmp/cifs",
+                    "selected_queries_tsv": "/tmp/selected_queries.tsv",
+                    "rank_indices": [0, 2],
+                    "query_pn_unit_iids": ["L_1"],
+                },
+            },
+        }
+    )
+
+    assert normalized["small_molecule"]["mode"] == "pharm_retrieval"
+    assert normalized["small_molecule"]["pharm_retrieval"] == {
+        "cif_root": "/tmp/cifs",
+        "selected_queries_tsv": "/tmp/selected_queries.tsv",
+        "rank_indices": [0, 2],
+        "query_pn_unit_iids": ["L_1"],
+    }
+    assert normalized["noise_std"] == {
+        "protein": 0.0,
         "metal": 0.0,
         "nonpolymer": 0.0,
     }
@@ -190,6 +227,28 @@ def test_weighted_mean_is_ligand_conformer_only():
         )
 
 
+@pytest.mark.parametrize(
+    "weights",
+    [
+        {"ref_weight": -0.1, "decoy_total_weight": 0.3},
+        {"ref_weight": 0.7, "decoy_total_weight": -0.1},
+        {"ref_weight": 0.0, "decoy_total_weight": 0.0},
+    ],
+)
+def test_normalize_ensemble_conditioning_cfg_validates_weight_values(weights):
+    with pytest.raises(ValueError, match="weights"):
+        normalize_ensemble_conditioning_cfg(
+            {
+                "total_members": 4,
+                "weights": {
+                    "scheme": "weighted_mean",
+                    **weights,
+                },
+                "small_molecule": {"mode": "ligand_conformer"},
+            }
+        )
+
+
 def test_ligand_conformer_conditioning_enabled_reads_sampling_inputs():
     sampling_inputs = {
         "potts_sampling_cfg": {
@@ -201,6 +260,23 @@ def test_ligand_conformer_conditioning_enabled_reads_sampling_inputs():
     }
 
     assert ligand_conformer_conditioning_enabled(sampling_inputs) is True
+
+
+def test_pharm_retrieval_conditioning_enabled_reads_sampling_inputs():
+    sampling_inputs = {
+        "potts_sampling_cfg": {
+            "ensemble_conditioning": {
+                "enabled": True,
+                "total_members": 3,
+                "small_molecule": {
+                    "mode": "pharm_retrieval",
+                    "pharm_retrieval": {"rank_indices": [0, 2]},
+                },
+            }
+        }
+    }
+
+    assert pharm_retrieval_conditioning_enabled(sampling_inputs) is True
 
 
 @pytest.mark.parametrize(
@@ -641,16 +717,350 @@ def test_ligand_conformer_manifest_records_native_threshold_selection_metadata()
     assert row["cluster_id"] is None
 
 
+def test_ligand_conformer_staging_weighted_mean_uses_weight_split(
+    monkeypatch,
+    tmp_path,
+):
+    atom_array = _make_atom_array()
+    saved_paths = []
+    clash_metrics = {
+        "has_clash": False,
+        "num_clashing_pairs": 0,
+        "min_heavy_atom_distance": None,
+        "max_vdw_overlap": None,
+        "clash_target_atoms": "all_protein",
+        "vdw_overlap_cutoff": 0.5,
+    }
+
+    def fake_load_example_with_parse(path, cif_parse_cfg):
+        return {"atom_array": atom_array.copy()}
+
+    def fake_save_cif_file(atom_array, out_file, cif_save_cfg=None):
+        out_file = Path(out_file)
+        saved_paths.append(out_file)
+        out_file.write_text(out_file.stem)
+
+    def fake_find_query_small_molecule_ligands(atom_array, query_pn_unit_iids=None):
+        return [
+            SimpleNamespace(
+                heavy_mask=np.ones(len(atom_array), dtype=bool),
+                pn_unit_iid="L_1",
+                res_name="LIG",
+            )
+        ]
+
+    def fake_generate_ligand_conformer_decoys(*args, **kwargs):
+        decoys = [
+            SimpleNamespace(
+                atom_array=atom_array.copy(),
+                clash_metrics=clash_metrics,
+                rank=rank,
+                cluster_id=rank,
+                rdkit_conformer_id=rank,
+                candidate_seed=100 + rank,
+                rmsd_to_native=0.5 + rank * 0.1,
+                atom_order_rmsd_to_native=0.6 + rank * 0.1,
+            )
+            for rank in range(2)
+        ]
+        return SimpleNamespace(
+            decoys=decoys,
+            metadata={"rdkit_native_threshold_hit_count": 2},
+        )
+
+    monkeypatch.setattr(
+        ligand_conformer_retrieval_module,
+        "load_example_with_parse",
+        fake_load_example_with_parse,
+    )
+    monkeypatch.setattr(
+        ligand_conformer_retrieval_module,
+        "save_cif_file",
+        fake_save_cif_file,
+    )
+    monkeypatch.setattr(
+        ligand_conformer_retrieval_module,
+        "find_query_small_molecule_ligands",
+        fake_find_query_small_molecule_ligands,
+    )
+    monkeypatch.setattr(
+        ligand_conformer_retrieval_module,
+        "compute_ligand_protein_clash_metrics",
+        lambda *args, **kwargs: clash_metrics,
+    )
+    monkeypatch.setattr(
+        ligand_conformer_retrieval_module,
+        "generate_ligand_conformer_decoys",
+        fake_generate_ligand_conformer_decoys,
+    )
+
+    staging = stage_ligand_conformer_ensembles(
+        pdb_paths=["/inputs/input.cif"],
+        out_dir=tmp_path,
+        ensemble_cfg={
+            "enabled": True,
+            "total_members": 4,
+            "weights": {
+                "scheme": "weighted_mean",
+                "ref_weight": 0.7,
+                "decoy_total_weight": 0.3,
+            },
+            "small_molecule": {"mode": "ligand_conformer"},
+        },
+        sampling_inputs_df=pd.DataFrame([{"pdb_id": "input"}]),
+        cif_parse_cfg=None,
+        cif_save_cfg=None,
+    )
+    manifest = pd.read_csv(staging.manifest_path)
+
+    assert [Path(path).name for path in staging.member_groups[0]] == [
+        "input.cif",
+        "input_ligconf_1.cif",
+        "input_ligconf_2.cif",
+        "input_ligconf_3.cif",
+    ]
+    assert [path.name for path in saved_paths] == [
+        "input.cif",
+        "input_ligconf_1.cif",
+        "input_ligconf_2.cif",
+        "input_ligconf_3.cif",
+    ]
+    assert manifest["member_role"].tolist() == [
+        "original",
+        "ligand_conformer_decoy",
+        "ligand_conformer_decoy",
+        "fallback_original_copy",
+    ]
+    assert manifest["member_coefficient"].tolist() == pytest.approx(
+        [0.7, 0.1, 0.1, 0.1]
+    )
+
+
+def _patch_fake_ligand_conformer_staging_deps(
+    monkeypatch,
+    *,
+    num_decoys: int,
+    fail_if_generate_called: bool = False,
+) -> tuple[list[Path], dict[str, object]]:
+    atom_array = _make_atom_array()
+    saved_paths = []
+    clash_metrics = {
+        "has_clash": False,
+        "num_clashing_pairs": 0,
+        "min_heavy_atom_distance": None,
+        "max_vdw_overlap": None,
+        "clash_target_atoms": "all_protein",
+        "vdw_overlap_cutoff": 0.5,
+    }
+
+    def fake_save_cif_file(atom_array, out_file, cif_save_cfg=None):
+        out_file = Path(out_file)
+        saved_paths.append(out_file)
+        out_file.write_text(out_file.stem)
+
+    def fake_generate_ligand_conformer_decoys(*args, **kwargs):
+        if fail_if_generate_called:
+            raise AssertionError("conformer generation should not be called")
+        decoys = [
+            SimpleNamespace(
+                atom_array=atom_array.copy(),
+                clash_metrics=clash_metrics,
+                rank=rank,
+                cluster_id=rank,
+                rdkit_conformer_id=rank,
+                candidate_seed=100 + rank,
+                rmsd_to_native=0.5 + rank * 0.1,
+                atom_order_rmsd_to_native=0.6 + rank * 0.1,
+            )
+            for rank in range(num_decoys)
+        ]
+        return SimpleNamespace(
+            decoys=decoys,
+            metadata={"rdkit_native_threshold_hit_count": num_decoys},
+        )
+
+    monkeypatch.setattr(
+        ligand_conformer_retrieval_module,
+        "load_example_with_parse",
+        lambda path, cif_parse_cfg: {"atom_array": atom_array.copy()},
+    )
+    monkeypatch.setattr(
+        ligand_conformer_retrieval_module,
+        "save_cif_file",
+        fake_save_cif_file,
+    )
+    monkeypatch.setattr(
+        ligand_conformer_retrieval_module,
+        "find_query_small_molecule_ligands",
+        lambda atom_array, query_pn_unit_iids=None: [
+            SimpleNamespace(
+                heavy_mask=np.ones(len(atom_array), dtype=bool),
+                pn_unit_iid="L_1",
+                res_name="LIG",
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        ligand_conformer_retrieval_module,
+        "compute_ligand_protein_clash_metrics",
+        lambda *args, **kwargs: clash_metrics,
+    )
+    monkeypatch.setattr(
+        ligand_conformer_retrieval_module,
+        "generate_ligand_conformer_decoys",
+        fake_generate_ligand_conformer_decoys,
+    )
+    return saved_paths, clash_metrics
+
+
+def test_ligand_conformer_staging_weighted_mean_falls_back_for_missing_decoys(
+    monkeypatch,
+    tmp_path,
+):
+    saved_paths, _ = _patch_fake_ligand_conformer_staging_deps(
+        monkeypatch,
+        num_decoys=1,
+    )
+
+    staging = stage_ligand_conformer_ensembles(
+        pdb_paths=["/inputs/input.cif"],
+        out_dir=tmp_path,
+        ensemble_cfg={
+            "enabled": True,
+            "total_members": 4,
+            "weights": {
+                "scheme": "weighted_mean",
+                "ref_weight": 0.7,
+                "decoy_total_weight": 0.3,
+            },
+            "small_molecule": {"mode": "ligand_conformer"},
+        },
+        sampling_inputs_df=pd.DataFrame([{"pdb_id": "input"}]),
+        cif_parse_cfg=None,
+        cif_save_cfg=None,
+    )
+    manifest = pd.read_csv(staging.manifest_path)
+
+    assert [Path(path).name for path in staging.member_groups[0]] == [
+        "input.cif",
+        "input_ligconf_1.cif",
+        "input_ligconf_2.cif",
+        "input_ligconf_3.cif",
+    ]
+    assert [path.name for path in saved_paths] == [
+        "input.cif",
+        "input_ligconf_1.cif",
+        "input_ligconf_2.cif",
+        "input_ligconf_3.cif",
+    ]
+    assert manifest["member_role"].tolist() == [
+        "original",
+        "ligand_conformer_decoy",
+        "fallback_original_copy",
+        "fallback_original_copy",
+    ]
+    assert manifest["member_coefficient"].tolist() == pytest.approx(
+        [0.7, 0.1, 0.1, 0.1]
+    )
+    assert manifest["warning"].str.contains(
+        "fewer_ligand_conformer_decoys_than_requested: requested=3, selected=1"
+    ).all()
+    assert manifest["warning"].str.contains("fallback_original_copy: count=2").all()
+
+
+def test_ligand_conformer_staging_original_only_skips_decoy_generation(
+    monkeypatch,
+    tmp_path,
+):
+    saved_paths, _ = _patch_fake_ligand_conformer_staging_deps(
+        monkeypatch,
+        num_decoys=0,
+        fail_if_generate_called=True,
+    )
+
+    staging = stage_ligand_conformer_ensembles(
+        pdb_paths=["/inputs/input.cif"],
+        out_dir=tmp_path,
+        ensemble_cfg={
+            "enabled": True,
+            "total_members": 1,
+            "weights": {
+                "scheme": "weighted_mean",
+                "ref_weight": 0.7,
+                "decoy_total_weight": 0.3,
+            },
+            "small_molecule": {"mode": "ligand_conformer"},
+        },
+        sampling_inputs_df=pd.DataFrame([{"pdb_id": "input"}]),
+        cif_parse_cfg=None,
+        cif_save_cfg=None,
+    )
+    manifest = pd.read_csv(staging.manifest_path)
+
+    assert [Path(path).name for path in staging.member_groups[0]] == [
+        "input.cif",
+    ]
+    assert [path.name for path in saved_paths] == [
+        "input.cif",
+    ]
+    assert manifest["member_role"].tolist() == [
+        "original",
+    ]
+    assert manifest["member_coefficient"].tolist() == pytest.approx([1.0])
+
+
+def test_ligand_conformer_staging_mean_keeps_single_reference_with_decoys(
+    monkeypatch,
+    tmp_path,
+):
+    saved_paths, _ = _patch_fake_ligand_conformer_staging_deps(
+        monkeypatch,
+        num_decoys=2,
+    )
+
+    staging = stage_ligand_conformer_ensembles(
+        pdb_paths=["/inputs/input.cif"],
+        out_dir=tmp_path,
+        ensemble_cfg={
+            "enabled": True,
+            "total_members": 3,
+            "weights": {"scheme": "mean"},
+            "small_molecule": {"mode": "ligand_conformer"},
+        },
+        sampling_inputs_df=pd.DataFrame([{"pdb_id": "input"}]),
+        cif_parse_cfg=None,
+        cif_save_cfg=None,
+    )
+    manifest = pd.read_csv(staging.manifest_path)
+
+    assert [Path(path).name for path in staging.member_groups[0]] == [
+        "input.cif",
+        "input_ligconf_1.cif",
+        "input_ligconf_2.cif",
+    ]
+    assert [path.name for path in saved_paths] == [
+        "input.cif",
+        "input_ligconf_1.cif",
+        "input_ligconf_2.cif",
+    ]
+    assert manifest["member_role"].tolist() == [
+        "original",
+        "ligand_conformer_decoy",
+        "ligand_conformer_decoy",
+    ]
+    assert manifest["member_coefficient"].tolist() == pytest.approx([1 / 3] * 3)
+
+
 def test_compute_ligand_conformer_member_coefficients_uses_weighted_mean_split():
     coefficients = compute_ligand_conformer_member_coefficients(
         num_decoys=7,
+        num_fallback_copies=0,
         scheme="weighted_mean",
         ref_weight=0.7,
         decoy_total_weight=0.3,
     )
 
-    assert coefficients[0] == pytest.approx(0.7)
-    assert coefficients[1:] == pytest.approx([0.3 / 7] * 7)
+    assert coefficients == pytest.approx([0.7, *([0.3 / 7] * 7)])
     assert sum(coefficients) == pytest.approx(1.0)
 
 
@@ -669,13 +1079,15 @@ def test_compute_ligand_conformer_member_coefficients_splits_fallback_copies():
 
 def test_compute_ligand_conformer_member_coefficients_mean_and_sqrt():
     assert compute_ligand_conformer_member_coefficients(
-        num_decoys=3,
+        num_decoys=2,
+        num_fallback_copies=1,
         scheme="mean",
         ref_weight=0.7,
         decoy_total_weight=0.3,
     ) == pytest.approx([0.25] * 4)
     assert compute_ligand_conformer_member_coefficients(
-        num_decoys=3,
+        num_decoys=2,
+        num_fallback_copies=1,
         scheme="sqrt",
         ref_weight=0.7,
         decoy_total_weight=0.3,
@@ -685,6 +1097,7 @@ def test_compute_ligand_conformer_member_coefficients_mean_and_sqrt():
 def test_compute_ligand_conformer_member_coefficients_original_only_fallback():
     assert compute_ligand_conformer_member_coefficients(
         num_decoys=0,
+        num_fallback_copies=0,
         scheme="weighted_mean",
         ref_weight=0.7,
         decoy_total_weight=0.3,
@@ -755,6 +1168,168 @@ def test_ligand_conformer_staging_uses_fallback_original_copies_for_metal_query(
     assert manifest["warning"].str.contains("fallback_original_copy: count=2").all()
 
 
+def _write_dummy_cif(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"data_{path.stem}\n#\n")
+
+
+def test_pharm_retrieval_staging_selects_query_and_rank_indices(tmp_path):
+    cif_root = tmp_path / "cifs"
+    query_dir = cif_root / "5UF"
+    query_path = query_dir / "len150_5UF_0.cif"
+    rank0_path = query_dir / "len150_5UF_rank0_ABC_0100.cif"
+    rank2_path = query_dir / "len150_5UF_rank2_DEF_0090.cif"
+    _write_dummy_cif(query_path)
+    _write_dummy_cif(rank0_path)
+    _write_dummy_cif(rank2_path)
+    selected_queries_tsv = tmp_path / "selected_queries.tsv"
+    selected_queries_tsv.write_text(
+        "query_ccd\tquery_pn_unit_iid\n"
+        "5UF\tL_1\n"
+    )
+
+    staging = stage_pharm_retrieval_ensembles(
+        pdb_paths=[str(query_path)],
+        out_dir=tmp_path / "out",
+        ensemble_cfg={
+            "enabled": True,
+            "total_members": 3,
+            "weights": {"scheme": "mean"},
+            "small_molecule": {
+                "mode": "pharm_retrieval",
+                "pharm_retrieval": {
+                    "cif_root": str(cif_root),
+                    "selected_queries_tsv": str(selected_queries_tsv),
+                    "rank_indices": [0, 2],
+                },
+            },
+        },
+        sampling_inputs_df=None,
+    )
+
+    assert [Path(path).name for path in staging.pdb_paths] == [
+        query_path.name,
+        rank0_path.name,
+        rank2_path.name,
+    ]
+    assert staging.target_count() == 1
+    assert list(staging.iter_member_batches(max_members=8)) == [staging.pdb_paths]
+
+    manifest = pd.read_csv(staging.manifest_path, keep_default_na=False)
+    assert manifest["member_role"].tolist() == [
+        "query_original",
+        "pharm_rank",
+        "pharm_rank",
+    ]
+    assert manifest["rank_index"].tolist() == ["", "0", "2"]
+    assert manifest["requested_rank_indices"].unique().tolist() == ["[0, 2]"]
+
+    runtime_rows = staging.sampling_inputs_df.set_index("pdb_key")
+    assert set(runtime_rows.index) == {
+        "len150_5UF_0",
+        "len150_5UF_rank0_ABC_0100",
+        "len150_5UF_rank2_DEF_0090",
+    }
+    assert runtime_rows.loc["len150_5UF_rank0_ABC_0100", "pdb_id"] == "5UF"
+    assert runtime_rows.loc["len150_5UF_rank0_ABC_0100", "query_pn_unit_iids"] == "['L_1']"
+    assert runtime_rows.loc["len150_5UF_rank0_ABC_0100", "ccd_code"] == "5UF"
+
+    batch = staging.annotate_batch(
+        {},
+        batch_pdb_paths=staging.pdb_paths,
+        device="cpu",
+    )
+    torch.testing.assert_close(batch["tied_sampling_ids"], torch.tensor([0, 0, 0]))
+    assert batch["tied_sampling_aggregation_scheme"] == "mean"
+
+
+def test_pharm_retrieval_staging_rejects_missing_rank(tmp_path):
+    cif_root = tmp_path / "cifs"
+    query_dir = cif_root / "5UF"
+    query_path = query_dir / "len150_5UF_0.cif"
+    _write_dummy_cif(query_path)
+
+    with pytest.raises(FileNotFoundError, match="rank_indices=\\[7\\]"):
+        stage_pharm_retrieval_ensembles(
+            pdb_paths=[str(query_path)],
+            out_dir=tmp_path / "out",
+            ensemble_cfg={
+                "enabled": True,
+                "total_members": 2,
+                "small_molecule": {
+                    "mode": "pharm_retrieval",
+                    "pharm_retrieval": {
+                        "cif_root": str(cif_root),
+                        "rank_indices": [7],
+                        "query_pn_unit_iids": ["L_1"],
+                    },
+                },
+            },
+            sampling_inputs_df=None,
+        )
+
+
+def test_pharm_retrieval_staging_adds_exact_keys_to_sampling_df_without_pdb_key(tmp_path):
+    cif_root = tmp_path / "cifs"
+    query_dir = cif_root / "5UF"
+    query_path = query_dir / "len150_5UF_0.cif"
+    rank0_path = query_dir / "len150_5UF_rank0_ABC_0100.cif"
+    _write_dummy_cif(query_path)
+    _write_dummy_cif(rank0_path)
+
+    staging = stage_pharm_retrieval_ensembles(
+        pdb_paths=[str(query_path)],
+        out_dir=tmp_path / "out",
+        ensemble_cfg={
+            "enabled": True,
+            "total_members": 2,
+            "small_molecule": {
+                "mode": "pharm_retrieval",
+                "pharm_retrieval": {
+                    "cif_root": str(cif_root),
+                    "rank_indices": [0],
+                },
+            },
+        },
+        sampling_inputs_df=pd.DataFrame(
+            [{"pdb_id": "5UF", "query_pn_unit_iids": "['L_2']"}]
+        ),
+    )
+
+    runtime_rows = staging.sampling_inputs_df.set_index("pdb_key")
+    assert "len150_5UF_0" in runtime_rows.index
+    assert "len150_5UF_rank0_ABC_0100" in runtime_rows.index
+    assert runtime_rows.loc["len150_5UF_rank0_ABC_0100", "query_pn_unit_iids"] == "['L_2']"
+
+
+def test_pharm_retrieval_staging_rejects_duplicate_rank_indices(tmp_path):
+    cif_root = tmp_path / "cifs"
+    query_dir = cif_root / "5UF"
+    query_path = query_dir / "len150_5UF_0.cif"
+    rank0_path = query_dir / "len150_5UF_rank0_ABC_0100.cif"
+    _write_dummy_cif(query_path)
+    _write_dummy_cif(rank0_path)
+
+    with pytest.raises(ValueError, match="duplicate ranks"):
+        stage_pharm_retrieval_ensembles(
+            pdb_paths=[str(query_path)],
+            out_dir=tmp_path / "out",
+            ensemble_cfg={
+                "enabled": True,
+                "total_members": 3,
+                "small_molecule": {
+                    "mode": "pharm_retrieval",
+                    "pharm_retrieval": {
+                        "cif_root": str(cif_root),
+                        "rank_indices": [0, 0],
+                        "query_pn_unit_iids": ["L_1"],
+                    },
+                },
+            },
+            sampling_inputs_df=None,
+        )
+
+
 def test_ligand_conformer_staging_result_owns_runtime_sampling_contract():
     staging_result = LigandConformerStagingResult(
         root_dir=Path("/tmp/staged"),
@@ -779,10 +1354,10 @@ def test_ligand_conformer_staging_result_owns_runtime_sampling_contract():
             "single": 2,
         },
         member_to_coefficient={
-            "input": 0.7,
-            "input_ligconf_1": 0.3,
-            "other": 0.7,
-            "other_ligconf_1": 0.3,
+            "input": 0.5,
+            "input_ligconf_1": 0.5,
+            "other": 0.5,
+            "other_ligconf_1": 0.5,
             "single": 1.0,
         },
         member_to_target_id={
@@ -828,7 +1403,7 @@ def test_ligand_conformer_staging_result_owns_runtime_sampling_contract():
     assert batch["tied_sampling_aggregation_scheme"] == "weighted_mean"
     torch.testing.assert_close(
         batch["tied_sampling_weights"],
-        torch.tensor([0.7, 0.3]),
+        torch.tensor([0.5, 0.5]),
     )
 
 
