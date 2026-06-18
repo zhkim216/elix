@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -20,78 +19,14 @@ from allatom_design.eval.utils.data_utils import (
 from allatom_design.eval.utils.ensemble_conditioning import (
     normalize_ensemble_conditioning_cfg,
 )
+from allatom_design.eval.utils.ensemble_staging import (
+    EnsembleStagingResult as LigandConformerStagingResult,
+    expand_pos_constraint_df_for_members,
+    iter_member_batches,
+    sampling_df_has_pdb_key,
+    sampling_row_for_member,
+)
 from allatom_design.utils.sample_io_utils import load_example_with_parse, save_cif_file
-
-
-@dataclass(frozen=True)
-class LigandConformerStagingResult:
-    root_dir: Path
-    pdb_paths: list[str]
-    member_groups: list[list[str]]
-    sampling_inputs_df: pd.DataFrame | None
-    member_to_group_id: dict[str, int]
-    member_to_coefficient: dict[str, float]
-    member_to_target_id: dict[str, str]
-    aggregation_scheme: str
-    manifest_path: Path
-
-    def expand_pos_constraints(
-        self,
-        pos_constraint_df: pd.DataFrame | None,
-    ) -> pd.DataFrame | None:
-        return expand_pos_constraint_df_for_ligand_conformer_members(
-            pos_constraint_df,
-            self,
-        )
-
-    def iter_member_batches(self, *, max_members: int) -> Iterator[list[str]]:
-        return iter_ligand_conformer_member_batches(
-            self.member_groups,
-            max_members=max_members,
-        )
-
-    def target_count(self, batch_pdb_paths: list[str] | None = None) -> int:
-        if batch_pdb_paths is None:
-            return len(self.member_groups)
-        return len({
-            self.member_to_group_id[Path(path).stem]
-            for path in batch_pdb_paths
-        })
-
-    def annotate_batch(
-        self,
-        batch: dict[str, Any],
-        *,
-        batch_pdb_paths: list[str],
-        device: str | torch.device | None,
-    ) -> dict[str, Any]:
-        group_ids = []
-        coefficients = []
-        missing = []
-        for path in batch_pdb_paths:
-            member_sample_id = Path(path).stem
-            if member_sample_id not in self.member_to_group_id:
-                missing.append(member_sample_id)
-                continue
-            group_ids.append(self.member_to_group_id[member_sample_id])
-            coefficients.append(self.member_to_coefficient[member_sample_id])
-        if missing:
-            raise KeyError(f"Missing ligand conformer staging metadata for: {missing[:5]}")
-
-        annotated = dict(batch)
-        annotated["tied_sampling_ids"] = torch.as_tensor(
-            group_ids,
-            dtype=torch.long,
-            device=device,
-        )
-        annotated["tied_sampling_aggregation_scheme"] = self.aggregation_scheme
-        if self.aggregation_scheme == "weighted_mean":
-            annotated["tied_sampling_weights"] = torch.as_tensor(
-                coefficients,
-                dtype=torch.float32,
-                device=device,
-            )
-        return annotated
 
 
 def stage_ligand_conformer_ensembles(
@@ -275,7 +210,7 @@ def stage_ligand_conformer_ensembles(
             )
             member_idx += 1
 
-        for fallback_idx in range(member_idx, max_decoys + 1):
+        for fallback_idx in range(member_idx, total_members):
             fallback_out_path = root_dir / f"{target_sample_id}_ligconf_{fallback_idx}.cif"
             save_cif_file(atom_array, fallback_out_path, cif_save_cfg=cif_save_cfg)
             group_paths.append(str(fallback_out_path))
@@ -298,12 +233,12 @@ def stage_ligand_conformer_ensembles(
             member_to_group_id[member_sample_id] = group_id
             member_to_coefficient[member_sample_id] = coefficients[member_idx]
             member_to_target_id[member_sample_id] = target_sample_id
-            if runtime_sampling_inputs_df is not None and not _sampling_df_has_pdb_key(
+            if runtime_sampling_inputs_df is not None and not sampling_df_has_pdb_key(
                 runtime_sampling_inputs_df,
                 member_sample_id,
             ):
                 sampling_extra_rows.append(
-                    _sampling_row_for_member(
+                    sampling_row_for_member(
                         sampling_inputs_df=runtime_sampling_inputs_df,
                         source_row=sampling_row,
                         member_sample_id=member_sample_id,
@@ -335,13 +270,14 @@ def stage_ligand_conformer_ensembles(
         member_to_target_id=member_to_target_id,
         aggregation_scheme=cfg["weights"]["scheme"],
         manifest_path=manifest_path,
+        label="ligand conformer",
     )
 
 
 def compute_ligand_conformer_member_coefficients(
     *,
     num_decoys: int,
-    num_fallback_copies: int = 0,
+    num_fallback_copies: int,
     scheme: str,
     ref_weight: float,
     decoy_total_weight: float,
@@ -382,20 +318,7 @@ def iter_ligand_conformer_member_batches(
     *,
     max_members: int,
 ) -> Iterator[list[str]]:
-    if max_members < 1:
-        raise ValueError("max_members must be >= 1")
-
-    current: list[str] = []
-    for group in member_groups:
-        if current and len(current) + len(group) > max_members:
-            yield current
-            current = []
-        if len(group) > max_members:
-            yield list(group)
-            continue
-        current.extend(group)
-    if current:
-        yield current
+    return iter_member_batches(member_groups, max_members=max_members)
 
 
 def annotate_ligand_conformer_batch(
@@ -416,31 +339,7 @@ def expand_pos_constraint_df_for_ligand_conformer_members(
     pos_constraint_df: pd.DataFrame | None,
     staging_result: LigandConformerStagingResult,
 ) -> pd.DataFrame | None:
-    if pos_constraint_df is None:
-        return None
-    if "pdb_key" not in pos_constraint_df.columns:
-        return pos_constraint_df
-
-    existing_keys = set(pos_constraint_df["pdb_key"].astype(str))
-    extra_rows = []
-    for member_sample_id, target_sample_id in staging_result.member_to_target_id.items():
-        if member_sample_id in existing_keys:
-            continue
-        source_rows = pos_constraint_df[
-            pos_constraint_df["pdb_key"].astype(str) == target_sample_id
-        ]
-        if source_rows.empty:
-            continue
-        row = source_rows.iloc[0].copy()
-        row["pdb_key"] = member_sample_id
-        extra_rows.append(row.to_dict())
-
-    if not extra_rows:
-        return pos_constraint_df
-    return pd.concat(
-        [pos_constraint_df, pd.DataFrame(extra_rows, columns=pos_constraint_df.columns)],
-        ignore_index=True,
-    )
+    return expand_pos_constraint_df_for_members(pos_constraint_df, staging_result)
 
 
 def ligand_conformer_target_count(
@@ -460,35 +359,6 @@ def _query_pn_unit_iids_from_sampling_row(row: pd.Series | None) -> list[str]:
         if parsed:
             return parsed
     return []
-
-
-def _sampling_df_has_pdb_key(sampling_inputs_df: pd.DataFrame, pdb_key: str) -> bool:
-    if "pdb_key" not in sampling_inputs_df.columns:
-        return False
-    return bool(
-        (
-            sampling_inputs_df["pdb_key"].astype(str).str.lower()
-            == str(pdb_key).lower()
-        ).any()
-    )
-
-
-def _sampling_row_for_member(
-    *,
-    sampling_inputs_df: pd.DataFrame,
-    source_row: pd.Series | None,
-    member_sample_id: str,
-    target_sample_id: str,
-) -> dict[str, Any]:
-    if source_row is None:
-        row = {column: "" for column in sampling_inputs_df.columns}
-    else:
-        row = source_row.to_dict()
-    if "pdb_key" in row:
-        row["pdb_key"] = member_sample_id
-    if "pdb_id" in row and (row["pdb_id"] is None or str(row["pdb_id"]).strip() == ""):
-        row["pdb_id"] = target_sample_id.split("_")[0]
-    return row
 
 
 def _manifest_row(

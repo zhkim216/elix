@@ -52,7 +52,7 @@ echo "Starting shard ${SLURM_ARRAY_TASK_ID}/${NUM_SHARDS} for atomworks_pdb_full
 #   object->str pass, so batches with all-None values no longer stringify to "None" and
 #   break pyarrow type inference at merge time.
 python3 allatom_design/data/preprocessing/atomworks/build_metadata_parquet_shards.py \
-    --config-path=/home/users/zhkim216/code/allatom-design/allatom_design/configs/data/preprocessing/atomworks \
+    --config-path=/home/users/zhkim216/code/allatom-design/allatom_design/configs/preprocessing \
     --config-name=build_metadata_parquet_shards \
     mmcif_dir=/scratch/users/zhkim216/datasets/pdb_mirror \
     out_dir=/scratch/users/zhkim216/datasets/atomworks_pdb_full_v9 \

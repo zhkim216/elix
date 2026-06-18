@@ -2,7 +2,10 @@ import unittest
 import torch
 from torchtyping import TensorType
 from typing import Any, Dict
-from allatom_design.model.seq_denoiser.denoisers.elix_mpnn_denoiser import _aggregate_potts_params
+from allatom_design.model.seq_denoiser.denoisers.elix_mpnn_denoiser import (
+    ElixMPNNDenoiser,
+    _aggregate_potts_params,
+)
 
 
 class TestPottsAggregation(unittest.TestCase):
@@ -267,6 +270,93 @@ class TestPottsAggregation(unittest.TestCase):
         torch.testing.assert_close(result["h"], torch.full((1, N, C), float(B), device=self.device) / expected_scale)
         torch.testing.assert_close(result["J"], torch.full((1, N, N, C, C), float(B), device=self.device) / expected_scale)
 
+    def test_weighted_mean_reduce_uses_member_weights(self):
+        B, N, C = 2, 2, 1
+        h = torch.tensor(
+            [
+                [[1.0], [1.0]],
+                [[3.0], [3.0]],
+            ],
+            device=self.device,
+            dtype=self.dtype,
+        )
+        J = torch.tensor([10.0, 30.0], device=self.device, dtype=self.dtype).view(B, 1, 1, 1, 1).expand(B, N, N, C, C)
+        potts_decoder_aux = {
+            "h": h,
+            "J": J,
+            "edge_idx": torch.arange(N, device=self.device).expand(B, N, N),
+            "mask_i": torch.ones(B, N, device=self.device, dtype=self.dtype),
+            "mask_ij": torch.ones(B, N, N, device=self.device, dtype=self.dtype),
+        }
+        tied_sampling_inputs = {
+            "inverse": torch.tensor([0, 0], device=self.device),
+            "unique_ids": torch.tensor([0], device=self.device),
+            "weights": torch.tensor([0.75, 0.25], device=self.device),
+        }
+
+        weighted = _aggregate_potts_params(
+            potts_decoder_aux,
+            tied_sampling_inputs,
+            reduce="weighted_mean",
+        )
+        mean = _aggregate_potts_params(
+            potts_decoder_aux,
+            {k: v for k, v in tied_sampling_inputs.items() if k != "weights"},
+            reduce="mean",
+        )
+
+        torch.testing.assert_close(weighted["h"], torch.full((1, N, C), 1.5, device=self.device))
+        torch.testing.assert_close(weighted["J"], torch.full((1, N, N, C, C), 15.0, device=self.device))
+        torch.testing.assert_close(mean["h"], torch.full((1, N, C), 2.0, device=self.device))
+        torch.testing.assert_close(mean["J"], torch.full((1, N, N, C, C), 20.0, device=self.device))
+
+    def test_compute_potts_params_threads_tied_weighted_mean(self):
+        dtype = self.dtype
+
+        class FakeDenoiser:
+            def __call__(self, subbatch, *, is_sampling, sampling_inputs):
+                B, N = subbatch["restype"].shape
+                C = 1
+                h = subbatch["restype"].to(dtype=dtype).unsqueeze(-1)
+                J = subbatch["j_values"].to(dtype=dtype).view(B, 1, 1, 1, 1).expand(B, N, N, C, C)
+                aux_preds_i = {
+                    "potts_decoder_aux": {
+                        "h": h,
+                        "J": J,
+                        "edge_idx": torch.arange(N, device=h.device).expand(B, N, N),
+                        "mask_i": torch.ones(B, N, device=h.device, dtype=dtype),
+                        "mask_ij": torch.ones(B, N, N, device=h.device, dtype=dtype),
+                    },
+                    "protein_residue_node_mask": torch.ones(B, N, device=h.device, dtype=dtype),
+                    "token_exists_mask": torch.ones(B, N, device=h.device, dtype=dtype),
+                }
+                return None, aux_preds_i
+
+        batch = {
+            "restype": torch.tensor(
+                [
+                    [1.0, 1.0],
+                    [3.0, 3.0],
+                ],
+                device=self.device,
+                dtype=self.dtype,
+            ),
+            "j_values": torch.tensor([10.0, 30.0], device=self.device, dtype=self.dtype),
+            "tied_sampling_ids": torch.tensor([0, 0], device=self.device),
+            "tied_sampling_aggregation_scheme": "weighted_mean",
+            "tied_sampling_weights": torch.tensor([0.75, 0.25], device=self.device, dtype=self.dtype),
+        }
+
+        potts_decoder_aux, sliced_batch, _ = ElixMPNNDenoiser.compute_potts_params(
+            FakeDenoiser(),
+            batch,
+            {"batch_size": 2},
+        )
+
+        torch.testing.assert_close(potts_decoder_aux["h"], torch.full((1, 2, 1), 1.5, device=self.device))
+        torch.testing.assert_close(potts_decoder_aux["J"], torch.full((1, 2, 2, 1, 1), 15.0, device=self.device))
+        torch.testing.assert_close(sliced_batch["restype"], batch["restype"][:1])
+
     def test_unknown_reduce_raises(self):
         B, N, C = 1, 2, 2
         potts_decoder_aux = {
@@ -286,6 +376,27 @@ class TestPottsAggregation(unittest.TestCase):
                 potts_decoder_aux,
                 tied_sampling_inputs,
                 reduce="bad",
+            )
+
+    def test_weighted_mean_without_weights_raises(self):
+        B, N, C = 1, 2, 2
+        potts_decoder_aux = {
+            "h": torch.ones(B, N, C, device=self.device, dtype=self.dtype),
+            "J": torch.ones(B, N, N, C, C, device=self.device, dtype=self.dtype),
+            "edge_idx": torch.arange(N, device=self.device).expand(B, N, N),
+            "mask_i": torch.ones(B, N, device=self.device, dtype=self.dtype),
+            "mask_ij": torch.ones(B, N, N, device=self.device, dtype=self.dtype),
+        }
+        tied_sampling_inputs = {
+            "inverse": torch.tensor([0], device=self.device),
+            "unique_ids": torch.tensor([0], device=self.device),
+        }
+
+        with self.assertRaisesRegex(ValueError, "requires tied sampling weights"):
+            _aggregate_potts_params(
+                potts_decoder_aux,
+                tied_sampling_inputs,
+                reduce="weighted_mean",
             )
 
 
