@@ -13,7 +13,6 @@ from biotite.structure import AtomArray
 from atomworks.constants import (
     DNA_BACKBONE_ATOM_NAMES,
     ELEMENT_NAME_TO_ATOMIC_NUMBER,
-    METAL_ELEMENTS,
     NUCLEIC_ACID_BACKBONE_ATOM_NAMES,
     PROTEIN_BACKBONE_ATOM_NAMES,
     RNA_BACKBONE_ATOM_NAMES,
@@ -28,6 +27,7 @@ from atomworks.constants import (
     UNKNOWN_RNA,
 )
 
+from allatom_design.data.const import METAL_ELEMENTS
 import atomworks.enums as aw_enums
 from atomworks.enums import ChainType
 from atomworks.ml.utils.token import get_token_starts
@@ -59,6 +59,24 @@ from allatom_design.data.const import TRAINING_SUPPORTED_CHAIN_TYPES
 import logging
 logger = logging.getLogger(__name__)
 
+_ATOM_CHIRALITY_TAG_TO_ID = {
+    "N": 0,
+    "R": 1,
+    "S": 2,
+}
+
+
+def _encode_atom_chirality_tags(stereo_values: Sequence[Any] | np.ndarray) -> np.ndarray:
+    encoded = np.zeros(len(stereo_values), dtype=np.int64)
+    for idx, value in enumerate(stereo_values):
+        if value is None:
+            continue
+        if isinstance(value, bytes):
+            value = value.decode()
+        encoded[idx] = _ATOM_CHIRALITY_TAG_TO_ID.get(str(value).strip().upper(), 0)
+    return encoded
+
+
 # Keep track of the token/atom dimensions of the features for padding & cropping
 FEAT_TO_TOKEN_DIM = {
     # Maps feature name to the token dimension
@@ -82,7 +100,6 @@ FEAT_TO_TOKEN_DIM = {
     "token_is_hetero": [0],
     "token_is_covalent_modification": [0],
     "token_is_ligand_pocket": [0],
-    "pocket_rbf_mask": [0],
     "token_is_protein_chain": [0],
     "token_is_peptide_chain": [0],
     "token_is_small_molecule_chain": [0],
@@ -117,6 +134,8 @@ FEAT_TO_ATOM_DIM = {
     "atom_is_hetero": [0],
     "atomic_number": [0],
     "atom_charge": [0],
+    "atom_is_aromatic": [0],
+    "atom_chirality_tag": [0],
     "atom_is_covalent_modification": [0],
     "atom_is_ligand_pocket": [0],
     "atom_is_protein_chain": [0],   
@@ -199,6 +218,15 @@ class FeaturizeCoordsAndMasks(Transform):
         # atomic number and charge
         feats["atomic_number"] = torch.tensor(atom_array.atomic_number).long()
         feats["atom_charge"] = torch.tensor(atom_array.charge).float()
+        if hasattr(atom_array, "is_aromatic"):
+            feats["atom_is_aromatic"] = torch.tensor(atom_array.is_aromatic).float()
+        else:
+            feats["atom_is_aromatic"] = torch.zeros(len(atom_array), dtype=torch.float32)
+        if hasattr(atom_array, "stereo"):
+            atom_stereo = atom_array.stereo
+        else:
+            atom_stereo = np.full(len(atom_array), "N", dtype=object)
+        feats["atom_chirality_tag"] = torch.tensor(_encode_atom_chirality_tags(atom_stereo)).long()
         
         # covalent modification flags
         feats["atom_is_covalent_modification"] = torch.tensor(atom_array.is_covalent_modification).float()
@@ -207,13 +235,6 @@ class FeaturizeCoordsAndMasks(Transform):
         # is_ligand_pocket flags
         feats["atom_is_ligand_pocket"] = torch.tensor(atom_array.is_ligand_pocket).float()
         feats["token_is_ligand_pocket"] = torch.tensor(apply_token_wise(atom_array, atom_array.is_ligand_pocket, np.any)).float()
-
-        # pocket_rbf_mask (C-alpha based pocket annotation for pocket-aware RBF)
-        if hasattr(atom_array, "is_pocket_rbf"):
-            feats["pocket_rbf_mask"] = torch.tensor(apply_token_wise(atom_array, atom_array.is_pocket_rbf, np.any)).float()
-        else:
-            # Default: all zeros (no pocket residues) for backward compatibility
-            feats["pocket_rbf_mask"] = torch.zeros(len(feats["token_is_ligand_pocket"]), dtype=torch.float32)
 
         # chain type flags
         atom_is_protein_chain = atom_array.get_annotation("atom_is_protein_chain")
@@ -276,15 +297,6 @@ class FeaturizeCoordsAndMasks(Transform):
         feats["atom_is_prot_std_aa"] = feats["atom_is_protein_chain"] * (1 - feats["atom_is_atomized"])
         feats["token_is_prot_std_aa"] = feats["token_is_protein_chain"] * (1 - feats["is_atomized"].float())
                 
-        # Get ligand related features
-        # try:
-        #     feats["atom_is_aromatic"] = torch.tensor(atom_array.is_aromatic).float()
-        # except: 
-        #     # Todo: LMT & DD6 from 6a2w, no attribute error for is_aromatic.
-        #     # Todo: Both have hexagon rings, but no aromaticity. Maybe error in parsing?
-        #     feats["atom_is_aromatic"] = torch.full((len(atom_array),), False).float()
-        #     print(f"Atom array has no attribute 'is_aromatic' for {data['example_id']}")            
-                        
         return data
 
 
