@@ -369,6 +369,7 @@ COMMON_ARGS=(
   pocket_cfg.n_min_ligand_atoms_for_seq_recovery=1
   input_sample_is_all_atom=true
   input_sample_is_designed=true
+  cif_cfg.parse.designed_samples.add_missing_atoms=false
   load_from_cache=false
   pdb_cfg.pdb_dir=${PDB_DIR}
   pdb_cfg.pdb_name_list=${PDB_NAME_LIST}
