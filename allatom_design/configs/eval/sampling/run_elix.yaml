@@ -47,7 +47,7 @@ sampling_cfg:
         enabled: false
         total_members: 1
         weights:
-          scheme: "mean"  # mean = 1/M, sqrt = 1/sqrt(M), weighted_mean = ref/decoy split
+          scheme: "mean"  # mean, sqrt, or weighted_mean
           ref_weight: 0.7
           decoy_total_weight: 0.3
         noise_seed: null
@@ -59,7 +59,7 @@ sampling_cfg:
           mode: "gaussian_noise"
           noise_std: 0.0
         small_molecule:
-          mode: "gaussian_noise"  # gaussian_noise, ligand_conformer, or none
+          mode: "gaussian_noise"  # gaussian_noise, ligand_conformer, pharm_retrieval, or none
           noise_std: 0.0
           num_conformer_candidates: 50
           rmsd_cluster_cutoff: 2.0
@@ -69,6 +69,11 @@ sampling_cfg:
           clash_target_atoms: "all_protein"  # sidechain, backbone, or all_protein
           vdw_overlap_cutoff: 0.5
           exclude_clashing_decoys: false
+          pharm_retrieval:
+            cif_root: null
+            selected_queries_tsv: null
+            rank_indices: []
+            query_pn_unit_iids: null
         noise_std:
           protein: 0.0
           metal: 0.0

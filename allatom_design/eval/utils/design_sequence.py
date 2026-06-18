@@ -27,9 +27,13 @@ from allatom_design.eval.utils.ensemble_conditioning import (
     ensemble_conditioning_enabled,
     ligand_conformer_conditioning_enabled,
     make_ensemble_potts_aux_provider,
+    pharm_retrieval_conditioning_enabled,
 )
 from allatom_design.eval.utils.ligand_conformer_retrieval import (
     stage_ligand_conformer_ensembles,
+)
+from allatom_design.eval.utils.pharm_retrieval import (
+    stage_pharm_retrieval_ensembles,
 )
 from allatom_design.eval.utils.data_utils import (
     collect_design_outputs,
@@ -103,7 +107,7 @@ def design_sequence(
 
     sampling_inputs_for_setup = OmegaConf.to_container(sampling_cfg, resolve=True)
     sampling_inputs_for_setup.pop("sample_token_prefix", None)
-    ligand_conformer_staging = None
+    ensemble_staging = None
     if ligand_conformer_conditioning_enabled(sampling_inputs_for_setup):
         if guidance_is_enabled(guidance_cfg):
             raise NotImplementedError(
@@ -111,7 +115,7 @@ def design_sequence(
                 "together with Potts guidance"
             )
         ensemble_cfg = sampling_inputs_for_setup["potts_sampling_cfg"]["ensemble_conditioning"]
-        ligand_conformer_staging = stage_ligand_conformer_ensembles(
+        ensemble_staging = stage_ligand_conformer_ensembles(
             pdb_paths=pdb_paths,
             out_dir=out_dir,
             ensemble_cfg=ensemble_cfg,
@@ -120,13 +124,35 @@ def design_sequence(
             cif_save_cfg=cif_save_cfg,
             csv_suffix=csv_suffix,
         )
-        pdb_paths = ligand_conformer_staging.pdb_paths
-        sampling_inputs_df = ligand_conformer_staging.sampling_inputs_df
-        pos_constraint_df = ligand_conformer_staging.expand_pos_constraints(pos_constraint_df)
+        pdb_paths = ensemble_staging.pdb_paths
+        sampling_inputs_df = ensemble_staging.sampling_inputs_df
+        pos_constraint_df = ensemble_staging.expand_pos_constraints(pos_constraint_df)
         print(
             "Staged ligand conformer ensemble members in "
-            f"{ligand_conformer_staging.root_dir}; manifest: "
-            f"{ligand_conformer_staging.manifest_path}"
+            f"{ensemble_staging.root_dir}; manifest: "
+            f"{ensemble_staging.manifest_path}"
+        )
+    elif pharm_retrieval_conditioning_enabled(sampling_inputs_for_setup):
+        if guidance_is_enabled(guidance_cfg):
+            raise NotImplementedError(
+                "pharm_retrieval ensemble_conditioning is not supported "
+                "together with Potts guidance"
+            )
+        ensemble_cfg = sampling_inputs_for_setup["potts_sampling_cfg"]["ensemble_conditioning"]
+        ensemble_staging = stage_pharm_retrieval_ensembles(
+            pdb_paths=pdb_paths,
+            out_dir=out_dir,
+            ensemble_cfg=ensemble_cfg,
+            sampling_inputs_df=sampling_inputs_df,
+            csv_suffix=csv_suffix,
+        )
+        pdb_paths = ensemble_staging.pdb_paths
+        sampling_inputs_df = ensemble_staging.sampling_inputs_df
+        pos_constraint_df = ensemble_staging.expand_pos_constraints(pos_constraint_df)
+        print(
+            "Staged pharm retrieval ensemble members in "
+            f"{ensemble_staging.root_dir}; manifest: "
+            f"{ensemble_staging.manifest_path}"
         )
 
     # Validate pos_constraint_df.
@@ -155,16 +181,16 @@ def design_sequence(
 
     # Begin sampling.
     n_sampling_targets = (
-        ligand_conformer_staging.target_count()
-        if ligand_conformer_staging is not None
+        ensemble_staging.target_count()
+        if ensemble_staging is not None
         else len(pdb_paths)
     )
     pbar = tqdm(
         total=n_sampling_targets,
         desc=f"Sampling {n_sampling_targets} PDBs, {sampling_cfg.num_seqs_per_pdb} sequences per PDB...",
     )
-    if ligand_conformer_staging is not None:
-        batch_iter = ligand_conformer_staging.iter_member_batches(
+    if ensemble_staging is not None:
+        batch_iter = ensemble_staging.iter_member_batches(
             max_members=int(sampling_cfg.batch_size),
         )
     else:
@@ -176,8 +202,8 @@ def design_sequence(
     with parallel_context as parallel_pool:
         for batch_pdb_paths in batch_iter:
             B = (
-                ligand_conformer_staging.target_count(batch_pdb_paths)
-                if ligand_conformer_staging is not None
+                ensemble_staging.target_count(batch_pdb_paths)
+                if ensemble_staging is not None
                 else len(batch_pdb_paths)
             )
 
@@ -189,8 +215,8 @@ def design_sequence(
                                  device=device,
                                  parallel_pool=parallel_pool,
                                  sampling_inputs_df=sampling_inputs_df)
-            if ligand_conformer_staging is not None:
-                batch = ligand_conformer_staging.annotate_batch(
+            if ensemble_staging is not None:
+                batch = ensemble_staging.annotate_batch(
                     batch,
                     batch_pdb_paths=batch_pdb_paths,
                     device=device,
