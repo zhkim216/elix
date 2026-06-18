@@ -39,7 +39,7 @@ from atomworks.io.tools.rdkit import (get_morgan_fingerprint_from_rdkit_mol,
 from allatom_design.data.preprocessing.atomworks.sharding_utils import \
     take_shard, use_sharding
 
-@hydra.main(config_path="../../../configs/data/preprocessing/atomworks", config_name="cache_residue_data", version_base="1.3.2")
+@hydra.main(config_path="../../../configs/preprocessing", config_name="cache_residue_data", version_base="1.3.2")
 def main(cfg: DictConfig):
     """
     Cache residue-level data for AtomWorks.

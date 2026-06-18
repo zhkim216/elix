@@ -898,7 +898,11 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
                 sampling_inputs["pos_restrict_aatype"] = [x[unique_rep_idxs] for x in sampling_inputs["pos_restrict_aatype"]]
 
             # aggregate potts parameters across tied groups
-            potts_decoder_aux = _aggregate_potts_params(potts_decoder_aux, tied_sampling_inputs)
+            potts_decoder_aux = _aggregate_potts_params(
+                potts_decoder_aux,
+                tied_sampling_inputs,
+                reduce=tied_sampling_inputs.get("reduce"),
+            )
 
         return potts_decoder_aux, batch, sampling_inputs
 
@@ -913,35 +917,57 @@ def _aggregate_potts_params(potts_decoder_aux: dict[str, TensorType["b ..."]],
 
     If reduce is "mean", we take the mean of the potts parameters across the tied
     groups (equivalent to geometric mean in probability space). If reduce is
-    "sqrt", summed parameters are divided by sqrt(group size). The legacy
-    use_mean argument is preserved for callers/tests that use sum vs mean.
+    "sqrt", summed parameters are divided by sqrt(group size). If reduce is
+    "weighted_mean", per-member weights from tied_sampling_inputs["weights"] are
+    used and normalized within each tied group. The legacy use_mean argument is
+    preserved for callers/tests that use sum vs mean.
     """
     if reduce is None:
         reduce = "mean" if use_mean else "sum"
-    if reduce not in {"sum", "mean", "sqrt"}:
+    if reduce not in {"sum", "mean", "sqrt", "weighted_mean"}:
         raise ValueError(f"Unknown Potts aggregation reduce: {reduce!r}")
 
     h, J, edge_idx, mask_i, mask_ij = potts_decoder_aux["h"], potts_decoder_aux["J"], potts_decoder_aux["edge_idx"], potts_decoder_aux["mask_i"], potts_decoder_aux["mask_ij"]
     inverse, unique_ids = tied_sampling_inputs["inverse"], tied_sampling_inputs["unique_ids"]
+    B = h.shape[0]
+
+    weights = None
+    weight_sums = None
+    if reduce == "weighted_mean":
+        if "weights" not in tied_sampling_inputs:
+            raise ValueError("Potts aggregation reduce='weighted_mean' requires tied sampling weights")
+        weights = tied_sampling_inputs["weights"].to(device=h.device, dtype=h.dtype)
+        if weights.ndim != 1 or weights.shape[0] != B:
+            raise ValueError(
+                "tied sampling weights must be a 1D tensor with one value per batch item; "
+                f"got shape={tuple(weights.shape)}, batch_size={B}"
+            )
+        if torch.any(weights < 0):
+            raise ValueError("tied sampling weights must be non-negative")
+        weight_sums = h.new_zeros(unique_ids.shape[0]).index_add(0, inverse, weights)
+        if torch.any(weight_sums <= 0):
+            raise ValueError("tied sampling weights must sum to a positive value per group")
 
     # handle 1D features
     counts = torch.bincount(inverse)
-    h_new = h.new_zeros(unique_ids.shape[0], *h.shape[1:]).index_add(0, inverse, h)
+    h_source = h if weights is None else h * weights.view(B, *([1] * (h.ndim - 1)))
+    h_new = h.new_zeros(unique_ids.shape[0], *h.shape[1:]).index_add(0, inverse, h_source)
     node_counts = mask_i.new_zeros(unique_ids.shape[0], *mask_i.shape[1:]).index_add(0, inverse, mask_i)
     mask_i_new = (node_counts == counts.view(-1, 1)).float()  # node i is unmasked only if node i is present across all inputs in the tied group
 
     # handle 2D features
     n_grp = unique_ids.shape[0]
-    B, N, K = edge_idx.shape
+    _, N, K = edge_idx.shape
     C = J.shape[-1]
     edge_counts = mask_ij.new_zeros(n_grp, N, N)
     J_new = J.new_zeros(n_grp, N, N, C, C)
     for bi in range(B):
         g = inverse[bi]
+        J_source = J[bi] if weights is None else J[bi] * weights[bi].to(dtype=J.dtype)
 
         edge_indices_flat = (edge_idx[bi] + torch.arange(N, device=edge_idx.device)[:, None] * N).reshape(-1)
         edge_counts[g].view(-1).index_add_(0, edge_indices_flat, mask_ij[bi].view(-1))  # count number of edges between each pair of nodes
-        J_new[g].view(-1, C, C).index_add_(0, edge_indices_flat, J[bi].view(-1, C, C))  # add in the pairwise interactions for this graph
+        J_new[g].view(-1, C, C).index_add_(0, edge_indices_flat, J_source.view(-1, C, C))  # add in the pairwise interactions for this graph
 
     mask_ij_new = (edge_counts > 0) * (mask_i_new[:, :, None] * mask_i_new[:, None, :])  # edge i,j is present only if both nodes are present and there exists some edge between them
     edge_idx_new = torch.arange(N, device=edge_idx.device).expand(1, 1, -1).repeat(n_grp, N, 1)  # new edge indices are given in the full NxN grid
@@ -953,6 +979,9 @@ def _aggregate_potts_params(potts_decoder_aux: dict[str, TensorType["b ..."]],
         scale = torch.sqrt(counts.to(dtype=J_new.dtype))
         J_new = J_new / scale.view(-1, 1, 1, 1, 1)
         h_new = h_new / scale.to(dtype=h_new.dtype).view(-1, 1, 1)
+    elif reduce == "weighted_mean":
+        J_new = J_new / weight_sums.to(dtype=J_new.dtype).view(-1, 1, 1, 1, 1)
+        h_new = h_new / weight_sums.to(dtype=h_new.dtype).view(-1, 1, 1)
 
     potts_decoder_aux_new = {
         "h": h_new,
@@ -969,6 +998,10 @@ def _construct_tied_sampling_inputs(batch: dict[str, TensorType["b ..."]]) -> di
     tied_sampling_inputs = {"tied_sampling_ids": batch["tied_sampling_ids"]}
     device = batch["tied_sampling_ids"].device
     tied_sampling_inputs["unique_ids"], tied_sampling_inputs["inverse"] = tied_sampling_inputs["tied_sampling_ids"].unique(return_inverse=True)
+    if "tied_sampling_aggregation_scheme" in batch:
+        tied_sampling_inputs["reduce"] = batch["tied_sampling_aggregation_scheme"]
+    if "tied_sampling_weights" in batch:
+        tied_sampling_inputs["weights"] = batch["tied_sampling_weights"]
 
     # use first index of each tied group as the representative index
     B = batch["restype"].shape[0]
