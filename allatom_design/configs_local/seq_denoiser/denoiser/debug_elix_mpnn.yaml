@@ -35,10 +35,11 @@ mpnn:
     ligand_conditioning: ${denoiser.mpnn.ligand_conditioning}
     use_ligand_context: true
     ligand_atom_context_num: 25
-    # Pocket-aware RBF: use full backbone RBF for ligand pocket residues, CA-only for others
-    use_pocket_rbf: true  # false for backward compat; set true to enable pocket-aware RBF
-    pocket_rbf_type: "ncaco"  # "ncaco" or "ncacocb" - RBF type for pocket residue edges
-    pocket_rbf_distance: 4.0  # distance threshold (Å) for C-alpha pocket definition
+    # Ligand atom/context feature ablations. Defaults preserve existing checkpoint shapes.
+    use_ligand_formal_charge: false
+    use_ligand_aromatic_atom_feature: false
+    use_ligand_aromatic_edge_feature: false
+    use_ligand_chirality_tag: false
 
     masked_distance_fill: 1000.0
 

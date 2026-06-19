@@ -150,11 +150,9 @@ python3 allatom_design/train_seq_denoiser.py \
     data.featurizer_cfg.drop_prob_non_protein_chains=0.0 \
     data.featurizer_cfg.pocket_distance=5.0 \
     data.featurizer_cfg.pocket_n_min_ligand_atoms=1 \
-    data.featurizer_cfg.use_pocket_rbf=false \
     data.featurizer_cfg.asymmetric_noise=false \
     denoiser.mpnn.k_neighbors=${KNN} \
     denoiser.mpnn.ligand_conditioning=true \
-    denoiser.mpnn.token_features.use_pocket_rbf=false \
     denoiser.mpnn.token_features.protein_graph_rbf_type=ncacocb \
     denoiser.mpnn.token_features.ligand_atom_context_num=25 \
     denoiser.mpnn.potts.k_neighbors_potts=${KNN} \

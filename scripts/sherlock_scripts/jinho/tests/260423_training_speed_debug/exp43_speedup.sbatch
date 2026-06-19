@@ -118,7 +118,6 @@ python3 allatom_design/train_seq_denoiser.py \
     data.sampling_weights.k_percentile=90.0 \
     denoiser.mpnn.k_neighbors=24 \
     denoiser.mpnn.ligand_conditioning=true \
-    denoiser.mpnn.token_features.use_pocket_rbf=false \
     denoiser.mpnn.token_features.protein_graph_rbf_type=ncacocb \
     denoiser.mpnn.token_features.ligand_atom_context_num=36 \
     denoiser.mpnn.potts.k_neighbors_potts=24 \
