@@ -103,10 +103,6 @@ def sd_featurizer_pocket_only(
     pocket_crop_distance: float = 5.0,
     # ----- Spatial pre-crop around target ligand -----
     spatial_crop_radius: float = 15.0,
-    # ----- Pocket annotation for model features -----    
-    # For pocket-aware RBF (C-alpha based pocket annotation)
-    use_pocket_rbf: bool = False,
-    pocket_rbf_distance: float = 5.0,
     # Center random augmentation
     apply_random_augmentation: bool = True,
     translation_scale: float = 1.0,

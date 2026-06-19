@@ -101,9 +101,6 @@ featurizer_cfg:
   drop_prob_non_protein_chains: 0.0
   pocket_distance: 5.0
   pocket_n_min_ligand_atoms: 1
-  use_pocket_rbf: ${denoiser.mpnn.token_features.use_pocket_rbf}
-  pocket_rbf_distance: ${denoiser.mpnn.token_features.pocket_rbf_distance}
-  pocket_rbf_n_min_ligand_atoms: 1
   residue_cache_dir: ${data.residue_cache_dir}
   max_conformers_per_residue: 50
   apply_random_augmentation: true
