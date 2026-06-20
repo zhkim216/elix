@@ -2,25 +2,25 @@
 # Submit from Sherlock:
 #   PROJECT_ROOT=/home/users/zhkim216/code/elix \
 #     bash scripts/sherlock_scripts/jinho/setup/wrap_sbatch_in_container_elix.sh \
-#     scripts/sherlock_scripts/jinho/eval/denovoval/eval_elix_exp7_cfg5_pocket_exp1_cfg0_scaffold_denovoval_pharm_retrieval_twostage_ensemble.sbatch
+#     scripts/sherlock_scripts/jinho/eval/denovoval/eval_elix_exp7_cfg7_pocket_exp1_cfg0_scaffold_denovoval_pharm_retrieval_twostage_ensemble.sbatch
 # Optional focused runs:
 #   PRESET_FILTER=top8 <submit command above>
-#   PRINT_ARRAY_PLAN=true bash scripts/sherlock_scripts/jinho/eval/denovoval/eval_elix_exp7_cfg5_pocket_exp1_cfg0_scaffold_denovoval_pharm_retrieval_twostage_ensemble.sbatch
+#   PRINT_ARRAY_PLAN=true bash scripts/sherlock_scripts/jinho/eval/denovoval/eval_elix_exp7_cfg7_pocket_exp1_cfg0_scaffold_denovoval_pharm_retrieval_twostage_ensemble.sbatch
 #
 # Array layout for the full run is 4 pharm retrieval presets x 2 chunks = 8 tasks:
 #   baseline: query/original only, no stage1 pocket ensemble
 #   top8:     query/original + ranks 0..6
 #   middle8:  query/original + ranks 12..18
 #   tail8:    query/original + ranks 25..31
-#SBATCH --job-name=eval_e7c5_pharm_ts
+#SBATCH --job-name=eval_e7c7_pharm_ts
 #SBATCH -p possu,bioe
 #SBATCH --array=0-7
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 #SBATCH --time=1-0:00:00
-#SBATCH --output=/scratch/users/zhkim216/job_output/eval_ligand_seq_des/eval_e7c5_pharm_ts_%A_%a.out
-#SBATCH --error=/scratch/users/zhkim216/job_output/eval_ligand_seq_des/eval_e7c5_pharm_ts_%A_%a.err
+#SBATCH --output=/scratch/users/zhkim216/job_output/eval_ligand_seq_des/eval_e7c7_pharm_ts_%A_%a.out
+#SBATCH --error=/scratch/users/zhkim216/job_output/eval_ligand_seq_des/eval_e7c7_pharm_ts_%A_%a.err
 
 set -euo pipefail
 
@@ -36,19 +36,19 @@ PRESET_ROWS=(
   "tail8|tail8|true|[25,26,27,28,29,30,31]"
 )
 
-POCKET_MODEL_NAME="${POCKET_MODEL_NAME:-elix_exp7_cfg5_context_skip_edge_update}"
-POCKET_STEP="${POCKET_STEP:-82500}"
-POCKET_TOTAL_MEMBERS="${POCKET_TOTAL_MEMBERS:-8}"
-POCKET_PROTEIN_NOISE_STD="${POCKET_PROTEIN_NOISE_STD:-0.0}"
-POCKET_SMALL_MOLECULE_NOISE_STD="${POCKET_SMALL_MOLECULE_NOISE_STD:-0.0}"
-POCKET_METAL_NOISE_STD="${POCKET_METAL_NOISE_STD:-0.0}"
+POCKET_MODEL_NAME=elix_exp7_cfg7_context_skip_edge_update_decoder_skip
+POCKET_STEP=102500
+POCKET_TOTAL_MEMBERS=8
+POCKET_PROTEIN_NOISE_STD=0.0
+POCKET_SMALL_MOLECULE_NOISE_STD=0.0
+POCKET_METAL_NOISE_STD=0.0
 
-SCAFFOLD_MODEL_NAME="${SCAFFOLD_MODEL_NAME:-elix_exp1_cfg0}"
-SCAFFOLD_STEP="${SCAFFOLD_STEP:-32500}"
-SCAFFOLD_TOTAL_MEMBERS="${SCAFFOLD_TOTAL_MEMBERS:-16}"
-SCAFFOLD_PROTEIN_NOISE_STD="${SCAFFOLD_PROTEIN_NOISE_STD:-0.5}"
-SCAFFOLD_SMALL_MOLECULE_NOISE_STD="${SCAFFOLD_SMALL_MOLECULE_NOISE_STD:-0.0}"
-SCAFFOLD_METAL_NOISE_STD="${SCAFFOLD_METAL_NOISE_STD:-0.0}"
+SCAFFOLD_MODEL_NAME=elix_exp1_cfg0
+SCAFFOLD_STEP=32500
+SCAFFOLD_TOTAL_MEMBERS=16
+SCAFFOLD_PROTEIN_NOISE_STD=0.5
+SCAFFOLD_SMALL_MOLECULE_NOISE_STD=0.0
+SCAFFOLD_METAL_NOISE_STD=0.0
 
 DIRECTION=ps
 POCKET_DISTANCE=10.0
@@ -96,7 +96,7 @@ fi
 NUM_TASKS=$((NUM_PRESETS * NUM_CHUNKS))
 
 if [[ "${PRINT_ARRAY_PLAN}" == "true" ]]; then
-  echo "Selected exp7_cfg5 pocket / exp1_cfg0 scaffold denovoval pharm-retrieval two-stage run: NUM_PRESETS=${NUM_PRESETS}, NUM_CHUNKS=${NUM_CHUNKS}, NUM_TASKS=${NUM_TASKS}"
+  echo "Selected exp7_cfg7 pocket / exp1_cfg0 scaffold denovoval pharm-retrieval two-stage run: NUM_PRESETS=${NUM_PRESETS}, NUM_CHUNKS=${NUM_CHUNKS}, NUM_TASKS=${NUM_TASKS}"
   for PRESET_IDX in "${!SELECTED_PRESETS[@]}"; do
     IFS='|' read -r PLAN_PRESET_KEY PLAN_PRESET_LABEL PLAN_ENABLE_PHARM PLAN_RANK_INDICES <<< "${SELECTED_PRESETS[$PRESET_IDX]}"
     echo "preset_idx=${PRESET_IDX} preset=${PLAN_PRESET_KEY} label=${PLAN_PRESET_LABEL} stage1_pharm_retrieval=${PLAN_ENABLE_PHARM} rank_indices=${PLAN_RANK_INDICES} pocket_model=${POCKET_MODEL_NAME} pocket_step=${POCKET_STEP} scaffold_model=${SCAFFOLD_MODEL_NAME} scaffold_step=${SCAFFOLD_STEP}"
@@ -116,17 +116,18 @@ IFS='|' read -r PRESET_KEY PRESET_LABEL ENABLE_PHARM_RETRIEVAL RANK_INDICES <<< 
 SCAFFOLD_PROTEIN_NOISE_LABEL=${SCAFFOLD_PROTEIN_NOISE_STD//./p}
 
 BASE_DIR="${PROJECT_ROOT:-/home/users/zhkim216/code/elix}"
-HYDRA_ROOT="${HYDRA_ROOT:-/scratch/users/zhkim216/hydra_outputs/eval_elix_exp7_cfg5_denovoval_pharm_retrieval_twostage_ensemble}"
-BASE_OUT_DIR="${BASE_OUT_DIR:-/scratch/users/zhkim216/out_dir/eval_ligand_seq_des}"
+HYDRA_ROOT=/scratch/users/zhkim216/hydra_outputs/eval_elix_exp7_cfg7_denovoval_pharm_retrieval_twostage_ensemble
+BASE_OUT_DIR=/scratch/users/zhkim216/out_dir/eval_ligand_seq_des
 VALSET_NAME=denovoval_pharm_retrieval_ref_ligand_proteins
-PHARM_RETRIEVAL_ROOT="${PHARM_RETRIEVAL_ROOT:-/scratch/users/zhkim216/datasets/val_cifs/denovoval_cifs/denovoval_pharm_retrieval/ref_ligand_proteins}"
+PHARM_RETRIEVAL_ROOT=/scratch/users/zhkim216/datasets/val_cifs/denovoval_cifs/denovoval_pharm_retrieval/ref_ligand_proteins
 PHARM_RETRIEVAL_DATASET_ROOT="$(dirname "${PHARM_RETRIEVAL_ROOT}")"
 PDB_DIR="${PHARM_RETRIEVAL_ROOT}/cifs"
-SELECTED_QUERIES_TSV="${SELECTED_QUERIES_TSV:-${PHARM_RETRIEVAL_DATASET_ROOT}/selected_queries.tsv}"
+SELECTED_QUERIES_TSV=${PHARM_RETRIEVAL_DATASET_ROOT}/selected_queries.tsv
 
-POCKET_DENOISER_TRAIN_DIR=/scratch/users/zhkim216/out_dir/ligand_seq_des/${POCKET_MODEL_NAME}
-SCAFFOLD_DENOISER_TRAIN_DIR=/scratch/users/zhkim216/out_dir/ligand_seq_des/${SCAFFOLD_MODEL_NAME}
-EXP_NAME=${POCKET_MODEL_NAME}_pocket_${SCAFFOLD_MODEL_NAME}_scaffold_${VALSET_NAME}_${PRESET_LABEL}_twostage_${DIRECTION}_10A_stage2_ens_n${SCAFFOLD_TOTAL_MEMBERS}_pnoise${SCAFFOLD_PROTEIN_NOISE_LABEL}_pseqs${NUM_POCKET_SEQS_PER_PDB}_sseqs${NUM_SCAFFOLD_SEQS_PER_PDB}
+DENOISER_ROOT=/scratch/users/zhkim216/out_dir/ligand_seq_des
+POCKET_DENOISER_TRAIN_DIR=${DENOISER_ROOT}/${POCKET_MODEL_NAME}
+SCAFFOLD_DENOISER_TRAIN_DIR=${DENOISER_ROOT}/${SCAFFOLD_MODEL_NAME}
+EXP_NAME=${POCKET_MODEL_NAME}_pocket_${SCAFFOLD_MODEL_NAME}_scaffold_${VALSET_NAME}_${PRESET_LABEL}_twostage_${DIRECTION}_10A_stage2_ens_n${SCAFFOLD_TOTAL_MEMBERS}_pnoise${SCAFFOLD_PROTEIN_NOISE_LABEL}_af3ss_r${AF3_RECYCLES}_d${AF3_DIFFUSION_SAMPLES}_pseqs${NUM_POCKET_SEQS_PER_PDB}_sseqs${NUM_SCAFFOLD_SEQS_PER_PDB}
 HYDRA_DIR=${HYDRA_ROOT}/${EXP_NAME}/chunk_${CHUNK_IDX}
 PDB_NAME_LIST=${HYDRA_DIR}/pharm_retrieval_query_originals.txt
 SAMPLING_INPUTS_CSV=${HYDRA_DIR}/pharm_retrieval_query_sampling_inputs.csv
@@ -277,7 +278,7 @@ else
   )
 fi
 
-echo "Starting exp7_cfg5 pocket / exp1_cfg0 scaffold denovoval pharm-retrieval two-stage run: task=${TASK_ID}/${NUM_TASKS}, preset=${PRESET_KEY}, chunk=${CHUNK_IDX}/${NUM_CHUNKS}"
+echo "Starting exp7_cfg7 pocket / exp1_cfg0 scaffold denovoval pharm-retrieval two-stage run: task=${TASK_ID}/${NUM_TASKS}, preset=${PRESET_KEY}, chunk=${CHUNK_IDX}/${NUM_CHUNKS}"
 echo "Stage1 pocket: model=${POCKET_MODEL_NAME}, step=${POCKET_STEP}, pharm_retrieval=${ENABLE_PHARM_RETRIEVAL}, rank_indices=${RANK_INDICES}, total_members=${POCKET_TOTAL_MEMBERS}, protein_noise_std=${POCKET_PROTEIN_NOISE_STD}, small_molecule_noise_std=${POCKET_SMALL_MOLECULE_NOISE_STD}, metal_noise_std=${POCKET_METAL_NOISE_STD}"
 echo "Stage2 scaffold: model=${SCAFFOLD_MODEL_NAME}, step=${SCAFFOLD_STEP}, total_members=${SCAFFOLD_TOTAL_MEMBERS}, protein_noise_std=${SCAFFOLD_PROTEIN_NOISE_STD}, small_molecule_noise_std=${SCAFFOLD_SMALL_MOLECULE_NOISE_STD}, metal_noise_std=${SCAFFOLD_METAL_NOISE_STD}"
 echo "Stage sampling counts: pocket=${NUM_POCKET_SEQS_PER_PDB}, scaffold=${NUM_SCAFFOLD_SEQS_PER_PDB}"

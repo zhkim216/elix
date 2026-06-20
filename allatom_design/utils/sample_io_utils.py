@@ -105,7 +105,6 @@ def fix_cif_annotation_types_atom_array(atom_array: AtomArray) -> AtomArray:
                 new_val = np.array([int(v) if str(v).lstrip("-").isdigit() else 0 for v in val])                
                 atom_array.del_annotation(ann)
                 atom_array.set_annotation(ann, new_val)
-
     float_annotations = ["B_iso_or_equiv", "Cartn_x", "Cartn_y", "Cartn_z", "occupancy", "b_factor"]
     for ann in float_annotations:
         if ann in atom_array.get_annotation_categories():

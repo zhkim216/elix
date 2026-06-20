@@ -162,6 +162,9 @@ def get_sd_example(
         pdb_id=pdb_id,
         pdb_key=pdb_key,
     )
+    if sample_is_designed and _is_protein_nonpolymer_complex(example["atom_array"]):
+        example.setdefault("data_category", "interface")
+        example.setdefault("phase", "train")
 
     featurizer_cfg = OmegaConf.to_container(featurizer_cfg, resolve=True)
     featurizer = sd_featurizer_for_design(**featurizer_cfg, sample_is_designed=sample_is_designed)
@@ -169,6 +172,17 @@ def get_sd_example(
     featurized = featurizer(example)
     featurized["native_res_name_by_chain_res_id"] = native_res_name_by_chain_res_id
     return featurized
+
+
+def _is_protein_nonpolymer_complex(atom_array: AtomArray) -> bool:
+    if "chain_type" not in atom_array.get_annotation_categories():
+        return False
+    chain_types = atom_array.chain_type
+    protein_values = [chain_type.value for chain_type in aw_enums.ChainTypeInfo.PROTEINS]
+    nonpolymer_values = [chain_type.value for chain_type in aw_enums.ChainTypeInfo.NON_POLYMERS]
+    has_protein = np.isin(chain_types, protein_values).any()
+    has_nonpolymer = np.isin(chain_types, nonpolymer_values).any()
+    return bool(has_protein and has_nonpolymer)
 
 def preprocess_input(
     example: dict[str, Any],
@@ -476,14 +490,20 @@ def collect_design_outputs(
 
         if len(query_pn_unit_iids) > 0:
             query_pn_unit_iid_set = set(map(str, query_pn_unit_iids))
-            protein_pn_unit_iids = [
-                pn_unit_iid for pn_unit_iid in protein_pn_unit_iids
+            query_protein_pn_unit_iids = [
+                pn_unit_iid
+                for pn_unit_iid in protein_pn_unit_iids
                 if pn_unit_iid in query_pn_unit_iid_set
             ]
-            ligand_pn_unit_iids = [
-                pn_unit_iid for pn_unit_iid in ligand_pn_unit_iids
+            query_ligand_pn_unit_iids = [
+                pn_unit_iid
+                for pn_unit_iid in ligand_pn_unit_iids
                 if pn_unit_iid in query_pn_unit_iid_set
             ]
+            if query_protein_pn_unit_iids:
+                protein_pn_unit_iids = query_protein_pn_unit_iids
+            if query_ligand_pn_unit_iids:
+                ligand_pn_unit_iids = query_ligand_pn_unit_iids
 
         previous_ligand_ccd_by_iid = {
             str(pn_unit_iid): str(ccd_code)

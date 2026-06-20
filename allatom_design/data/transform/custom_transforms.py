@@ -133,7 +133,7 @@ FEAT_TO_ATOM_DIM = {
     "atom_is_polymer": [0],
     "atom_is_hetero": [0],
     "atomic_number": [0],
-    "atom_charge": [0],
+    "atom_formal_charge": [0],
     "atom_is_aromatic": [0],
     "atom_chirality_tag": [0],
     "atom_is_covalent_modification": [0],
@@ -215,9 +215,9 @@ class FeaturizeCoordsAndMasks(Transform):
         feats["atom_is_hetero"] = torch.tensor(atom_array.hetero).float()
         feats["token_is_hetero"] = torch.tensor(apply_token_wise(atom_array, atom_array.hetero, np.any)).float()
         
-        # atomic number and charge
+        # atomic number and formal charge
         feats["atomic_number"] = torch.tensor(atom_array.atomic_number).long()
-        feats["atom_charge"] = torch.tensor(atom_array.charge).float()
+        feats["atom_formal_charge"] = torch.tensor(atom_array.charge).float()
         if hasattr(atom_array, "is_aromatic"):
             feats["atom_is_aromatic"] = torch.tensor(atom_array.is_aromatic).float()
         else:
