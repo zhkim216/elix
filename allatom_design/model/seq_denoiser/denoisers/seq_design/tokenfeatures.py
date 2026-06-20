@@ -268,7 +268,7 @@ class TokenFeatures(nn.Module):
         ligand_atom_features = {}
         ligand_aromatic = None
         if self.use_ligand_formal_charge:
-            ligand_formal_charge = batch["atom_charge"].float()
+            ligand_formal_charge = batch["atom_formal_charge"].float()
             ligand_atom_features["formal_charge"] = (ligand_formal_charge * ligand_mask).unsqueeze(-1)
         if self.use_ligand_aromatic_atom_feature or self.use_ligand_aromatic_edge_feature:
             ligand_aromatic = batch["atom_is_aromatic"].float() * ligand_mask
