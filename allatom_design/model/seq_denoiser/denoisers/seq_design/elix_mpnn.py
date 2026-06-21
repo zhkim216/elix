@@ -48,6 +48,7 @@ class ElixMPNN(nn.Module):
         self.hidden_dim = cfg.hidden_dim
         self.num_encoder_layers = cfg.num_encoder_layers
         self.num_decoder_layers = cfg.num_decoder_layers
+        self.use_mpnn_decoder = cfg.get("use_mpnn_decoder", True)
         self.k_neighbors = cfg.k_neighbors
         self.n_tokens = const.AF3_ENCODING.n_tokens
         self.expansion_mode = cfg.get("expansion_mode", None)
@@ -246,11 +247,12 @@ class ElixMPNN(nn.Module):
             )
 
         # Add residue-level features to the encoded features before passing through decoder layers
-        h_V = h_V + h_S
-        for layer in self.decoder_layers:
-            h_V, h_E = layer(h_V = h_V, h_E = h_E,
-                                mask_V = protein_residue_node_mask, E_idx = E_idx,
-                                mask_attend = protein_residue_node_mask_2d, h_V_C_skip=h_V_C_skip)
+        if self.use_mpnn_decoder:
+            h_V = h_V + h_S
+            for layer in self.decoder_layers:
+                h_V, h_E = layer(h_V = h_V, h_E = h_E,
+                                    mask_V = protein_residue_node_mask, E_idx = E_idx,
+                                    mask_attend = protein_residue_node_mask_2d, h_V_C_skip=h_V_C_skip)
 
         h_V_potts = self._expand_potts_nodes(h_V, h_V_C_skip)
         h_E = self._expand_potts_edges(h_V, h_E, E_idx, h_V_C_skip)

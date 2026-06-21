@@ -10,6 +10,7 @@ mpnn:
   k_neighbors: 32
   num_encoder_layers: 3
   num_decoder_layers: 3
+  use_mpnn_decoder: true
   dropout_p: 0.1
   ligand_conditioning: true
 
