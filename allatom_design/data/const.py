@@ -131,6 +131,19 @@ PROT_TOKEN_TO_LETTER: Final[dict[str, str]] = {v: k for k, v in PROT_LETTER_TO_T
 DUMMY_SEQ_ID: Final[int] = -1  # dummy sequence id to use for auth_seq_id when not present
 
 METAL_ELEMENTS: Final[frozenset[str]] = ATOMWORKS_METAL_ELEMENTS
+DEFAULT_METAL_COORDINATION_DISTANCE: Final[float] = 3.2
+DEFAULT_METAL_COORDINATION_DONOR_ELEMENTS: Final[tuple[str, ...]] = (
+    "N",
+    "O",
+    "F",
+    "P",
+    "S",
+    "Cl",
+    "As",
+    "Se",
+    "Br",
+    "I",
+)
 METALLOID_ELEMENTS: Final[frozenset[str]] = frozenset({"B", "SI", "GE", "AS", "SB", "TE", "PO"})
 HALOGEN_ELEMENTS: Final[frozenset[str]] = frozenset({"F", "CL", "BR", "I", "AT", "TS"})
 PERIOD4_TRANSITION_METALS: Final[frozenset[str]] = frozenset(
