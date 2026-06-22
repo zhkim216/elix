@@ -4,8 +4,11 @@ from typing import Any
 
 import pandas as pd
 
+from allatom_design.eval.sampling_inputs import parse_query_pn_unit_iids
+from allatom_design.eval.selectivity.pairs import normalize_target_ligand_side
 
-SELECTIVITY_GUIDANCE_METADATA_KEYS = (
+
+LEGACY_SELECTIVITY_GUIDANCE_METADATA_KEYS = (
     "selectivity_pair_id",
     "scaffold_side",
     "native_ligand_side",
@@ -20,33 +23,6 @@ SELECTIVITY_GUIDANCE_METADATA_KEYS = (
     "positive_ligand_role",
     "negative_ligand_role",
 )
-
-
-def normalize_target_ligand_side(value: Any) -> int | None:
-    """Normalize guidance target side to None, 1, or 2."""
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        raise ValueError(f"target_ligand_side must be null, 1, or 2; got {value!r}")
-    if isinstance(value, int):
-        side = value
-    elif isinstance(value, float):
-        if pd.isna(value):
-            return None
-        if not value.is_integer():
-            raise ValueError(f"target_ligand_side must be null, 1, or 2; got {value!r}")
-        side = int(value)
-    else:
-        text = str(value).strip()
-        if text == "" or text.lower() in {"none", "null", "nan"}:
-            return None
-        if text not in {"1", "2"}:
-            raise ValueError(f"target_ligand_side must be null, 1, or 2; got {value!r}")
-        side = int(text)
-
-    if side not in (1, 2):
-        raise ValueError(f"target_ligand_side must be null, 1, or 2; got {value!r}")
-    return side
 
 
 def _row_has(row: pd.Series, column: str) -> bool:
@@ -93,7 +69,7 @@ def resolve_selectivity_guidance_branches(
     target_ligand_side: int | None,
     example_id: str,
 ) -> dict[str, Any]:
-    """Resolve dual-ligand selectivity positive/negative branch metadata."""
+    """Resolve legacy composite dual-ligand selectivity branch metadata."""
     target_ligand_side = normalize_target_ligand_side(target_ligand_side)
     native_side = _required_ligand_side(row, "native_ligand_side", example_id)
     transformed_side = _required_ligand_side(row, "transformed_ligand_side", example_id)
@@ -129,3 +105,74 @@ def resolve_selectivity_guidance_branches(
     if "selectivity_pair_id" in row.index:
         metadata["selectivity_pair_id"] = str(row["selectivity_pair_id"])
     return metadata
+
+
+def resolve_selectivity_row(
+    *,
+    sampling_inputs_df: pd.DataFrame,
+    pdb_id: str | None = None,
+    pdb_key: str | None = None,
+    guidance_direction: int,
+) -> dict[str, Any]:
+    """Resolve one backbone's context from the legacy composite selectivity CSV."""
+    if guidance_direction not in (1, 2):
+        raise ValueError(f"guidance_direction must be 1 or 2, got {guidance_direction}")
+
+    required_cols = {
+        "pdb_id_1",
+        "pdb_id_2",
+        "query_pn_unit_iids_1",
+        "query_pn_unit_iids_2",
+        "ccd_code_1",
+        "ccd_code_2",
+    }
+    missing = required_cols - set(sampling_inputs_df.columns)
+    if missing:
+        raise ValueError(f"sampling_inputs_df missing columns: {sorted(missing)}")
+
+    if pdb_id is None and pdb_key is None:
+        raise ValueError("Either pdb_id or pdb_key must be provided")
+
+    pdb_lc = str(pdb_id).lower() if pdb_id is not None else None
+    pdb_key_lc = str(pdb_key).lower() if pdb_key is not None else None
+    matches: list[tuple[pd.Series, int]] = []
+    for self_pos in (1, 2):
+        for _, row in sampling_inputs_df.iterrows():
+            row_pdb_id = str(row[f"pdb_id_{self_pos}"]).lower()
+            query_iids = parse_query_pn_unit_iids(row[f"query_pn_unit_iids_{self_pos}"])
+            row_pdb_key = f"{row[f'pdb_id_{self_pos}']}_{query_iids[0]}_{query_iids[1]}".lower()
+            if pdb_key_lc is not None:
+                if row_pdb_key == pdb_key_lc:
+                    matches.append((row, self_pos))
+            elif row_pdb_id == pdb_lc:
+                matches.append((row, self_pos))
+
+    if len(matches) > 1:
+        raise ValueError(
+            f"Endpoint match is ambiguous for pdb_id={pdb_id!r}; pass pdb_key to disambiguate"
+        )
+    if len(matches) == 1:
+        row, self_pos = matches[0]
+        other_pos = 3 - self_pos
+        out = {
+            "pdb_id_self": str(row[f"pdb_id_{self_pos}"]),
+            "query_pn_unit_iids_self": parse_query_pn_unit_iids(
+                row[f"query_pn_unit_iids_{self_pos}"]
+            ),
+            "ccd_self": str(row[f"ccd_code_{self_pos}"]),
+            "pdb_id_partner": str(row[f"pdb_id_{other_pos}"]),
+            "query_pn_unit_iids_partner": parse_query_pn_unit_iids(
+                row[f"query_pn_unit_iids_{other_pos}"]
+            ),
+            "ccd_partner": str(row[f"ccd_code_{other_pos}"]),
+            "guidance_target_ccd": str(row[f"ccd_code_{guidance_direction}"]),
+            "self_position": self_pos,
+        }
+        if "pocket_subcluster_id" in sampling_inputs_df.columns:
+            out["pocket_subcluster_id"] = int(row["pocket_subcluster_id"])
+        return out
+
+    raise ValueError(
+        f"pdb_id={pdb_id} pdb_key={pdb_key} not found in paired selectivity columns of "
+        f"sampling_inputs_df (rows={len(sampling_inputs_df)})"
+    )

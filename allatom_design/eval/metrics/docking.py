@@ -7,20 +7,22 @@ from rdkit import Chem
 from rdkit.Chem import rdFMCS, rdMolAlign
 from rdkit.Geometry import Point3D
 
-from atomworks.constants import METAL_ELEMENTS
 from atomworks.io.tools.rdkit import atom_array_to_rdkit
 from atomworks.ml.transforms.atom_array import apply_and_spread_residue_wise
 from atomworks.ml.utils.geometry import align_atom_arrays
 
+from allatom_design.data.const import METAL_ELEMENTS
 from allatom_design.data.transform.custom_transforms import (
-    annotate_ligand_pockets,
-    annotate_ligand_pockets_calpha,
-    annotate_ligand_pockets_pseudocb,
+    count_metal_coordinating_protein_residues,
 )
 from allatom_design.utils.sample_io_utils import save_cif_file
 
-from allatom_design.eval.utils.metrics.af3_confidence import extract_af3_confidence_metrics
-from allatom_design.eval.utils.misc import normalize_ccd_code
+from allatom_design.eval.metrics.af3_confidence import extract_af3_confidence_metrics
+from allatom_design.eval.pocket_constraints import (
+    annotate_ligand_pocket,
+    resolve_pocket_annotation_method,
+)
+from allatom_design.eval.chemical_components import normalize_ccd_code
 
 
 def _docking_metric_error(
@@ -353,40 +355,23 @@ def _annotate_reference_ligand_pocket(
     method: str,
     n_min_ligand_atoms: int = 5,
 ) -> AtomArray:
-    method_normalized = method.replace("-", "_").lower()
-    if method_normalized in {"all_atom", "allatom", "atom"}:
-        annotated = annotate_ligand_pockets(
-            atom_array=reference_atom_array,
-            pocket_distance=pocket_distance,
-            n_min_ligand_atoms=n_min_ligand_atoms,
-            annotation_name=annotation_name,
-            receptor_pn_unit_iids=receptor_pn_unit_iids,
-            ligand_pn_unit_iids=ligand_pn_unit_iids,
-        )
-    elif method_normalized in {"calpha", "c_alpha", "ca"}:
-        annotated = annotate_ligand_pockets_calpha(
-            atom_array=reference_atom_array,
-            pocket_distance=pocket_distance,
-            n_min_ligand_atoms=n_min_ligand_atoms,
-            annotation_name=annotation_name,
-            receptor_pn_unit_iids=receptor_pn_unit_iids,
-            ligand_pn_unit_iids=ligand_pn_unit_iids,
-        )
-    elif method_normalized in {"pseudocb", "pseudo_cb", "pseudo_cbeta"}:
-        annotated = annotate_ligand_pockets_pseudocb(
-            atom_array=reference_atom_array,
-            pocket_distance=pocket_distance,
-            n_min_ligand_atoms=n_min_ligand_atoms,
-            annotation_name=annotation_name,
-            receptor_pn_unit_iids=receptor_pn_unit_iids,
-            ligand_pn_unit_iids=ligand_pn_unit_iids,
-        )
-    else:
+    try:
+        resolved_method = resolve_pocket_annotation_method(method)
+    except ValueError as exc:
         raise ValueError(
             "reference_pocket_annotation_method must be one of "
             "'all_atom', 'calpha', or 'pseudocb', got "
             f"{method!r}"
-        )
+        ) from exc
+    annotated = annotate_ligand_pocket(
+        atom_array=reference_atom_array,
+        pocket_distance=pocket_distance,
+        n_min_ligand_atoms=n_min_ligand_atoms,
+        annotation_name=annotation_name,
+        receptor_pn_unit_iids=receptor_pn_unit_iids,
+        ligand_pn_unit_iids=ligand_pn_unit_iids,
+        pocket_annotation_method=resolved_method,
+    )
 
     pocket_mask = apply_and_spread_residue_wise(
         annotated,
@@ -881,6 +866,7 @@ def compute_docking_metrics_atomarray(*, pred_atom_array: AtomArray,
                                        save_aligned: bool = True,
                                        ref_sample_is_designed: bool = True,
                                        reference_pocket_annotation_method: str | None = None,
+                                       metal_pn_unit_iids: list[str] | None = None,
                                        ) -> dict[str, float]:
     """
     Compute docking metrics between a designed structure and its predicted structure, using atom array.
@@ -901,6 +887,9 @@ def compute_docking_metrics_atomarray(*, pred_atom_array: AtomArray,
             reference_atom_array. Defaults to ligand_pn_unit_iids.
         ref_sample_is_designed: Selects the default reference pocket annotation
             method when reference_pocket_annotation_method is None.
+        metal_pn_unit_iids: Optional predicted metal pn_unit_iids for the direct
+            predicted metal donor-residue count. If None, predicted single-atom
+            metal pn_unit_iids are auto-detected.
     """
     if reference_atom_array is None:
         reference_atom_array = sample_atom_array
@@ -911,33 +900,42 @@ def compute_docking_metrics_atomarray(*, pred_atom_array: AtomArray,
         reference_ligand_pn_unit_iids=reference_ligand_pn_unit_iids,
         ligand_smiles=ligand_smiles,
     )
+    metal_donor_residue_metadata = {
+        "metal_num_predicted_coordinating_protein_residues": count_metal_coordinating_protein_residues(
+            atom_array=pred_atom_array,
+            receptor_pn_unit_iids=receptor_pn_unit_iids,
+            metal_pn_unit_iids=metal_pn_unit_iids,
+        )
+    }
+    metric_metadata.update(metal_donor_residue_metadata)
     if ligand_smiles is not None and len(ligand_smiles) != len(ligand_pn_unit_iids):
         return _docking_metric_error(
             "ligand_smiles must have the same length as ligand_pn_unit_iids",
             ligand_ccd_code=ligand_ccd_code,
             metric_metadata=metric_metadata,
         )
-    metal_pn_unit_iids = _selected_metal_pn_unit_iids(sample_atom_array, ligand_pn_unit_iids)
+    selected_sample_metal_pn_unit_iids = _selected_metal_pn_unit_iids(sample_atom_array, ligand_pn_unit_iids)
     if reference_pocket_annotation_method is None:
         reference_pocket_annotation_method = "calpha" if ref_sample_is_designed else "all_atom"
     metal_reference_pocket_annotation_method = reference_pocket_annotation_method
     small_molecule_reference_pocket_annotation_method = reference_pocket_annotation_method
 
-    if metal_pn_unit_iids:
+    if selected_sample_metal_pn_unit_iids:
         metal_ligand_ccd_code = _ligand_ccd_code_for_iids(
             sample_atom_array,
-            metal_pn_unit_iids,
+            selected_sample_metal_pn_unit_iids,
             [
                 str(code)
                 for pn_unit_iid, code in zip(ligand_pn_unit_iids, ligand_ccd_codes or [])
-                if str(pn_unit_iid) in set(metal_pn_unit_iids)
+                if str(pn_unit_iid) in set(selected_sample_metal_pn_unit_iids)
             ] or None,
         )
         metal_metadata = _metadata_for_ligand_metric(
-            ligand_pn_unit_iids=metal_pn_unit_iids,
-            reference_ligand_pn_unit_iids=metal_pn_unit_iids,
+            ligand_pn_unit_iids=selected_sample_metal_pn_unit_iids,
+            reference_ligand_pn_unit_iids=selected_sample_metal_pn_unit_iids,
             ligand_smiles=None,
         )
+        metal_metadata.update(metal_donor_residue_metadata)
         return _compute_metal_docking_metrics_atomarray(
             pred_atom_array=pred_atom_array,
             sample_atom_array=sample_atom_array,
@@ -945,7 +943,7 @@ def compute_docking_metrics_atomarray(*, pred_atom_array: AtomArray,
             pred_sample_path=pred_sample_path,
             pocket_distance_for_docking_metrics=pocket_distance_for_docking_metrics,
             receptor_pn_unit_iids=receptor_pn_unit_iids,
-            metal_pn_unit_iids=metal_pn_unit_iids,
+            metal_pn_unit_iids=selected_sample_metal_pn_unit_iids,
             ligand_ccd_code=metal_ligand_ccd_code,
             save_aligned=save_aligned,
             reference_pocket_annotation_method=metal_reference_pocket_annotation_method,

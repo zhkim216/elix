@@ -12,14 +12,14 @@ from allatom_design.data.transform.ligand_conformers import (
     find_query_small_molecule_ligands,
     generate_ligand_conformer_decoys,
 )
-from allatom_design.eval.utils.data_utils import (
-    _matched_sampling_input_row,
-    parse_query_pn_unit_iids,
+from allatom_design.eval.sampling_inputs import (
+    matched_sampling_input_row,
+    resolve_query_pn_unit_iids_from_sampling_row,
 )
-from allatom_design.eval.utils.ensemble_conditioning import (
+from allatom_design.eval.sampling.sequence_design.ensemble.conditioning import (
     normalize_ensemble_conditioning_cfg,
 )
-from allatom_design.eval.utils.ensemble_staging import (
+from allatom_design.eval.sampling.sequence_design.ensemble.staging import (
     EnsembleStagingResult as LigandConformerStagingResult,
     expand_pos_constraint_df_for_members,
     iter_member_batches,
@@ -73,12 +73,12 @@ def stage_ligand_conformer_ensembles(
         input_path = Path(pdb_path)
         target_sample_id = input_path.stem
         pdb_id = target_sample_id.split("_")[0]
-        sampling_row = _matched_sampling_input_row(
+        sampling_row = matched_sampling_input_row(
             sampling_inputs_df,
             pdb_id=pdb_id,
             pdb_key=target_sample_id,
         )
-        query_pn_unit_iids = _query_pn_unit_iids_from_sampling_row(sampling_row)
+        query_pn_unit_iids = resolve_query_pn_unit_iids_from_sampling_row(sampling_row)
 
         example = load_example_with_parse(str(input_path), cif_parse_cfg)
         atom_array = example["atom_array"]
@@ -347,18 +347,6 @@ def ligand_conformer_target_count(
     staging_result: LigandConformerStagingResult,
 ) -> int:
     return staging_result.target_count(batch_pdb_paths)
-
-
-def _query_pn_unit_iids_from_sampling_row(row: pd.Series | None) -> list[str]:
-    if row is None:
-        return []
-    for column in ("query_pn_unit_iids", "query_pn_unit_iids_json"):
-        if column not in row.index:
-            continue
-        parsed = parse_query_pn_unit_iids(row[column])
-        if parsed:
-            return parsed
-    return []
 
 
 def _manifest_row(

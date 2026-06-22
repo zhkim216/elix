@@ -10,7 +10,7 @@ from atomworks.ml.utils.geometry import align_atom_arrays
 
 from allatom_design.utils.sample_io_utils import save_cif_file
 
-from allatom_design.eval.utils.metrics.af3_confidence import extract_af3_confidence_metrics
+from allatom_design.eval.metrics.af3_confidence import extract_af3_confidence_metrics
 
 
 def _ca_mask_by_chain_res_offset(atom_array: AtomArray, ca_mask: np.ndarray) -> dict[tuple[str, int], int]:

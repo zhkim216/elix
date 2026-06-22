@@ -10,11 +10,10 @@ import pandas as pd
 from omegaconf import DictConfig, OmegaConf
 
 from allatom_design.data.transform.sd_featurizer import featurizer_designed_samples
-from allatom_design.eval.utils.data_utils import (
-    preprocess_input,
-    resolve_query_pn_unit_iids,
-)
-from allatom_design.utils.sample_io_utils import load_example_with_parse
+from allatom_design.eval.input_preprocessing import preprocess_input
+from allatom_design.eval.sampling_inputs import resolve_query_pn_unit_iids
+from allatom_design.utils.atom_array_utils import insert_unk_residues_for_gaps_in_atom_array
+from allatom_design.utils.sample_io_utils import load_example_with_parse, save_cif_file
 
 
 def load_sampling_inputs_csv(sampling_inputs_csv: str | None) -> pd.DataFrame | None:
@@ -52,6 +51,37 @@ def filter_sample_paths_by_sampling_inputs(
         if sample_key in pdb_keys or sample_pdb_id in pdb_ids:
             filtered_paths.append(sample_path)
     return filtered_paths
+
+
+def prepare_tc_template_cif(
+    atom_array,
+    out_path: str,
+    cif_save_args: dict,
+) -> str:
+    """
+    Prepare a template CIF file for AF3 template-conditioned prediction.
+
+    1. Separate protein and ligand atom arrays.
+    2. Insert UNK CA atoms for gaps in protein backbone.
+    3. Add dummy b_factor if missing.
+    4. Save to CIF and fix formal charges through the repo CIF writer.
+    """
+    prot_mask = atom_array.chain_type == aw_enums.ChainType.POLYPEPTIDE_L
+    ligand_mask = np.isin(atom_array.chain_type, list(aw_enums.ChainTypeInfo.NON_POLYMERS))
+
+    prot_atom_array = atom_array[prot_mask]
+    ligand_atom_array = atom_array[ligand_mask]
+    prot_atom_array_with_gaps = insert_unk_residues_for_gaps_in_atom_array(prot_atom_array)
+
+    tc_atom_array = prot_atom_array_with_gaps + ligand_atom_array
+    tc_atom_array.atom_id = np.arange(1, len(tc_atom_array) + 1)
+
+    if "b_factor" not in tc_atom_array.get_annotation_categories():
+        tc_atom_array.set_annotation("b_factor", np.zeros(len(tc_atom_array)))
+
+    cif_save_args = dict(cif_save_args)
+    cif_save_args.setdefault("file_type", "cif")
+    return str(save_cif_file(tc_atom_array, out_path, cif_save_cfg=OmegaConf.create(cif_save_args)))
 
 
 def extract_pdb_chain_info(atom_array) -> dict[str, list[str]]:
