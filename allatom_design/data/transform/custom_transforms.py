@@ -27,7 +27,11 @@ from atomworks.constants import (
     UNKNOWN_RNA,
 )
 
-from allatom_design.data.const import METAL_ELEMENTS
+from allatom_design.data.const import (
+    DEFAULT_METAL_COORDINATION_DISTANCE,
+    DEFAULT_METAL_COORDINATION_DONOR_ELEMENTS,
+    METAL_ELEMENTS,
+)
 import atomworks.enums as aw_enums
 from atomworks.enums import ChainType
 from atomworks.ml.utils.token import get_token_starts
@@ -555,6 +559,100 @@ class AddCachedResidueData(Transform): #! (JH) changed 251001
         return data
 
 ### Binding site annotation
+def _normalized_element_values(values: Sequence[Any] | np.ndarray) -> np.ndarray:
+    return np.array([str(value).strip().upper() for value in values])
+
+
+def _unique_preserving_order(values: Sequence[Any]) -> list[str]:
+    unique_values = []
+    for value in values:
+        value = str(value)
+        if value not in unique_values:
+            unique_values.append(value)
+    return unique_values
+
+
+def _detect_metal_pn_unit_iids(atom_array: AtomArray) -> list[str]:
+    pn_unit_iids = np.asarray(atom_array.pn_unit_iid).astype(str)
+    elements = _normalized_element_values(atom_array.element)
+    metal_pn_unit_iids = []
+    for pn_unit_iid in np.unique(pn_unit_iids):
+        mask = (pn_unit_iids == pn_unit_iid) & (elements != "H")
+        if int(np.sum(mask)) == 1 and elements[mask][0] in METAL_ELEMENTS:
+            metal_pn_unit_iids.append(str(pn_unit_iid))
+    return metal_pn_unit_iids
+
+
+def count_metal_coordinating_protein_residues(
+    atom_array: AtomArray,
+    receptor_pn_unit_iids: list[str],
+    metal_pn_unit_iids: list[str] | None = None,
+    coordination_distance: float = DEFAULT_METAL_COORDINATION_DISTANCE,
+    donor_elements: Sequence[str] = DEFAULT_METAL_COORDINATION_DONOR_ELEMENTS,
+) -> int:
+    """Count receptor residues with donor atoms near selected metal ions."""
+    if not all(hasattr(atom_array, name) for name in ("pn_unit_iid", "element", "coord", "res_id")):
+        return 0
+    if len(atom_array) == 0 or not receptor_pn_unit_iids:
+        return 0
+
+    pn_unit_iids = np.asarray(atom_array.pn_unit_iid).astype(str)
+    elements = _normalized_element_values(atom_array.element)
+    selected_metal_iids = (
+        _unique_preserving_order(metal_pn_unit_iids)
+        if metal_pn_unit_iids is not None
+        else _detect_metal_pn_unit_iids(atom_array)
+    )
+    if not selected_metal_iids:
+        return 0
+
+    finite_coords = np.isfinite(np.asarray(atom_array.coord, dtype=float)).all(axis=1)
+    metal_mask = (
+        np.isin(pn_unit_iids, selected_metal_iids)
+        & np.isin(elements, list(METAL_ELEMENTS))
+        & finite_coords
+    )
+    metal_coords = np.asarray(atom_array.coord[metal_mask], dtype=float)
+    if len(metal_coords) == 0:
+        return 0
+
+    donor_element_set = frozenset(str(element).strip().upper() for element in donor_elements)
+    donor_mask = (
+        np.isin(pn_unit_iids, [str(iid) for iid in receptor_pn_unit_iids])
+        & np.isin(elements, list(donor_element_set))
+        & finite_coords
+    )
+    if hasattr(atom_array, "occupancy"):
+        donor_mask &= np.asarray(atom_array.occupancy) > 0
+
+    donor_indices = np.where(donor_mask)[0]
+    if len(donor_indices) == 0:
+        return 0
+
+    donor_coords = np.asarray(atom_array.coord[donor_indices], dtype=float)
+    delta = donor_coords[:, None, :] - metal_coords[None, :, :]
+    near_metal = np.any(
+        np.sum(delta * delta, axis=2) <= coordination_distance * coordination_distance + 1e-6,
+        axis=1,
+    )
+
+    residue_keys = set()
+    ins_codes = (
+        np.asarray(atom_array.ins_code).astype(str)
+        if hasattr(atom_array, "ins_code")
+        else np.full(len(atom_array), "", dtype=object)
+    )
+    for atom_idx in donor_indices[near_metal]:
+        residue_keys.add(
+            (
+                str(atom_array.pn_unit_iid[atom_idx]),
+                int(atom_array.res_id[atom_idx]),
+                str(ins_codes[atom_idx]),
+            )
+        )
+    return len(residue_keys)
+
+
 def annotate_ligand_pockets(
     atom_array: AtomArray = None,
     pocket_distance: float = 5.0,
