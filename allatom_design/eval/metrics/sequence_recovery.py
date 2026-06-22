@@ -1,8 +1,8 @@
 """
-Calculate sequence recovery from folders of native and designed CIF files.
+Calculate sequence recovery from native and designed CIF files.
 
 Usage:
-    python -m allatom_design.eval.eval_utils.sequence_recovery \
+    python -m allatom_design.eval.metrics.sequence_recovery \
         --native_cif_dir /path/to/native_cifs \
         --designed_sample_dir /path/to/samples \
         --sampling_inputs_csv /path/to/sampling_inputs.csv \
@@ -11,8 +11,10 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 from collections import defaultdict
 from pathlib import Path
+from collections.abc import Sequence
 
 import numpy as np
 import pandas as pd
@@ -51,12 +53,14 @@ DESIGNED_CIF_PARSE_CFG = {
 
 
 def calculate_sequence_recovery(input_atom_array: AtomArray, designed_atom_array: AtomArray,
-                                pocket_distances_for_seq_recovery: list[float] = [4.0, 5.0, 6.0],
-                                pocket_distance_bins: list[tuple[float, float]] | None = None,
+                                pocket_distances_for_seq_recovery: Sequence[float] | None = None,
+                                pocket_distance_bins: Sequence[tuple[float, float]] | None = None,
                                 n_min_ligand_atoms: int = 5) -> dict[str, float]:
     """
     Calculate sequence recovery and pocket sequence recovery between input and designed atom arrays.
     """
+    if pocket_distances_for_seq_recovery is None:
+        pocket_distances_for_seq_recovery = (4.0, 5.0, 6.0)
     seq_recovery_metrics = {}
 
     input_valid_residue_mask = get_valid_standard_aa_residue_mask(input_atom_array)
@@ -202,11 +206,18 @@ def calculate_sequence_recovery_from_folders(
     designed_sample_dir: str | Path,
     sampling_inputs_csv: str | Path,
     output_csv: str | Path | None = None,
-    pocket_distances: list[float] = [4.0, 5.0, 6.0],
-    native_cif_parse_cfg: dict = NATIVE_CIF_PARSE_CFG,
-    designed_cif_parse_cfg: dict = DESIGNED_CIF_PARSE_CFG,
+    pocket_distances: Sequence[float] | None = None,
+    native_cif_parse_cfg: dict | None = None,
+    designed_cif_parse_cfg: dict | None = None,
 ) -> pd.DataFrame:
     """Calculate sequence recovery for designed samples against native reference structures."""
+    if pocket_distances is None:
+        pocket_distances = (4.0, 5.0, 6.0)
+    if native_cif_parse_cfg is None:
+        native_cif_parse_cfg = NATIVE_CIF_PARSE_CFG
+    if designed_cif_parse_cfg is None:
+        designed_cif_parse_cfg = DESIGNED_CIF_PARSE_CFG
+
     native_cif_dir = Path(native_cif_dir)
     designed_sample_dir = Path(designed_sample_dir)
     pd.read_csv(sampling_inputs_csv)  # validate CSV exists
@@ -263,16 +274,14 @@ def calculate_sequence_recovery_from_folders(
     return results_df
 
 
-if __name__ == "__main__":
-    import argparse
-
+def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Calculate sequence recovery from CIF folders")
     parser.add_argument("--native_cif_dir", type=str, required=True)
     parser.add_argument("--designed_sample_dir", type=str, required=True)
     parser.add_argument("--sampling_inputs_csv", type=str, required=True)
     parser.add_argument("--output_csv", type=str, default=None)
     parser.add_argument("--pocket_distances", nargs="+", type=float, default=[4.0, 5.0, 6.0])
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     calculate_sequence_recovery_from_folders(
         native_cif_dir=args.native_cif_dir,
@@ -281,3 +290,7 @@ if __name__ == "__main__":
         output_csv=args.output_csv,
         pocket_distances=args.pocket_distances,
     )
+
+
+if __name__ == "__main__":
+    main()

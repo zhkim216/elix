@@ -9,14 +9,15 @@ from typing import Any
 import pandas as pd
 from omegaconf import DictConfig
 
-from allatom_design.eval.utils.data_utils import (
-    _matched_sampling_input_row,
+from allatom_design.eval.sampling_inputs import (
+    matched_sampling_input_row,
     parse_query_pn_unit_iids,
+    resolve_query_pn_unit_iids_from_sampling_row,
 )
-from allatom_design.eval.utils.ensemble_conditioning import (
+from allatom_design.eval.sampling.sequence_design.ensemble.conditioning import (
     normalize_ensemble_conditioning_cfg,
 )
-from allatom_design.eval.utils.ensemble_staging import (
+from allatom_design.eval.sampling.sequence_design.ensemble.staging import (
     EnsembleStagingResult,
     compute_member_coefficients,
     sampling_df_has_pdb_key,
@@ -91,7 +92,7 @@ def stage_pharm_retrieval_ensembles(
         query_dir = input_path.parent
         query_id = query_dir.name
         target_sample_id = input_path.stem
-        sampling_row = _matched_sampling_input_row(
+        sampling_row = matched_sampling_input_row(
             sampling_inputs_df,
             pdb_id=query_id,
             pdb_key=target_sample_id,
@@ -315,7 +316,7 @@ def _query_pn_unit_iids_for_target(
     query_metadata: dict[str, pd.Series],
     default_query_pn_unit_iids: list[str],
 ) -> list[str]:
-    row_iids = _query_pn_unit_iids_from_sampling_row(sampling_row)
+    row_iids = resolve_query_pn_unit_iids_from_sampling_row(sampling_row)
     if row_iids:
         return row_iids
 
@@ -333,18 +334,6 @@ def _query_pn_unit_iids_for_target(
         f"selected_queries_tsv, or small_molecule.pharm_retrieval.query_pn_unit_iids; "
         f"missing for query_id={query_id}"
     )
-
-
-def _query_pn_unit_iids_from_sampling_row(row: pd.Series | None) -> list[str]:
-    if row is None:
-        return []
-    for column in ("query_pn_unit_iids", "query_pn_unit_iids_json"):
-        if column not in row.index:
-            continue
-        parsed = parse_query_pn_unit_iids(row[column])
-        if parsed:
-            return parsed
-    return []
 
 
 def _discover_query_members(query_dir: Path) -> list[Path]:

@@ -173,3 +173,13 @@ def sampling_row_for_member(
     if "pdb_id" in row and (row["pdb_id"] is None or str(row["pdb_id"]).strip() == ""):
         row["pdb_id"] = target_sample_id.split("_")[0]
     return row
+
+
+__all__ = [
+    "EnsembleStagingResult",
+    "compute_member_coefficients",
+    "expand_pos_constraint_df_for_members",
+    "iter_member_batches",
+    "sampling_df_has_pdb_key",
+    "sampling_row_for_member",
+]

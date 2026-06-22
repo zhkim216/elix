@@ -16,22 +16,23 @@ from allatom_design.eval.structure_prediction.af3_input_utils import (
     extract_pdb_chain_info,
     load_af3_eval_sample,
     load_sampling_inputs_csv,
+    prepare_tc_template_cif,
 )
-from allatom_design.eval.structure_prediction.run_tc_af3 import prepare_tc_template_cif
-from allatom_design.eval.utils.data_utils import (
-    parse_query_pn_unit_iids,
-    prepare_af3_prediction,
-)
-from allatom_design.eval.utils.eval_setup_utils import get_pdb_files, wandb_setup
-from allatom_design.eval.utils.folding_utils import (
+from allatom_design.eval.structure_prediction.inputs import prepare_af3_prediction
+from allatom_design.eval.structure_prediction.af3_runner import (
     find_pred_sample_path_af3,
-    make_af3_json,
     run_af3_template_conditioned,
 )
-from allatom_design.eval.utils.metrics import compute_docking_metrics_atomarray
-from allatom_design.eval.utils.selectivity import (
-    SELECTIVITY_GUIDANCE_METADATA_KEYS,
+from allatom_design.eval.structure_prediction.af3_json import make_af3_json
+from allatom_design.eval.input_files import get_pdb_files
+from allatom_design.eval.run_logging import wandb_setup
+from allatom_design.eval.sampling_inputs import parse_query_pn_unit_iids
+from allatom_design.eval.metrics import compute_docking_metrics_atomarray
+from allatom_design.eval.selectivity import (
     normalize_target_ligand_side,
+)
+from allatom_design.eval.selectivity.legacy import (
+    LEGACY_SELECTIVITY_GUIDANCE_METADATA_KEYS,
     resolve_selectivity_guidance_branches,
 )
 
@@ -68,6 +69,21 @@ def filter_selectivity_sample_paths(
         if resolve_input_sample_id(sample_key, sampling_inputs_df) is not None:
             filtered.append(sample_path)
     return filtered
+
+
+def selectivity_pair_inputs_enabled(sampling_inputs_df: pd.DataFrame) -> bool:
+    return {"selectivity_pair_id", "selectivity_side", "partner_pdb_key"}.issubset(
+        sampling_inputs_df.columns
+    )
+
+
+def reject_selectivity_pair_inputs(sampling_inputs_df: pd.DataFrame) -> None:
+    if selectivity_pair_inputs_enabled(sampling_inputs_df):
+        raise NotImplementedError(
+            "run_selectivity_dual_ligand_tc_af3.py still evaluates legacy composite "
+            "dual-ligand outputs. Paired selectivity outputs contain one ligand "
+            "per side and need a separate AF3 evaluator."
+        )
 
 
 def _pn_unit_mask(atom_array, pn_unit_iid: str) -> np.ndarray:
@@ -178,7 +194,7 @@ def _base_metric_row(
         "original_ligand_pn_unit_iid": ligand_meta.get("original_ligand_pn_unit_iid", ""),
         "diffusion_idx": diffusion_idx,
     }
-    for key in SELECTIVITY_GUIDANCE_METADATA_KEYS:
+    for key in LEGACY_SELECTIVITY_GUIDANCE_METADATA_KEYS:
         row[key] = branch_metadata.get(key, "")
     return row
 
@@ -380,6 +396,7 @@ def run_selectivity_dual_ligand_tc_af3(cfg: DictConfig) -> Path:
         yaml.safe_dump(cfg_dict, f)
 
     sampling_inputs_df = load_sampling_inputs_csv(cfg.sampling_inputs_csv)
+    reject_selectivity_pair_inputs(sampling_inputs_df)
     sample_paths = get_pdb_files(**cfg.pdb_cfg)
     before_filter = len(sample_paths)
     sample_paths = filter_selectivity_sample_paths(sample_paths, sampling_inputs_df)
