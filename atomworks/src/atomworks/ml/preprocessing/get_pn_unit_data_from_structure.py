@@ -409,6 +409,7 @@ class DataPreprocessor:
                         distance=metal_coord_distance,
                         partner_mask=is_donor_partner_mask,
                         include_element_counts=True,
+                        include_atom_details=True,
                     )
                 elif is_halide:
                     n_coordination_partners_halide = halide_coordination_counts.get(query_pn_unit_iid, 0)
@@ -455,6 +456,9 @@ class DataPreprocessor:
                         # JH changed: preserve optional donor element breakdowns on per-partner rows
                         if "element_counts" in p:
                             decoded_partner["element_counts"] = p["element_counts"]
+                        # JH changed: preserve optional atom-level donor distances on metal contact rows
+                        if "donor_atoms" in p:
+                            decoded_partner["donor_atoms"] = p["donor_atoms"]
                         decoded.append(decoded_partner)
                     return decoded
 

@@ -422,6 +422,7 @@ def count_per_partner_contacts(
     distance: float,
     partner_mask: np.ndarray | None = None,
     include_element_counts: bool = False,
+    include_atom_details: bool = False,
 ) -> list[dict]:
     """
     For a single query (small molecule / metal / halide), list how many atoms each partner
@@ -438,10 +439,12 @@ def count_per_partner_contacts(
         partner_mask: Optional bool mask over ``filtered_atom_array`` restricting eligible
             partner atoms (e.g. donor elements only, or non-C only). Default: all atoms.
         include_element_counts: Whether to include per-partner donor element counts.
+        include_atom_details: Whether to include one JSON-safe entry per counted atom,
+            including its identity annotations and minimum distance to the query atoms.
 
     Returns:
         List of ``{"pn_unit_iid": int, "chain_iid": str, "count": int}``, optionally with
-        ``element_counts``. Results are sorted by count descending. Empty list if no contacts.
+        ``element_counts`` and ``donor_atoms``. Results are sorted by count descending. Empty list if no contacts.
         ``pn_unit_iid`` is returned as the raw remapped integer; callers are expected to decode
         via ``id_map_dict["pn_unit_iid"]`` to the verbose string before persisting.
     """
@@ -464,30 +467,89 @@ def count_per_partner_contacts(
 
     partner_pn_unit_iids = filtered_atom_array.pn_unit_iid[eligible]
     partner_chain_iids = filtered_atom_array.chain_iid[eligible]
+    eligible_indices = np.flatnonzero(eligible)
 
     # Group (pn_unit_iid, chain_iid) -> atom count
     counts: dict[tuple[int, str], int] = defaultdict(int)
     # JH changed: optionally preserve donor element counts in the existing per-partner schema
     element_counts: dict[tuple[int, str], dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    if include_element_counts:
-        partner_elements = filtered_atom_array.element[eligible]
-        for p, c, e in zip(
-            partner_pn_unit_iids.tolist(),
-            partner_chain_iids.tolist(),
-            partner_elements.tolist(),
+    # JH changed: optionally preserve one donor atom detail per counted atom.
+    atom_details: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
+
+    atom_distances: np.ndarray | None = None
+    if include_atom_details:
+        atom_distances = np.min(cdist(query_coord, filtered_atom_array.coord[eligible]), axis=0)
+
+    def _annotation_as_str_or_none(atom_idx: int, annotation: str) -> str | None:
+        if annotation not in filtered_atom_array.get_annotation_categories():
+            return None
+        value = filtered_atom_array.get_annotation(annotation)[atom_idx]
+        if isinstance(value, np.generic):
+            value = value.item()
+        if value is None:
+            return None
+        value_str = str(value)
+        return value_str or None
+
+    def _res_id_as_int_or_none(atom_idx: int) -> int | None:
+        if "res_id" not in filtered_atom_array.get_annotation_categories():
+            return None
+        value = filtered_atom_array.res_id[atom_idx]
+        if isinstance(value, np.generic):
+            value = value.item()
+        try:
+            res_id = int(value)
+        except (TypeError, ValueError):
+            return None
+        if res_id == 0 and all(
+            _annotation_as_str_or_none(atom_idx, annotation) is None
+            for annotation in ("atom_name", "res_name", "chain_id")
         ):
-            key = (int(p), str(c))
-            counts[key] += 1
-            element_counts[key][str(e).upper()] += 1
-    else:
-        for p, c in zip(partner_pn_unit_iids.tolist(), partner_chain_iids.tolist()):
-            counts[(int(p), str(c))] += 1
+            return None
+        return res_id
+
+    partner_elements = filtered_atom_array.element[eligible]
+    for eligible_pos, atom_idx, p, c, e in zip(
+        range(len(eligible_indices)),
+        eligible_indices.tolist(),
+        partner_pn_unit_iids.tolist(),
+        partner_chain_iids.tolist(),
+        partner_elements.tolist(),
+    ):
+        key = (int(p), str(c))
+        counts[key] += 1
+        element = str(e).upper()
+        if include_element_counts:
+            element_counts[key][element] += 1
+        if include_atom_details:
+            atom_details[key].append(
+                {
+                    "element": element,
+                    "atom_name": _annotation_as_str_or_none(atom_idx, "atom_name"),
+                    "res_name": _annotation_as_str_or_none(atom_idx, "res_name"),
+                    "res_id": _res_id_as_int_or_none(atom_idx),
+                    "chain_id": _annotation_as_str_or_none(atom_idx, "chain_id"),
+                    "chain_iid": str(c),
+                    "distance": float(round(float(atom_distances[eligible_pos]), 3)),
+                }
+            )
 
     partner_contacts = []
     for (p, c), n in sorted(counts.items(), key=lambda kv: kv[1], reverse=True):
         contact = {"pn_unit_iid": p, "chain_iid": c, "count": n}
         if include_element_counts:
             contact["element_counts"] = dict(sorted(element_counts[(p, c)].items()))
+        if include_atom_details:
+            contact["donor_atoms"] = sorted(
+                atom_details[(p, c)],
+                key=lambda atom: (
+                    atom["distance"],
+                    atom["chain_id"] or "",
+                    atom["res_id"] if atom["res_id"] is not None else -1,
+                    atom["atom_name"] or "",
+                    atom["element"],
+                ),
+            )
         partner_contacts.append(contact)
 
     return partner_contacts
