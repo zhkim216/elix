@@ -408,6 +408,7 @@ class DataPreprocessor:
                         cell_list=cell_list,
                         distance=metal_coord_distance,
                         partner_mask=is_donor_partner_mask,
+                        include_element_counts=True,
                     )
                 elif is_halide:
                     n_coordination_partners_halide = halide_coordination_counts.get(query_pn_unit_iid, 0)
@@ -444,14 +445,18 @@ class DataPreprocessor:
                 def _decode_per_partner(raw_list: list[dict] | None) -> list[dict] | None:
                     if raw_list is None:
                         return None
-                    return [
-                        {
+                    decoded = []
+                    for p in raw_list:
+                        decoded_partner = {
                             "pn_unit_iid": id_map_dict["pn_unit_iid"][p["pn_unit_iid"]],
                             "chain_iid": p["chain_iid"],
                             "count": p["count"],
                         }
-                        for p in raw_list
-                    ]
+                        # JH changed: preserve optional donor element breakdowns on per-partner rows
+                        if "element_counts" in p:
+                            decoded_partner["element_counts"] = p["element_counts"]
+                        decoded.append(decoded_partner)
+                    return decoded
 
                 per_partner_contacts_metal = _decode_per_partner(per_partner_contacts_metal_raw)
                 per_partner_contacts_halide = _decode_per_partner(per_partner_contacts_halide_raw)
@@ -501,7 +506,7 @@ class DataPreprocessor:
                     "n_coordination_partners_halide": n_coordination_partners_halide,
                     "n_neighboring_heavy_atoms_small_molecule": n_neighboring_heavy_atoms_sm,
                     "avg_occupancy": avg_occupancy,
-                    # JH changed: per-partner contact breakdowns (list of {pn_unit_iid, chain_iid, count})
+                    # JH changed: metal contacts include element_counts in each partner row
                     "per_partner_contacts_metal": per_partner_contacts_metal,
                     "per_partner_contacts_halide": per_partner_contacts_halide,
                     "per_partner_contacts_small_molecule": per_partner_contacts_small_molecule,

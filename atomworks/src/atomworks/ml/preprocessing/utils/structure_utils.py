@@ -308,9 +308,7 @@ def count_metal_coordination_partners(
     """
     Count coordination partners for each single-atom metal PN unit.
 
-    A coordination partner is an atom within ``coordination_distance`` that is either:
-    - A donor element (from ``donor_elements``), OR
-    - A metal atom from another PN unit.
+    A coordination partner is a donor atom within ``coordination_distance``.
 
     The caller is expected to have already applied ``occupancy > 0`` filtering upstream
     (see ``DataPreprocessor._apply_filters``), so no per-partner occupancy threshold is
@@ -338,15 +336,9 @@ def count_metal_coordination_partners(
     if not metal_iids:
         return {}
 
-    # 2. Build valid-partner mask: donor element OR any metal atom (from any metal PN unit).
-    # Self is excluded per metal below via `non_self`.
+    # 2. Build donor partner mask. Self is excluded per metal below via `non_self`.
     elements_upper = np.array([e.upper() for e in filtered_atom_array.element])
     is_donor = np.isin(elements_upper, list(donor_elements_upper))
-
-    metal_iid_set = set(metal_iids)
-    is_metal_atom = np.array([iid in metal_iid_set for iid in filtered_atom_array.pn_unit_iid])
-
-    valid_partner_mask = is_donor | is_metal_atom
 
     # 3. Per metal: count coordination partners within distance, excluding self
     result: dict[int, int] = {}
@@ -357,7 +349,7 @@ def count_metal_coordination_partners(
         )
         collapsed = np.any(neighbor_mask, axis=0)
         non_self = filtered_atom_array.pn_unit_iid != metal_iid
-        result[metal_iid] = int(np.sum(collapsed & non_self & valid_partner_mask))
+        result[metal_iid] = int(np.sum(collapsed & non_self & is_donor))
 
     return result
 
@@ -429,6 +421,7 @@ def count_per_partner_contacts(
     cell_list: CellList,
     distance: float,
     partner_mask: np.ndarray | None = None,
+    include_element_counts: bool = False,
 ) -> list[dict]:
     """
     For a single query (small molecule / metal / halide), list how many atoms each partner
@@ -444,12 +437,13 @@ def count_per_partner_contacts(
         distance: Distance threshold (Angstrom).
         partner_mask: Optional bool mask over ``filtered_atom_array`` restricting eligible
             partner atoms (e.g. donor elements only, or non-C only). Default: all atoms.
+        include_element_counts: Whether to include per-partner donor element counts.
 
     Returns:
-        List of ``{"pn_unit_iid": int, "chain_iid": str, "count": int}``, sorted by count
-        descending. Empty list if no contacts. ``pn_unit_iid`` is returned as the raw
-        remapped integer; callers are expected to decode via ``id_map_dict["pn_unit_iid"]``
-        to the verbose string before persisting.
+        List of ``{"pn_unit_iid": int, "chain_iid": str, "count": int}``, optionally with
+        ``element_counts``. Results are sorted by count descending. Empty list if no contacts.
+        ``pn_unit_iid`` is returned as the raw remapped integer; callers are expected to decode
+        via ``id_map_dict["pn_unit_iid"]`` to the verbose string before persisting.
     """
     if len(query_coord) == 0:
         return []
@@ -473,13 +467,30 @@ def count_per_partner_contacts(
 
     # Group (pn_unit_iid, chain_iid) -> atom count
     counts: dict[tuple[int, str], int] = defaultdict(int)
-    for p, c in zip(partner_pn_unit_iids.tolist(), partner_chain_iids.tolist()):
-        counts[(int(p), str(c))] += 1
+    # JH changed: optionally preserve donor element counts in the existing per-partner schema
+    element_counts: dict[tuple[int, str], dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    if include_element_counts:
+        partner_elements = filtered_atom_array.element[eligible]
+        for p, c, e in zip(
+            partner_pn_unit_iids.tolist(),
+            partner_chain_iids.tolist(),
+            partner_elements.tolist(),
+        ):
+            key = (int(p), str(c))
+            counts[key] += 1
+            element_counts[key][str(e).upper()] += 1
+    else:
+        for p, c in zip(partner_pn_unit_iids.tolist(), partner_chain_iids.tolist()):
+            counts[(int(p), str(c))] += 1
 
-    return [
-        {"pn_unit_iid": p, "chain_iid": c, "count": n}
-        for (p, c), n in sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
-    ]
+    partner_contacts = []
+    for (p, c), n in sorted(counts.items(), key=lambda kv: kv[1], reverse=True):
+        contact = {"pn_unit_iid": p, "chain_iid": c, "count": n}
+        if include_element_counts:
+            contact["element_counts"] = dict(sorted(element_counts[(p, c)].items()))
+        partner_contacts.append(contact)
+
+    return partner_contacts
 
 
 def get_intra_pn_unit_bonds(pn_unit_iid: str, full_atom_array: AtomArray) -> np.ndarray:
