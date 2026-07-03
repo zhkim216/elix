@@ -128,15 +128,77 @@ PROT_BB_ATOMS: Final[list[str]] = ["N", "CA", "C", "O"]
 PROT_LETTER_TO_TOKEN: Final[dict[str, str]] = {**aw_sequence.aa_chem_comp_1to3(), "X": "UNK"}  # include "X" for unknown amino acids
 PROT_TOKEN_TO_LETTER: Final[dict[str, str]] = {v: k for k, v in PROT_LETTER_TO_TOKEN.items()}
 
+POTTS_NON_PROTEIN_TOKEN: Final[str] = "<NP>"
+POTTS_MASK_TOKEN: Final[str] = "<M>"
+POTTS_PAD_TOKEN: Final[str] = "<pad>"
+POTTS_TOKENS: Final[tuple[str, ...]] = (
+    *STANDARD_AA,
+    UNKNOWN_AA,
+    POTTS_NON_PROTEIN_TOKEN,
+    POTTS_MASK_TOKEN,
+    POTTS_PAD_TOKEN,
+)
+
+
+class StaticSequenceEncoding:
+    """Static sequence-token encoding with the AF3 encoding interface subset."""
+
+    def __init__(self, tokens: Sequence[str]):
+        self._tokens = tuple(tokens)
+        self._token_to_idx = {token: i for i, token in enumerate(self._tokens)}
+
+    @property
+    def tokens(self) -> tuple[str, ...]:
+        return self._tokens
+
+    @property
+    def token_to_idx(self) -> dict[str, int]:
+        return self._token_to_idx
+
+    @cached_property
+    def idx_to_token(self) -> np.ndarray:
+        return np.array(self._tokens)
+
+    @property
+    def n_tokens(self) -> int:
+        return len(self.tokens)
+
+    @property
+    def protein_tokens(self) -> list[str]:
+        return [token for token in self.tokens if token in PROT_LETTER_TO_TOKEN.values()]
+
+    @property
+    def non_protein_tokens(self) -> list[str]:
+        return [token for token in self.tokens if token not in PROT_LETTER_TO_TOKEN.values()]
+
+    def encode(self, res_names: Sequence[str]) -> list[int]:
+        return [self._token_to_idx.get(x, self._token_to_idx[UNKNOWN_AA]) for x in res_names]
+
+    def decode(self, token_idxs: int | Sequence[int]) -> list[str]:
+        if isinstance(token_idxs, int):
+            token_idxs = [token_idxs]
+        return [self.idx_to_token[idx] for idx in token_idxs]
+
+    def encode_aa(self, aa: str) -> int:
+        return self._token_to_idx.get(PROT_LETTER_TO_TOKEN[aa], self._token_to_idx[UNKNOWN_AA])
+
+    def encode_aa_seq(self, aa_seq: Sequence[str]) -> list[int]:
+        return [self.encode_aa(aa) for aa in aa_seq]
+
+    def decode_aa_seq(self, token_idxs: Sequence[int]) -> str:
+        return "".join([PROT_TOKEN_TO_LETTER[token] for token in self.decode(token_idxs)])
+
+
+POTTS_ENCODING: Final[StaticSequenceEncoding] = StaticSequenceEncoding(POTTS_TOKENS)
+
 DUMMY_SEQ_ID: Final[int] = -1  # dummy sequence id to use for auth_seq_id when not present
 
 METAL_ELEMENTS: Final[frozenset[str]] = ATOMWORKS_METAL_ELEMENTS
-DEFAULT_METAL_COORDINATION_DISTANCE: Final[float] = 3.2
+DEFAULT_METAL_COORDINATION_DISTANCE: Final[float] = 3.0
 DEFAULT_METAL_COORDINATION_DONOR_ELEMENTS: Final[tuple[str, ...]] = (
     "N",
     "O",
     "F",
-    "P",
     "S",
     "Cl",
     "As",

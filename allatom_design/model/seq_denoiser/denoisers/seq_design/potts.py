@@ -1143,6 +1143,13 @@ def init_sampling_masks(
         # restrict to certain aatypes at certain positions
         restrict_pos_mask, allowed_aatype_mask = pos_restrict_aatype  # (B, N), (B, N, K)
         mask_S[restrict_pos_mask.bool()] = allowed_aatype_mask[restrict_pos_mask.bool()]
+        if ban_S is not None:
+            mask_S[:, :, ban_S] = 0.0
+        empty_restricted_mask = restrict_pos_mask.bool() & (mask_S.sum(-1) == 0)
+        if bool(empty_restricted_mask.any()):
+            raise ValueError(
+                "pos_restrict_aatype leaves no allowed amino-acid states after applying ban_S"
+            )
 
     mask_S_1D = (mask_S.sum(-1) > 1).float()  # check where we can sample
     # For initial mask generation,

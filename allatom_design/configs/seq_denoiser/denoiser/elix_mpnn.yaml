@@ -11,6 +11,7 @@ mpnn:
   num_encoder_layers: 3
   num_decoder_layers: 3
   use_mpnn_decoder: true
+  use_potts_encoding: false  # false preserves legacy AF3-width sequence logits/checkpoints.
   dropout_p: 0.1
   ligand_conditioning: true
 

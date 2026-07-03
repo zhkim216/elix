@@ -10,7 +10,6 @@ from torch.utils.checkpoint import checkpoint
 from torchtyping import TensorType
 
 import allatom_design.model.seq_denoiser.denoisers.seq_design.potts as potts
-from allatom_design.data import const
 from allatom_design.model.seq_denoiser.denoisers.sidechain_prediction.chi_angle_loss import (
     chi_target_bins_and_offsets,
     masked_chi_accuracy,
@@ -80,7 +79,10 @@ class SDLoss(nn.Module):
 
         if self.use_seq_pred and eval_seq:
             # compute sequence loss from sequence design module
-            target_restype = batch["restype"].argmax(dim=-1)
+            if "target_restype" in outputs:
+                target_restype = outputs["target_restype"]
+            else:
+                target_restype = batch["restype"].argmax(dim=-1)
             seq_loss_mask = outputs["protein_residue_node_mask"] * (1 - outputs["seq_cond_mask"])  # compute loss only on masked tokens. protein_residue_node_mask is already for standard AA only.                        
             main_seq_loss_mask = seq_loss_mask
             pocket_mask = batch.get("token_is_ligand_pocket", None) if self.task == "lc_seq_des" else None
@@ -254,7 +256,7 @@ def masked_cross_entropy(logits: TensorType["b n c", float],
     - label_smoothing: float, label smoothing factor
     - per_token_avg: bool, whether to average loss per token (false will divide by fixed_size)
     """
-    n_classes = const.AF3_ENCODING.n_tokens
+    n_classes = logits.shape[-1]
     target_oh = F.one_hot(target, num_classes=n_classes).float()
 
     # Unpack seq_loss_cfg
