@@ -6,7 +6,6 @@ from typing import Any, Callable, Dict, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from atomworks.ml.utils.token import apply_token_wise, spread_token_wise
 from biotite.structure import AtomArray
 from einops import rearrange
@@ -23,69 +22,6 @@ from allatom_design.model.seq_denoiser.denoisers.denoiser import \
 from allatom_design.model.seq_denoiser.denoisers.seq_design import complexity
 
 logger = logging.getLogger(__name__)
-
-
-def _get_decoding_order(
-    mode: str,
-    seq_mask: TensorType["b n", float],
-    mlm_mask_prev: TensorType["b n", int],
-    **kwargs,
-) -> TensorType["b n", int]:
-    """Return per-token decode rank, with masked-out/already-visible tokens last."""
-    B, N = seq_mask.shape
-
-    if mode == "autoregressive":
-        decoding_order = torch.arange(N, device=seq_mask.device).expand(B, N)
-        decoding_order = torch.where(seq_mask.bool(), decoding_order, 1.0e6)
-        decoding_order = torch.where(mlm_mask_prev.bool(), decoding_order, 1.0e6)
-    elif mode == "random_spans":
-        timesteps = kwargs["timesteps"]
-        lengths = seq_mask.sum(dim=-1).long()
-        decoding_order = torch.where(seq_mask.bool(), torch.zeros_like(seq_mask), 1.0e6)
-        for i in range(B):
-            n_unmasked = (lengths[i] * timesteps[i]).ceil().long()
-            chunk_sizes = n_unmasked[1:] - n_unmasked[:-1]
-            indices = torch.arange(lengths[i], device=seq_mask.device)
-            chunks = torch.split(indices, chunk_sizes.tolist())
-            chunks = [chunks[j] for j in torch.randperm(len(chunks), device=seq_mask.device)]
-            decoding_order[i, :lengths[i]] = torch.cat(chunks)
-    else:
-        decoding_order = torch.where(seq_mask.bool(), torch.rand_like(seq_mask), 1.0e6)
-        decoding_order = decoding_order.argsort(dim=-1)
-
-    return decoding_order.long()
-
-
-def _get_timesteps_from_schedule(
-    mode: str,
-    num_steps: int,
-    t_start: float,
-    t_end: float,
-) -> TensorType["S+1", float]:
-    """Build the MLM unmasking schedule used during sequence sampling."""
-    timesteps = torch.linspace(t_start, t_end, num_steps + 1)
-    if mode == "linear":
-        pass
-    elif mode == "square":
-        timesteps = timesteps ** 2
-    elif mode == "cubic":
-        timesteps = timesteps ** 3
-    elif mode == "sqrt":
-        timesteps = timesteps ** 0.5
-    elif mode == "cbrt":
-        timesteps = timesteps ** (1.0 / 3.0)
-    elif mode == "cosine":
-        timesteps = 1 - torch.cos(timesteps * np.pi / 2)
-    elif mode == "last_only":
-        timesteps = torch.zeros_like(timesteps)
-        timesteps[-1] = 1.0
-    elif mode == "first_only":
-        timesteps = torch.ones_like(timesteps)
-        timesteps[0] = 0.0
-    else:
-        raise NotImplementedError(f"timestep schedule mode {mode} not implemented")
-
-    return timesteps
 
 
 class ElixMPNNDenoiser(BaseSeqDenoiser):
@@ -117,8 +53,10 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
         aux_preds = {
             "seq_logits": seq_logits,
             "potts_decoder_aux": mpnn_feats.get("potts_decoder_aux", None),
+            "sidechain_prediction_aux": mpnn_feats.get("sidechain_prediction_aux", None),
             "seq_cond_mask": batch["seq_cond_mask"],
             "atom_cond_mask": batch["atom_cond_mask"],
+            "sidechain_context_token_mask": batch["sidechain_context_token_mask"],
             "token_exists_mask": batch["token_exists_mask"],
             "protein_residue_node_mask": batch["protein_residue_node_mask"],
         }
@@ -140,6 +78,15 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
         # Ensure the conditioning masks only contain non-pad, resolved entries.
         batch["seq_cond_mask"] = batch["seq_cond_mask"] * batch["token_resolved_mask"] * batch["token_pad_mask"]
         batch["atom_cond_mask"] = batch["atom_cond_mask"] * batch["atom_resolved_mask"] * batch["atom_pad_mask"]
+        batch["sidechain_context_token_mask"] = batch.get(
+            "sidechain_context_token_mask",
+            torch.zeros_like(batch["seq_cond_mask"]),
+        )
+        batch["sidechain_context_token_mask"] = (
+            batch["sidechain_context_token_mask"]
+            * batch["token_resolved_mask"]
+            * batch["token_pad_mask"]
+        )
 
         # Build mask for which tokens to include in the token-level grpah
         ## ensure center atom is present, since graph nodes are the center atom
@@ -224,27 +171,382 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
             }
 
         if guidance_mode == "selectivity":
-            positive_mask = cls._require_guidance_atom_cond_mask(
-                guidance_cfg,
-                "positive_atom_cond_mask",
-                batch,
+            raise NotImplementedError(
+                "legacy composite selectivity branch masks are no longer supported; "
+                "selectivity pair guidance uses common_token_idx inputs"
             )
-            negative_mask = cls._require_guidance_atom_cond_mask(
-                guidance_cfg,
-                "negative_atom_cond_mask",
-                batch,
-            )
-            return {
-                "mode": guidance_mode,
-                "positive_batch": cls._guidance_branch_batch(batch, positive_mask),
-                "negative_batch": cls._guidance_branch_batch(batch, negative_mask),
-                "positive_branch_label": str(guidance_cfg.get("positive_branch_label", "positive")),
-                "negative_branch_label": str(guidance_cfg.get("negative_branch_label", "negative")),
-            }
 
         raise NotImplementedError(
             f"Unsupported guidance.mode={guidance_mode!r}. Expected 'cond_uncond' or 'selectivity'."
         )
+
+    @staticmethod
+    def _require_selectivity_pair_guidance(
+        guidance_cfg: dict[str, Any],
+        batch: dict[str, TensorType["b ..."]],
+    ) -> dict[str, Any]:
+        required = (
+            "common_token_idx",
+            "common_valid_mask",
+            "common_designable_mask",
+            "positive_batch_idx",
+            "negative_batch_idx",
+        )
+        missing = [key for key in required if key not in guidance_cfg]
+        if missing:
+            raise ValueError(f"selectivity pair guidance missing keys: {missing}")
+        if batch["restype"].shape[0] != 2:
+            raise ValueError(
+                "selectivity pair guidance requires exactly two examples per batch; "
+                f"got batch size {batch['restype'].shape[0]}"
+            )
+        common_token_idx = guidance_cfg["common_token_idx"]
+        if not torch.is_tensor(common_token_idx) or common_token_idx.shape[0] != 2:
+            raise ValueError("guidance_cfg.common_token_idx must be a tensor with shape [2, n_common]")
+        return {
+            "common_token_idx": common_token_idx.to(device=batch["restype"].device, dtype=torch.long),
+            "common_valid_mask": guidance_cfg["common_valid_mask"].to(device=batch["restype"].device).bool(),
+            "common_designable_mask": guidance_cfg["common_designable_mask"].to(device=batch["restype"].device).bool(),
+            "positive_batch_idx": int(guidance_cfg["positive_batch_idx"]),
+            "negative_batch_idx": int(guidance_cfg["negative_batch_idx"]),
+            "positive_branch_label": str(guidance_cfg.get("positive_branch_label", "positive")),
+            "negative_branch_label": str(guidance_cfg.get("negative_branch_label", "negative")),
+        }
+
+    @staticmethod
+    def _project_pos_restrict_aatype_to_common_axis(
+        pos_restrict_aatype: tuple[torch.Tensor, torch.Tensor] | None,
+        common_token_idx: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if pos_restrict_aatype is None:
+            return None
+        restrict_pos_mask, allowed_aatype_mask = pos_restrict_aatype
+        idx0 = common_token_idx[0]
+        idx1 = common_token_idx[1]
+        restrict_common = restrict_pos_mask[0, idx0].bool() | restrict_pos_mask[1, idx1].bool()
+        allowed_common = allowed_aatype_mask[0, idx0] * allowed_aatype_mask[1, idx1]
+        if bool((restrict_common & (allowed_common.sum(-1) == 0)).any()):
+            raise ValueError("selectivity pair guidance has incompatible amino-acid restrictions on common residues")
+        return restrict_common[None].float(), allowed_common[None].float()
+
+    @staticmethod
+    def _project_potts_branch_to_common_axis(
+        *,
+        potts_decoder_aux: dict[str, torch.Tensor],
+        batch_idx: int,
+        common_idx: torch.Tensor,
+        S_full: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        h = potts_decoder_aux["h"]
+        J = potts_decoder_aux["J"]
+        edge_idx = potts_decoder_aux["edge_idx"]
+        mask_i = potts_decoder_aux["mask_i"]
+        mask_ij = potts_decoder_aux["mask_ij"]
+        _, N, K, C, _ = J.shape
+        M = int(common_idx.numel())
+        device = h.device
+
+        common_idx = common_idx.to(device=device, dtype=torch.long)
+        common_pos = torch.full((N,), -1, dtype=torch.long, device=device)
+        common_pos[common_idx] = torch.arange(M, dtype=torch.long, device=device)
+
+        h_new = h[batch_idx, common_idx].clone()
+        J_new = J.new_zeros((1, M, M, C, C))
+        mask_ij_new = mask_ij.new_zeros((1, M, M))
+
+        for common_i, src_i_raw in enumerate(common_idx.tolist()):
+            src_i = int(src_i_raw)
+            for edge_k in range(K):
+                if mask_ij[batch_idx, src_i, edge_k] <= 0:
+                    continue
+                src_j = int(edge_idx[batch_idx, src_i, edge_k].item())
+                common_j = int(common_pos[src_j].item())
+                if common_j >= 0:
+                    J_new[0, common_i, common_j] += J[batch_idx, src_i, edge_k]
+                    mask_ij_new[0, common_i, common_j] = 1
+                else:
+                    fixed_j = int(S_full[batch_idx, src_j].item())
+                    h_new[common_i] += 0.5 * J[batch_idx, src_i, edge_k, :, fixed_j]
+
+        for src_i in range(N):
+            if int(common_pos[src_i].item()) >= 0:
+                continue
+            fixed_i = int(S_full[batch_idx, src_i].item())
+            for edge_k in range(K):
+                if mask_ij[batch_idx, src_i, edge_k] <= 0:
+                    continue
+                src_j = int(edge_idx[batch_idx, src_i, edge_k].item())
+                common_j = int(common_pos[src_j].item())
+                if common_j >= 0:
+                    h_new[common_j] += 0.5 * J[batch_idx, src_i, edge_k, fixed_i, :]
+
+        return {
+            "h": h_new[None],
+            "J": J_new,
+            "edge_idx": torch.arange(M, device=device, dtype=torch.long).view(1, 1, M).expand(1, M, M),
+            "mask_i": mask_i[batch_idx, common_idx][None],
+            "mask_ij": mask_ij_new,
+        }
+
+    @staticmethod
+    def _pair_aux_tensor(value: torch.Tensor | None, batch_size: int) -> torch.Tensor | None:
+        if value is None:
+            return None
+        return value.expand(batch_size).detach().cpu()
+
+    def _potts_sample_selectivity_pair(
+        self,
+        batch: dict[str, TensorType["b ..."]],
+        sampling_inputs: dict[str, Any],
+        guidance_cfg: dict[str, Any],
+    ) -> tuple[dict[str, list[AtomArray]], dict[str, Any]]:
+        selectivity_pair = self._require_selectivity_pair_guidance(guidance_cfg, batch)
+        potts_sampling_cfg = sampling_inputs["potts_sampling_cfg"]
+        if "tied_sampling_ids" in batch:
+            raise NotImplementedError("selectivity pair guidance is not supported with tied_sampling")
+        if potts_sampling_cfg["potts_proposal"] != "dlmc":
+            raise NotImplementedError("selectivity pair guidance requires potts_proposal='dlmc'")
+
+        potts_decoder_aux, batch, sampling_inputs = self.compute_potts_params(batch, sampling_inputs)
+        common_token_idx = selectivity_pair["common_token_idx"]
+        common_valid_mask = selectivity_pair["common_valid_mask"]
+        common_designable_mask = selectivity_pair["common_designable_mask"]
+        positive_batch_idx = selectivity_pair["positive_batch_idx"]
+        negative_batch_idx = selectivity_pair["negative_batch_idx"]
+        positive_common_idx = common_token_idx[positive_batch_idx]
+        negative_common_idx = common_token_idx[negative_batch_idx]
+
+        B, N, C = batch["restype"].shape
+        S_full_init = batch["restype"].argmax(dim=-1)
+        positive_aux = self._project_potts_branch_to_common_axis(
+            potts_decoder_aux=potts_decoder_aux,
+            batch_idx=positive_batch_idx,
+            common_idx=positive_common_idx,
+            S_full=S_full_init,
+        )
+        negative_aux = self._project_potts_branch_to_common_axis(
+            potts_decoder_aux=potts_decoder_aux,
+            batch_idx=negative_batch_idx,
+            common_idx=negative_common_idx,
+            S_full=S_full_init,
+        )
+
+        mask_sample_full = (1 - batch["seq_cond_mask_potts"]) * batch["token_pad_mask"]
+        mask_sample_common = (
+            mask_sample_full[0, common_token_idx[0]]
+            * mask_sample_full[1, common_token_idx[1]]
+            * common_valid_mask.float()
+            * common_designable_mask.float()
+            * positive_aux["mask_i"][0]
+            * negative_aux["mask_i"][0]
+        )
+        if not bool(mask_sample_common.bool().any()):
+            raise ValueError("selectivity pair common axis has no sampleable residues")
+
+        logits_init = torch.zeros((1, common_token_idx.shape[1], C), device=batch["restype"].device).float()
+        S_common_init = S_full_init[positive_batch_idx, positive_common_idx][None]
+        ban_S = {"X"}
+        omit_aas = sampling_inputs.get("omit_aas", None)
+        if omit_aas is not None:
+            ban_S = ban_S | set(omit_aas)
+        ban_S = const.AF3_ENCODING.encode_aa_seq(ban_S)
+        ban_S = ban_S + const.AF3_ENCODING.encode(const.AF3_ENCODING.non_protein_tokens)
+        pos_restrict_common = self._project_pos_restrict_aatype_to_common_axis(
+            sampling_inputs.get("pos_restrict_aatype", None),
+            common_token_idx,
+        )
+        mask_sample_common, _, S_common_init = potts.init_sampling_masks(
+            logits_init,
+            mask_sample=mask_sample_common[None],
+            S=S_common_init,
+            ban_S=ban_S,
+            pos_restrict_aatype=pos_restrict_common,
+        )
+
+        regularization = potts_sampling_cfg["regularization"]
+        penalty_func = None
+        if regularization == "LCP":
+            C_complexity = batch["asym_id"][positive_batch_idx, positive_common_idx][None]
+            C_complexity = C_complexity * positive_aux["mask_i"]
+            penalty_func = lambda _S: complexity.complexity_lcp(_S, C_complexity)
+        elif regularization not in {None, "none", "None"}:
+            raise NotImplementedError(f"Unsupported selectivity pair regularization={regularization!r}")
+
+        iter_items = self._build_schedule_iter_items(guidance_cfg)
+
+        pocket_distance = float(guidance_cfg.get("pocket_distance", 10.0))
+        pocket_mask, _ = self._compute_ligand_pocket_mask(batch, pocket_distance=pocket_distance)
+        pocket_common = (
+            pocket_mask[0, common_token_idx[0]].bool()
+            | pocket_mask[1, common_token_idx[1]].bool()
+        ).float()[None]
+        n_pocket = pocket_common.sum(-1).clamp(min=1.0)
+        n_common = common_valid_mask.float().sum().view(1).clamp(min=1.0)
+
+        S_samples: list[torch.Tensor] = []
+        per_sample_aux: list[dict[str, Any]] = []
+        for sched in iter_items:
+            sched_cfg = None if sched["type"] == "constant" else sched
+            for _ in tqdm(
+                range(sampling_inputs["num_seqs_per_pdb"]),
+                desc=f"Sampling selectivity pair ({sched['label']})",
+                leave=False,
+            ):
+                S_common, U_mixed = self.elix_mpnn.decoder_S_potts.sample(
+                    positive_aux["h"],
+                    positive_aux["J"],
+                    positive_aux["edge_idx"],
+                    positive_aux["mask_i"],
+                    positive_aux["mask_ij"],
+                    S=S_common_init,
+                    mask_sample=mask_sample_common,
+                    temperature=potts_sampling_cfg["potts_temperature"],
+                    num_sweeps=potts_sampling_cfg["potts_sweeps"],
+                    penalty_func=penalty_func,
+                    proposal=potts_sampling_cfg["potts_proposal"],
+                    rejection_step=potts_sampling_cfg.get("rejection_step", False),
+                    verbose=False,
+                    h_uncond=negative_aux["h"],
+                    J_uncond=negative_aux["J"],
+                    edge_idx_uncond=negative_aux["edge_idx"],
+                    gamma=sched["gamma_max"],
+                    gamma_schedule_cfg=sched_cfg,
+                )
+                S_full = S_full_init.clone()
+                S_full[positive_batch_idx, positive_common_idx] = S_common[0]
+                S_full[negative_batch_idx, negative_common_idx] = S_common[0]
+                S_full = self._set_non_protein_tokens(S_full, batch)
+
+                U_positive, _, U_positive_per_res = potts.compute_potts_energy(
+                    S_common,
+                    positive_aux["h"],
+                    positive_aux["J"],
+                    positive_aux["edge_idx"],
+                    return_per_res=True,
+                )
+                U_negative, _, U_negative_per_res = potts.compute_potts_energy(
+                    S_common,
+                    negative_aux["h"],
+                    negative_aux["J"],
+                    negative_aux["edge_idx"],
+                    return_per_res=True,
+                )
+                U_positive_pocket = (U_positive_per_res * pocket_common).sum(-1)
+                U_negative_pocket = (U_negative_per_res * pocket_common).sum(-1)
+                per_sample_aux.append({
+                    "U": self._pair_aux_tensor(U_mixed, B),
+                    "gamma": sched["gamma_max"],
+                    "guidance_scale": sched["gamma_max"],
+                    "guidance_mode": "selectivity",
+                    "schedule_label": sched["label"],
+                    "positive_branch_label": selectivity_pair["positive_branch_label"],
+                    "negative_branch_label": selectivity_pair["negative_branch_label"],
+                    "U_positive": self._pair_aux_tensor(U_positive, B),
+                    "U_negative": self._pair_aux_tensor(U_negative, B),
+                    "U_positive_per_res": self._pair_aux_tensor(U_positive / n_common, B),
+                    "U_negative_per_res": self._pair_aux_tensor(U_negative / n_common, B),
+                    "U_positive_pocket": self._pair_aux_tensor(U_positive_pocket, B),
+                    "U_negative_pocket": self._pair_aux_tensor(U_negative_pocket, B),
+                    "U_positive_pocket_per_res": self._pair_aux_tensor(U_positive_pocket / n_pocket, B),
+                    "U_negative_pocket_per_res": self._pair_aux_tensor(U_negative_pocket / n_pocket, B),
+                    "U_cond": self._pair_aux_tensor(U_positive, B),
+                    "U_uncond": self._pair_aux_tensor(U_negative, B),
+                    "U_cond_per_res": self._pair_aux_tensor(U_positive / n_common, B),
+                    "U_uncond_per_res": self._pair_aux_tensor(U_negative / n_common, B),
+                    "U_cond_pocket": self._pair_aux_tensor(U_positive_pocket, B),
+                    "U_uncond_pocket": self._pair_aux_tensor(U_negative_pocket, B),
+                    "U_cond_pocket_per_res": self._pair_aux_tensor(U_positive_pocket / n_pocket, B),
+                    "U_uncond_pocket_per_res": self._pair_aux_tensor(U_negative_pocket / n_pocket, B),
+                    "N_pocket": self._pair_aux_tensor(n_pocket, B),
+                })
+                S_samples.append(S_full.cpu())
+
+        del potts_decoder_aux
+        return self._postprocess_sampled_sequences(S_samples, batch, per_sample_aux=per_sample_aux)
+
+    @staticmethod
+    def _build_schedule_iter_items(guidance_cfg: dict[str, Any]) -> list[dict[str, Any]]:
+        """Normalize guidance schedule config into a flat list of iteration items.
+
+        Each item is ``{label, type, gamma_max[, tau]}``. ``schedule_list`` (when
+        set) takes precedence over ``guidance_scale_list`` / the legacy
+        ``gamma_list``. For constant entries ``gamma_schedule_cfg`` should be
+        passed as ``None`` downstream. A scale value of ``None`` yields a
+        no-guidance constant item (``gamma_max=None``).
+        """
+        guidance_scale_list = list(
+            guidance_cfg.get("guidance_scale_list", guidance_cfg.get("gamma_list", [1.0]))
+        )
+        schedule_list_raw = guidance_cfg.get("schedule_list", None)
+        if schedule_list_raw is not None:
+            iter_items = []
+            for sched_raw in schedule_list_raw:
+                sched = dict(sched_raw)
+                if "type" not in sched or "gamma_max" not in sched:
+                    raise ValueError(
+                        f"schedule_list entry must include 'type' and 'gamma_max'; got {sched!r}"
+                    )
+                iter_items.append({
+                    "label": str(sched.get("label", f"{sched['type']}_g{float(sched['gamma_max']):.2f}")),
+                    "type": str(sched["type"]),
+                    "gamma_max": float(sched["gamma_max"]),
+                    **({"tau": float(sched["tau"])} if "tau" in sched else {}),
+                })
+            return iter_items
+        return [
+            {
+                "label": (f"gamma_{float(g):.2f}" if g is not None else "no-guidance"),
+                "type": "constant",
+                "gamma_max": (float(g) if g is not None else None),
+            }
+            for g in guidance_scale_list
+        ]
+
+    @staticmethod
+    def _compute_branch_energies(
+        S_sample: torch.Tensor,
+        potts_decoder_aux: dict[str, torch.Tensor],
+        potts_decoder_aux_negative: dict[str, torch.Tensor],
+        pocket_mask: torch.Tensor,
+        n_protein: torch.Tensor,
+        n_pocket: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Post-hoc physical Potts energies on cond/uncond branches for one sample.
+
+        Returns CPU tensors used as the (x, y) coordinates of the Pareto plot
+        downstream. Pocket-restricted totals sum per-residue contributions over
+        pocket residues only; per-residue averages clamp the denominators so
+        ``N_pocket==0`` (no ligand / nothing within distance) stays finite.
+        """
+        U_cond_post, _, U_cond_per_res_post = potts.compute_potts_energy(
+            S_sample,
+            potts_decoder_aux["h"],
+            potts_decoder_aux["J"],
+            potts_decoder_aux["edge_idx"],
+            return_per_res=True,
+        )
+        U_uncond_post, _, U_uncond_per_res_post = potts.compute_potts_energy(
+            S_sample,
+            potts_decoder_aux_negative["h"],
+            potts_decoder_aux_negative["J"],
+            potts_decoder_aux_negative["edge_idx"],
+            return_per_res=True,
+        )
+        U_cond_pocket = (U_cond_per_res_post * pocket_mask).sum(-1)
+        U_uncond_pocket = (U_uncond_per_res_post * pocket_mask).sum(-1)
+        safe_np = n_pocket.clamp(min=1.0)
+        safe_n = n_protein.clamp(min=1.0)
+        return {
+            "U_cond": U_cond_post.cpu(),
+            "U_uncond": U_uncond_post.cpu(),
+            "U_cond_per_res": (U_cond_post / safe_n).cpu(),
+            "U_uncond_per_res": (U_uncond_post / safe_n).cpu(),
+            "U_cond_pocket": U_cond_pocket.cpu(),
+            "U_uncond_pocket": U_uncond_pocket.cpu(),
+            "U_cond_pocket_per_res": (U_cond_pocket / safe_np).cpu(),
+            "U_uncond_pocket_per_res": (U_uncond_pocket / safe_np).cpu(),
+            "N_pocket": n_pocket.cpu(),
+        }
 
     def potts_sample(self,
                      batch: dict[str, TensorType["b ..."]],
@@ -255,11 +557,11 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
         Potts sampling for sequence design.
 
         When ``potts_sampling_cfg.guidance_cfg.enabled`` is true, Potts
-        parameters are computed for positive and negative branches. In legacy
+        parameters are computed for positive and negative branches. In
         ``cond_uncond`` mode these are the ligand-conditioned and protein-only
-        branches; in ``selectivity`` mode the eval layer supplies generic
-        branch atom masks. The sampler then runs DLMC on the linearly-mixed
-        parameters
+        branches. In ``selectivity`` mode the eval layer supplies selectivity-pair
+        common-token tensors and sampling runs on the aligned common axis. The
+        sampler then runs DLMC on the linearly-mixed parameters
 
             h_mix = scale * h_positive + (1 - scale) * h_negative
             J_mix = scale * J_positive + (1 - scale) * J_negative
@@ -272,8 +574,6 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
             output_feats: list[dict[str, TensorType["b ..."]]]: list of length (n_samples_per_pdb) of output features for each sample
             aux: dict[str, Any]: auxiliary outputs
         """
-        aux = {}
-
         # If specified, condition on sequence only in the potts model
         batch["seq_cond_mask_potts"] = batch["seq_cond_mask"].clone()
         if sampling_inputs["potts_sampling_cfg"].get("potts_only_cond", False):
@@ -288,6 +588,12 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
             raise NotImplementedError(
                 "A custom Potts aux provider cannot be combined with Potts guidance."
             )
+        if use_guidance and str(guidance_cfg.get("mode", "cond_uncond")) == "selectivity":
+            return self._potts_sample_selectivity_pair(
+                batch=batch,
+                sampling_inputs=sampling_inputs,
+                guidance_cfg=guidance_cfg,
+            )
         if use_guidance:
             if "tied_sampling_ids" in batch:
                 raise NotImplementedError(
@@ -295,19 +601,12 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
                 )
             guidance_branches = self._resolve_potts_guidance_branches(batch, guidance_cfg)
             guidance_mode = guidance_branches["mode"]
-            guidance_scale_list = list(
-                guidance_cfg.get("guidance_scale_list", guidance_cfg.get("gamma_list", [1.0]))
-            )
-            schedule_list_raw = guidance_cfg.get("schedule_list", None)
-            schedule_list = [dict(s) for s in schedule_list_raw] if schedule_list_raw is not None else None
             batch_positive = guidance_branches["positive_batch"]
             batch_negative = guidance_branches["negative_batch"]
             pocket_distance = float(guidance_cfg.get("pocket_distance", 10.0))
         else:
             guidance_branches = None
             guidance_mode = None
-            guidance_scale_list = [None]
-            schedule_list = None
             batch_positive = None
             batch_negative = None
             pocket_distance = None
@@ -382,20 +681,21 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
             penalty_func = lambda _S: complexity.complexity_lcp(_S, C_complexity)
 
         S = []  # keep track of sequences for each sample
-        aux["U"] = []  # mixed energy per sample (equal to U_cond when guidance is off)
-        aux["gamma"] = []  # gamma used to produce each sample (None when guidance is off; γ_max for schedules)
-        aux["schedule_label"] = []  # human-readable schedule tag (None when guidance is off)
-        aux["U_cond"] = []  # post-hoc cond energy (no penalty); None when guidance is off
-        aux["U_uncond"] = []  # post-hoc uncond energy (no penalty); None when guidance is off
-        # Per-residue and pocket-restricted energy aux (guidance-only). All
-        # are shape [B] per sample when filled, or None when guidance is off.
-        aux["U_cond_per_res"] = []
-        aux["U_uncond_per_res"] = []
-        aux["U_cond_pocket"] = []
-        aux["U_uncond_pocket"] = []
-        aux["U_cond_pocket_per_res"] = []
-        aux["U_uncond_pocket_per_res"] = []
-        aux["N_pocket"] = []
+        per_sample_aux: list[dict[str, Any]] = []
+
+        # Energy aux keys filled per sample under guidance; set to None
+        # otherwise. Per-residue / pocket entries are shape [B] when filled.
+        energy_keys = (
+            "U_cond",
+            "U_uncond",
+            "U_cond_per_res",
+            "U_uncond_per_res",
+            "U_cond_pocket",
+            "U_uncond_pocket",
+            "U_cond_pocket_per_res",
+            "U_uncond_pocket_per_res",
+            "N_pocket",
+        )
 
         num_seqs_per_pdb = sampling_inputs["num_seqs_per_pdb"]
 
@@ -403,28 +703,10 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
         # scale lists. Each item is normalized to {label, type, gamma_max}; for
         # constant entries we pass gamma_schedule_cfg=None so the legacy
         # constant-γ path runs unchanged.
-        if use_guidance and schedule_list is not None:
-            iter_items = []
-            for sched in schedule_list:
-                if "type" not in sched or "gamma_max" not in sched:
-                    raise ValueError(
-                        f"schedule_list entry must include 'type' and 'gamma_max'; got {sched!r}"
-                    )
-                iter_items.append({
-                    "label": str(sched.get("label", f"{sched['type']}_g{float(sched['gamma_max']):.2f}")),
-                    "type": str(sched["type"]),
-                    "gamma_max": float(sched["gamma_max"]),
-                    **({"tau": float(sched["tau"])} if "tau" in sched else {}),
-                })
+        if use_guidance:
+            iter_items = self._build_schedule_iter_items(guidance_cfg)
         else:
-            iter_items = [
-                {
-                    "label": (f"gamma_{g:.2f}" if g is not None else "no-guidance"),
-                    "type": "constant",
-                    "gamma_max": (float(g) if g is not None else None),
-                }
-                for g in guidance_scale_list
-            ]
+            iter_items = [{"label": "no-guidance", "type": "constant", "gamma_max": None}]
 
         # Design sequences: outer loop over schedule (or constant gamma),
         # inner loop over samples-per-pdb.
@@ -435,103 +717,73 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
             desc = f"schedule={sched_label}"
             for _ in tqdm(range(num_seqs_per_pdb), desc=f"Sampling sequences ({desc})", leave=False):
 
+                sample_kwargs = dict(
+                    S=S_init,
+                    mask_sample=mask_sample,
+                    temperature=potts_temperature,
+                    num_sweeps=potts_sweeps,
+                    penalty_func=penalty_func,
+                    proposal=potts_proposal,
+                    rejection_step=rejection_step,
+                    verbose=False,
+                    edge_idx_coloring=edge_idx_coloring,
+                    mask_ij_coloring=mask_ij_coloring,
+                )
                 if use_guidance:
-                    S_sample, U_sample = self.elix_mpnn.decoder_S_potts.sample(
-                        potts_decoder_aux["h"],
-                        potts_decoder_aux["J"],
-                        potts_decoder_aux["edge_idx"],
-                        potts_decoder_aux["mask_i"],
-                        potts_decoder_aux["mask_ij"],
-                        S=S_init,
-                        mask_sample=mask_sample,
-                        temperature=potts_temperature,
-                        num_sweeps=potts_sweeps,
-                        penalty_func=penalty_func,
-                        proposal=potts_proposal,
-                        rejection_step=rejection_step,
-                        verbose=False,
-                        edge_idx_coloring=edge_idx_coloring,
-                        mask_ij_coloring=mask_ij_coloring,
+                    sample_kwargs.update(
                         h_uncond=potts_decoder_aux_negative["h"],
                         J_uncond=potts_decoder_aux_negative["J"],
                         edge_idx_uncond=potts_decoder_aux_negative["edge_idx"],
                         gamma=sched_gamma_max,
                         gamma_schedule_cfg=sched_cfg,
                     )
-                else:
-                    S_sample, U_sample = self.elix_mpnn.decoder_S_potts.sample(
-                        potts_decoder_aux["h"],
-                        potts_decoder_aux["J"],
-                        potts_decoder_aux["edge_idx"],
-                        potts_decoder_aux["mask_i"],
-                        potts_decoder_aux["mask_ij"],
-                        S=S_init,
-                        mask_sample=mask_sample,
-                        temperature=potts_temperature,
-                        num_sweeps=potts_sweeps,
-                        penalty_func=penalty_func,
-                        proposal=potts_proposal,
-                        rejection_step=rejection_step,
-                        verbose=False,
-                        edge_idx_coloring=edge_idx_coloring,
-                        mask_ij_coloring=mask_ij_coloring,
-                    )
+                S_sample, U_sample = self.elix_mpnn.decoder_S_potts.sample(
+                    potts_decoder_aux["h"],
+                    potts_decoder_aux["J"],
+                    potts_decoder_aux["edge_idx"],
+                    potts_decoder_aux["mask_i"],
+                    potts_decoder_aux["mask_ij"],
+                    **sample_kwargs,
+                )
 
                 # Set all tokens that don't exist in the graph to unknown
                 S_sample = self._set_non_protein_tokens(S_sample, batch)
 
-                aux["U"].append(U_sample.cpu())
-                aux["gamma"].append(sched_gamma_max)
-                aux["schedule_label"].append(sched_label if use_guidance else None)
-
                 if use_guidance:
-                    # Post-hoc physical Potts energies on both branches. Used
-                    # as the (x, y) coordinates of the Pareto plot downstream.
-                    U_cond_post, _, U_cond_per_res_post = potts.compute_potts_energy(
+                    energies = self._compute_branch_energies(
                         S_sample,
-                        potts_decoder_aux["h"],
-                        potts_decoder_aux["J"],
-                        potts_decoder_aux["edge_idx"],
-                        return_per_res=True,
+                        potts_decoder_aux,
+                        potts_decoder_aux_negative,
+                        pocket_mask,
+                        n_protein,
+                        n_pocket,
                     )
-                    U_uncond_post, _, U_uncond_per_res_post = potts.compute_potts_energy(
-                        S_sample,
-                        potts_decoder_aux_negative["h"],
-                        potts_decoder_aux_negative["J"],
-                        potts_decoder_aux_negative["edge_idx"],
-                        return_per_res=True,
-                    )
-                    # Pocket-restricted totals: sum per-residue contributions
-                    # over pocket residues only.
-                    U_cond_pocket = (U_cond_per_res_post * pocket_mask).sum(-1)
-                    U_uncond_pocket = (U_uncond_per_res_post * pocket_mask).sum(-1)
-                    safe_np = n_pocket.clamp(min=1.0)
-                    safe_n = n_protein.clamp(min=1.0)
-                    U_cond_per_res_global = U_cond_post / safe_n
-                    U_uncond_per_res_global = U_uncond_post / safe_n
-                    U_cond_pocket_per_res = U_cond_pocket / safe_np
-                    U_uncond_pocket_per_res = U_uncond_pocket / safe_np
-
-                    aux["U_cond"].append(U_cond_post.cpu())
-                    aux["U_uncond"].append(U_uncond_post.cpu())
-                    aux["U_cond_per_res"].append(U_cond_per_res_global.cpu())
-                    aux["U_uncond_per_res"].append(U_uncond_per_res_global.cpu())
-                    aux["U_cond_pocket"].append(U_cond_pocket.cpu())
-                    aux["U_uncond_pocket"].append(U_uncond_pocket.cpu())
-                    aux["U_cond_pocket_per_res"].append(U_cond_pocket_per_res.cpu())
-                    aux["U_uncond_pocket_per_res"].append(U_uncond_pocket_per_res.cpu())
-                    aux["N_pocket"].append(n_pocket.cpu())
                 else:
-                    aux["U_cond"].append(None)
-                    aux["U_uncond"].append(None)
-                    aux["U_cond_per_res"].append(None)
-                    aux["U_uncond_per_res"].append(None)
-                    aux["U_cond_pocket"].append(None)
-                    aux["U_uncond_pocket"].append(None)
-                    aux["U_cond_pocket_per_res"].append(None)
-                    aux["U_uncond_pocket_per_res"].append(None)
-                    aux["N_pocket"].append(None)
+                    energies = {key: None for key in energy_keys}
 
+                sample_entry = {
+                    "U": U_sample.cpu(),
+                    "gamma": sched_gamma_max,
+                    "guidance_scale": sched_gamma_max,
+                    "guidance_mode": guidance_mode if use_guidance else None,
+                    "schedule_label": sched_label if use_guidance else None,
+                    "positive_branch_label": (
+                        guidance_branches["positive_branch_label"] if use_guidance else None
+                    ),
+                    "negative_branch_label": (
+                        guidance_branches["negative_branch_label"] if use_guidance else None
+                    ),
+                    "U_positive": energies["U_cond"],
+                    "U_negative": energies["U_uncond"],
+                    "U_positive_per_res": energies["U_cond_per_res"],
+                    "U_negative_per_res": energies["U_uncond_per_res"],
+                    "U_positive_pocket": energies["U_cond_pocket"],
+                    "U_negative_pocket": energies["U_uncond_pocket"],
+                    "U_positive_pocket_per_res": energies["U_cond_pocket_per_res"],
+                    "U_negative_pocket_per_res": energies["U_uncond_pocket_per_res"],
+                    **{key: energies[key] for key in energy_keys},
+                }
+                per_sample_aux.append(sample_entry)
                 S.append(S_sample.cpu())
 
         # Free GPU potts parameters before postprocessing
@@ -539,152 +791,7 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
         if potts_decoder_aux_negative is not None:
             del potts_decoder_aux_negative
 
-        per_sample_aux = [
-            {
-                "U": aux["U"][si],
-                "gamma": aux["gamma"][si],
-                "guidance_scale": aux["gamma"][si],
-                "guidance_mode": guidance_mode if use_guidance else None,
-                "schedule_label": aux["schedule_label"][si],
-                "positive_branch_label": (
-                    guidance_branches["positive_branch_label"] if use_guidance else None
-                ),
-                "negative_branch_label": (
-                    guidance_branches["negative_branch_label"] if use_guidance else None
-                ),
-                "U_positive": aux["U_cond"][si],
-                "U_negative": aux["U_uncond"][si],
-                "U_positive_per_res": aux["U_cond_per_res"][si],
-                "U_negative_per_res": aux["U_uncond_per_res"][si],
-                "U_positive_pocket": aux["U_cond_pocket"][si],
-                "U_negative_pocket": aux["U_uncond_pocket"][si],
-                "U_positive_pocket_per_res": aux["U_cond_pocket_per_res"][si],
-                "U_negative_pocket_per_res": aux["U_uncond_pocket_per_res"][si],
-                "U_cond": aux["U_cond"][si],
-                "U_uncond": aux["U_uncond"][si],
-                "U_cond_per_res": aux["U_cond_per_res"][si],
-                "U_uncond_per_res": aux["U_uncond_per_res"][si],
-                "U_cond_pocket": aux["U_cond_pocket"][si],
-                "U_uncond_pocket": aux["U_uncond_pocket"][si],
-                "U_cond_pocket_per_res": aux["U_cond_pocket_per_res"][si],
-                "U_uncond_pocket_per_res": aux["U_uncond_pocket_per_res"][si],
-                "N_pocket": aux["N_pocket"][si],
-            }
-            for si in range(len(S))
-        ]
         return self._postprocess_sampled_sequences(S, batch, per_sample_aux=per_sample_aux)
-
-
-    @torch.no_grad()
-    def mlm_sample(self,
-                   batch: dict[str, TensorType["b ..."]],
-                   sampling_inputs: dict[str, Any]
-                   ) -> tuple[dict[str, list[AtomArray]], dict[str, Any]]:
-        """
-        MLM (order-agnostic autoregressive) sampling using W_out logits.
-        Iteratively unmasks positions, re-running the full model each step.
-
-        Follows the pattern from fampnn/fampnn/model/sd_model.py:sample().
-        """
-        mlm_cfg = sampling_inputs["mlm_sampling_cfg"]
-        num_steps = mlm_cfg["num_steps"]
-        temperature = mlm_cfg["temperature"]
-        num_seqs_per_pdb = sampling_inputs.get("num_seqs_per_pdb", 1)
-
-        # Build masks once (sets protein_residue_node_mask, token_exists_mask)
-        batch = self.build_masks(batch, is_sampling=True)
-        B, N, C = batch["restype"].shape
-        device = batch["restype"].device
-
-        # Banned token logit bias
-        ban_S = {"X"}
-        omit_aas = sampling_inputs.get("omit_aas", None)
-        if omit_aas is not None:
-            ban_S = ban_S | set(omit_aas)
-        ban_indices = const.AF3_ENCODING.encode_aa_seq(ban_S)
-        ban_indices = ban_indices + const.AF3_ENCODING.encode(const.AF3_ENCODING.non_protein_tokens)
-        gap_idx = const.AF3_ENCODING.token_to_idx["<G>"]
-        if gap_idx not in ban_indices:
-            ban_indices.append(gap_idx)
-
-        logit_bias = torch.zeros(C, device=device)
-        logit_bias[ban_indices] = -1e9
-
-        # Timestep schedule -> K values.
-        timesteps = _get_timesteps_from_schedule(
-            mode=mlm_cfg["timestep_schedule"]["mode"],
-            num_steps=mlm_cfg["timestep_schedule"]["num_steps"],
-            t_start=mlm_cfg["timestep_schedule"]["t_start"],
-            t_end=mlm_cfg["timestep_schedule"]["t_end"],
-        ).to(device)
-
-        # Designable positions and schedule
-        original_seq_cond_mask = batch["seq_cond_mask"].clone()
-        original_restype = batch["restype"].clone()
-        restype_dtype = original_restype.dtype
-
-        designable_mask = (1 - original_seq_cond_mask) * batch["protein_residue_node_mask"]
-        n_designable = designable_mask.sum(dim=-1).long()           # [B]
-        n_partial = original_seq_cond_mask.sum(dim=-1).long()       # [B]
-        timesteps_K = torch.ceil(
-            timesteps[None, :] * n_designable[:, None].float()
-        ).long() + n_partial[:, None]                                # [B, S+1]
-
-        gap_onehot = F.one_hot(
-            torch.tensor(gap_idx, device=device), num_classes=C
-        ).to(restype_dtype)
-
-        # Main sampling loop
-        S_all = []
-        for sample_idx in tqdm(range(num_seqs_per_pdb), desc="MLM sampling sequences", leave=False):
-            # Reset state: mask designable positions to gap token
-            seq_cond_mask = original_seq_cond_mask.clone()
-            restype = original_restype.clone()
-            restype[designable_mask.bool()] = gap_onehot
-
-            # Random decoding order.
-            decoding_order = _get_decoding_order(
-                mode=mlm_cfg.get("aatype_decoding_order_mode", "random"),
-                seq_mask=designable_mask,
-                mlm_mask_prev=seq_cond_mask,
-            )
-
-            # Iterative unmasking.
-            for step in range(num_steps):
-                K_next = timesteps_K[:, step + 1]  # [B]
-
-                batch["seq_cond_mask"] = seq_cond_mask
-                batch["restype"] = restype
-
-                # Forward pass → logits
-                seq_logits, _ = self.elix_mpnn(batch, is_sampling=True)
-
-                # Sample tokens (fampnn: fampnn_denoiser.py:112-130)
-                masked_logits = seq_logits + logit_bias[None, None, :]
-                if temperature == 0.0:
-                    aatype_pred = masked_logits.argmax(dim=-1)
-                else:
-                    probs = F.softmax(masked_logits / temperature, dim=-1)
-                    aatype_pred = torch.multinomial(probs.view(-1, C), 1).view(B, N)
-
-                # Update mask.
-                newly_unmask = (~seq_cond_mask.bool()) & (decoding_order < K_next[:, None])
-                seq_cond_mask = (newly_unmask.float() + seq_cond_mask).clamp(max=1.0)
-
-                # Update restype at newly unmasked positions.
-                aatype_pred_onehot = F.one_hot(aatype_pred, num_classes=C).to(restype_dtype)
-                restype = torch.where(newly_unmask.unsqueeze(-1), aatype_pred_onehot, restype)
-
-            # Collect final sequence
-            S_sample = restype.argmax(dim=-1)  # [B, N]
-            S_sample = self._set_non_protein_tokens(S_sample, batch)
-            S_all.append(S_sample.cpu())
-
-        # Restore original batch state
-        batch["seq_cond_mask"] = original_seq_cond_mask
-        batch["restype"] = original_restype
-
-        return self._postprocess_sampled_sequences(S_all, batch)
 
 
     @staticmethod
@@ -901,7 +1008,7 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
             potts_decoder_aux = _aggregate_potts_params(
                 potts_decoder_aux,
                 tied_sampling_inputs,
-                reduce=tied_sampling_inputs.get("reduce"),
+                reduce=tied_sampling_inputs["reduce"],
             )
 
         return potts_decoder_aux, batch, sampling_inputs
@@ -933,10 +1040,15 @@ def _aggregate_potts_params(potts_decoder_aux: dict[str, TensorType["b ..."]],
 
     weights = None
     weight_sums = None
+    raw_weights = tied_sampling_inputs.get("weights", None)
+    if raw_weights is not None and reduce != "weighted_mean":
+        raise ValueError(
+            "tied sampling weights require Potts aggregation reduce='weighted_mean'"
+        )
     if reduce == "weighted_mean":
-        if "weights" not in tied_sampling_inputs:
+        if raw_weights is None:
             raise ValueError("Potts aggregation reduce='weighted_mean' requires tied sampling weights")
-        weights = tied_sampling_inputs["weights"].to(device=h.device, dtype=h.dtype)
+        weights = raw_weights.to(device=h.device, dtype=h.dtype)
         if weights.ndim != 1 or weights.shape[0] != B:
             raise ValueError(
                 "tied sampling weights must be a 1D tensor with one value per batch item; "
@@ -997,17 +1109,43 @@ def _aggregate_potts_params(potts_decoder_aux: dict[str, TensorType["b ..."]],
 def _construct_tied_sampling_inputs(batch: dict[str, TensorType["b ..."]]) -> dict[str, Any]:
     tied_sampling_inputs = {"tied_sampling_ids": batch["tied_sampling_ids"]}
     device = batch["tied_sampling_ids"].device
+    B = batch["restype"].shape[0]
     tied_sampling_inputs["unique_ids"], tied_sampling_inputs["inverse"] = tied_sampling_inputs["tied_sampling_ids"].unique(return_inverse=True)
-    if "tied_sampling_aggregation_scheme" in batch:
-        tied_sampling_inputs["reduce"] = batch["tied_sampling_aggregation_scheme"]
-    if "tied_sampling_weights" in batch:
-        tied_sampling_inputs["weights"] = batch["tied_sampling_weights"]
+    reduce = str(batch.get("tied_sampling_aggregation_scheme", "mean"))
+    if reduce not in {"mean", "sqrt", "weighted_mean"}:
+        raise ValueError(
+            "tied_sampling_aggregation_scheme must be 'mean', 'sqrt', "
+            f"or 'weighted_mean'; got {reduce!r}"
+        )
+    tied_sampling_inputs["reduce"] = reduce
 
     # use first index of each tied group as the representative index
-    B = batch["restype"].shape[0]
     batch_idx = torch.arange(B, device=device)
     n_unique_ids = tied_sampling_inputs["unique_ids"].shape[0]
     first_idxs = torch.full((n_unique_ids, ), B, device=device)
     first_idxs.scatter_reduce_(0, tied_sampling_inputs["inverse"], batch_idx, reduce="amin", include_self=True)
     tied_sampling_inputs["rep_idx"] = first_idxs[tied_sampling_inputs["inverse"]]
+    if "tied_sampling_weights" in batch:
+        if reduce != "weighted_mean":
+            raise ValueError(
+                "tied_sampling_weights require "
+                "tied_sampling_aggregation_scheme='weighted_mean'"
+            )
+        weights = batch["tied_sampling_weights"].to(device=device, dtype=torch.float32)
+        if weights.ndim != 1 or weights.shape[0] != B:
+            raise ValueError(
+                "tied_sampling_weights must be a 1D tensor with one value per batch item"
+            )
+        if torch.any(weights < 0):
+            raise ValueError("tied_sampling_weights must be non-negative")
+        group_weight_sums = torch.zeros(n_unique_ids, device=device, dtype=weights.dtype)
+        group_weight_sums.index_add_(0, tied_sampling_inputs["inverse"], weights)
+        if torch.any(group_weight_sums <= 0):
+            raise ValueError("Each tied_sampling group must have positive total weight")
+        tied_sampling_inputs["weights"] = weights / group_weight_sums[tied_sampling_inputs["inverse"]]
+    elif reduce == "weighted_mean":
+        raise ValueError(
+            "tied_sampling_aggregation_scheme='weighted_mean' requires "
+            "tied_sampling_weights"
+        )
     return tied_sampling_inputs

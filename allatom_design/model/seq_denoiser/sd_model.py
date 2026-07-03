@@ -48,6 +48,7 @@ class SeqDenoiser(nn.Module):
             # Sample sequence and atom conditioning masks
             batch["seq_cond_mask"] = self.mask_selector.sample_seq_cond_mask(batch, t)  # 1 if we should condition on the restype, 0 otherwise
             batch["atom_cond_mask"], scn_token_mask, scn_atom_mask = self.mask_selector.sample_atom_cond_mask(batch)
+            batch["sidechain_context_token_mask"] = scn_token_mask
             batch["sidechain_context_atom_mask"] = scn_atom_mask
             batch["seq_cond_mask"] = (batch["seq_cond_mask"] + scn_token_mask).clamp(max=1.0)
 
@@ -77,16 +78,14 @@ class SeqDenoiser(nn.Module):
             batch["t"] = torch.full((batch["token_pad_mask"].shape[0],), fill_value=sampling_inputs["t"], device=batch["token_pad_mask"].device)
 
         # Choose sampling method
-        if sampling_inputs.get("use_mlm_sampling", False):
-            id_to_atom_arrays, aux = self.denoiser.mlm_sample(batch, sampling_inputs)
-        elif sampling_inputs.get("use_potts_sampling", False):
+        if sampling_inputs.get("use_potts_sampling", False):
             id_to_atom_arrays, aux = self.denoiser.potts_sample(
                 batch,
                 sampling_inputs,
                 potts_aux_provider=potts_aux_provider,
             )
         else:
-            raise ValueError("No sampling method specified. Set use_potts_sampling=True or use_mlm_sampling=True.")
+            raise ValueError("No sampling method specified. Set use_potts_sampling=True.")
 
         return id_to_atom_arrays, aux
 

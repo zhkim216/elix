@@ -50,11 +50,9 @@ class AtomworksSDDataset(MolecularDataset):
     # ------------------------------------------------------------------ #
     def _build_train_index(self) -> None:
         self.metadata_path = self.cfg.train_metadata_path
-        self.allowed_evidence_columns = md.resolve_evidence_columns(self.cfg)
         self.metadata_df, self.val_cluster_ids = md.process_train_metadata_df(
             self.metadata_path,
             cfg=self.cfg,
-            allowed_evidence_columns=self.allowed_evidence_columns,
             phase=self.phase,
         )
         dataset_name = self.cfg.get("dataset_name", Path(self.metadata_path).parent.name)

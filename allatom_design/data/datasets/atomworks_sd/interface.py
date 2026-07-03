@@ -353,7 +353,7 @@ def _build_nucleic_acid_ligand_interface_rows(
 
     rows = []
     for _, group_df in center_df.groupby(
-        ["pdb_id", "assembly_id", "q_pn_unit_nucleic_acid_group_id"],
+        ["pdb_id", "assembly_id", "q_pn_unit_nucleic_acid_group_iids"],
         sort=False,
     ):
         group_rows = sorted(

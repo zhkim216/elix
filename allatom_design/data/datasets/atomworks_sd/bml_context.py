@@ -56,22 +56,6 @@ CONTEXT_FLAG_COLUMNS = [
 ]
 BML_ANNOTATION_COLUMNS = [*BML_CENTER_FLAG_COLUMNS, *CONTEXT_FLAG_COLUMNS]
 
-LEGACY_BML_CONFIG_KEYS = [
-    "metal_external_evidence_policy",
-    "allowed_ccd_codes",
-    "min_protein_donor_atoms",
-    "min_avg_occupancy_nonpolymer",
-    "small_molecule_artifact_list_path",
-    "small_molecule_artifact_external_evidence_policy",
-    "small_molecule_external_evidence_policy",
-    "min_contacting_protein_atoms_small_molecule",
-    "min_contacting_protein_atom_ratio_small_molecule",
-    "min_avg_occupancy_nonpolymer_small_molecule",
-    "max_missing_atom_fraction_small_molecule",
-    "nucleic_acid_group_distance_cutoff",
-    "nucleic_acid_ligand_max_residues",
-]
-
 CONTEXT_REQUIRED_COLUMNS = [
     "q_pn_unit_iid",
     "pdb_id",
@@ -94,7 +78,7 @@ CONTEXT_REQUIRED_COLUMNS = [
 
 @dataclass(frozen=True)
 class MetalCenterPolicy:
-    external_evidence_policy: str = "no_filter"
+    external_evidence_policy: Any = "no_filter"
     allowed_ccd_codes: list[str] | None = None
     min_protein_donor_atoms: int = 3
     min_avg_occupancy_nonpolymer: float | None = 0.5
@@ -103,7 +87,7 @@ class MetalCenterPolicy:
     def from_cfg(cls, cfg: dict | DictConfig | None) -> "MetalCenterPolicy":
         cfg = cfg or {}
         return cls(
-            external_evidence_policy=str(cfg.get("external_evidence_policy", "no_filter")),
+            external_evidence_policy=cfg.get("external_evidence_policy", "no_filter"),
             allowed_ccd_codes=_optional_list(cfg.get("allowed_ccd_codes", None)),
             min_protein_donor_atoms=int(cfg.get("min_protein_donor_atoms", 3)),
             min_avg_occupancy_nonpolymer=_optional_float(cfg.get("min_avg_occupancy_nonpolymer", 0.5)),
@@ -112,7 +96,6 @@ class MetalCenterPolicy:
     def as_selector_cfg(self) -> dict[str, Any]:
         return {
             "external_evidence_policy": self.external_evidence_policy,
-            "metal_external_evidence_policy": self.external_evidence_policy,
             "allowed_ccd_codes": self.allowed_ccd_codes,
             "min_avg_occupancy_nonpolymer": self.min_avg_occupancy_nonpolymer,
         }
@@ -120,21 +103,18 @@ class MetalCenterPolicy:
 
 @dataclass(frozen=True)
 class SmallMoleculeCenterPolicy:
-    artifact_list_path: str | None = None
-    artifact_external_evidence_policy: str = "no_filter"
+    external_evidence_policy: Any = "no_filter"
     min_contacting_protein_atoms: int | None = 20
     min_contacting_protein_atom_ratio: float | None = None
     min_avg_occupancy_nonpolymer: float | None = 0.5
     max_missing_atom_fraction: float | None = 0.2
+    exclude_maybe_covalently_linked_small_molecules: bool = False
 
     @classmethod
     def from_cfg(cls, cfg: dict | DictConfig | None) -> "SmallMoleculeCenterPolicy":
         cfg = cfg or {}
         return cls(
-            artifact_list_path=_optional_str(cfg.get("artifact_list_path", None)),
-            artifact_external_evidence_policy=str(
-                cfg.get("artifact_external_evidence_policy", "no_filter")
-            ),
+            external_evidence_policy=cfg.get("external_evidence_policy", "no_filter"),
             min_contacting_protein_atoms=_optional_int(
                 cfg.get("min_contacting_protein_atoms", 20)
             ),
@@ -145,14 +125,14 @@ class SmallMoleculeCenterPolicy:
                 cfg.get("min_avg_occupancy_nonpolymer", 0.5)
             ),
             max_missing_atom_fraction=_optional_float(cfg.get("max_missing_atom_fraction", 0.2)),
+            exclude_maybe_covalently_linked_small_molecules=bool(
+                cfg.get("exclude_maybe_covalently_linked_small_molecules", False)
+            ),
         )
 
     def as_selector_cfg(self) -> dict[str, Any]:
         return {
-            "small_molecule_artifact_list_path": self.artifact_list_path,
-            "small_molecule_artifact_external_evidence_policy": (
-                self.artifact_external_evidence_policy
-            ),
+            "external_evidence_policy": self.external_evidence_policy,
             "min_contacting_protein_atoms_small_molecule": (
                 self.min_contacting_protein_atoms
             ),
@@ -163,21 +143,10 @@ class SmallMoleculeCenterPolicy:
                 self.min_avg_occupancy_nonpolymer
             ),
             "max_missing_atom_fraction_small_molecule": self.max_missing_atom_fraction,
+            "exclude_maybe_covalently_linked_small_molecules": (
+                self.exclude_maybe_covalently_linked_small_molecules
+            ),
         }
-
-
-@dataclass(frozen=True)
-class NucleicAcidCenterPolicy:
-    group_distance_cutoff: float = 4.5
-    ligand_max_residues: int = 10
-
-    @classmethod
-    def from_cfg(cls, cfg: dict | DictConfig | None) -> "NucleicAcidCenterPolicy":
-        cfg = cfg or {}
-        return cls(
-            group_distance_cutoff=float(cfg.get("group_distance_cutoff", 4.5)),
-            ligand_max_residues=int(cfg.get("ligand_max_residues", 10)),
-        )
 
 
 @dataclass(frozen=True)
@@ -247,7 +216,6 @@ class EnabledContextPolicy:
 class BMLCenterPolicy:
     metal: MetalCenterPolicy
     small_molecule: SmallMoleculeCenterPolicy
-    nucleic_acid: NucleicAcidCenterPolicy
 
     @classmethod
     def from_cfg(cls, cfg: dict | DictConfig | None) -> "BMLCenterPolicy":
@@ -255,7 +223,6 @@ class BMLCenterPolicy:
         return cls(
             metal=MetalCenterPolicy.from_cfg(cfg.get("metal", {})),
             small_molecule=SmallMoleculeCenterPolicy.from_cfg(cfg.get("small_molecule", {})),
-            nucleic_acid=NucleicAcidCenterPolicy.from_cfg(cfg.get("nucleic_acid", {})),
         )
 
 
@@ -293,7 +260,6 @@ class BMLPolicy:
     @classmethod
     def from_cfg(cls, cfg: dict | DictConfig | None) -> "BMLPolicy":
         cfg = cfg or {}
-        validate_no_legacy_bml_keys(cfg)
         if "bml_center" not in cfg:
             raise KeyError(
                 "AtomWorks SD data config must define nested `bml_center`. "
@@ -309,17 +275,6 @@ class BMLPolicy:
 class BMLContextExpansionStats:
     missing_partner_rows: int = 0
     skipped_ineligible_partners: int = 0
-
-
-def validate_no_legacy_bml_keys(cfg: dict | DictConfig | None) -> None:
-    cfg = cfg or {}
-    present = [key for key in LEGACY_BML_CONFIG_KEYS if key in cfg]
-    if present:
-        raise ValueError(
-            "Legacy flat AtomWorks SD BML config keys are no longer supported: "
-            f"{present}. Move these settings under nested `bml_center` and "
-            "`bml_context`."
-        )
 
 
 def has_nested_bml_config(cfg: dict | DictConfig | None) -> bool:
@@ -355,7 +310,6 @@ def annotate_bml_context(
             "q_pn_unit_num_resolved_atoms",
             "q_pn_unit_avg_occupancy_nonpolymer",
             "q_pn_unit_non_polymer_res_names",
-            "q_pn_unit_has_external_evidence",
         ],
         context="BML center annotation",
     )
@@ -828,12 +782,6 @@ def _optional_list(value) -> list[str] | None:
     if isinstance(value, str):
         return [value]
     return [str(item) for item in list(value)]
-
-
-def _optional_str(value) -> str | None:
-    if value in (None, ""):
-        return None
-    return str(value)
 
 
 def _optional_float(value) -> float | None:

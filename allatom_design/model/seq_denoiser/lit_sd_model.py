@@ -145,7 +145,11 @@ class LitSeqDenoiser(L.LightningModule):
             _, aux = self.loss(outputs, batch, eval_total = False, return_aux=True)
             batch.update(meta_fields)
 
-            aux = {k: v for k, v in aux.items() if ("seq" in k) or ("potts" in k)}  # trim aux to sequence metrics
+            aux = {
+                k: v
+                for k, v in aux.items()
+                if ("seq" in k) or ("potts" in k) or ("sidechain" in k)
+            }
             self._log(batch, outputs, aux, batch_idx, phase="val", phase_suffix=phase_suffix, key_suffix=f"_t{eval_t}")
 
             # aggregate across timesteps

@@ -12,6 +12,9 @@ from torchtyping import TensorType
 
 import allatom_design.data.const as const
 import allatom_design.model.seq_denoiser.denoisers.seq_design.potts as potts
+from allatom_design.model.seq_denoiser.denoisers.sidechain_prediction import (
+    ChiAnglePredictionHead,
+)
 from allatom_design.model.seq_denoiser.denoisers.seq_design.mpnn_utils import (
     cat_neighbors_nodes,
     gather_nodes,
@@ -108,6 +111,11 @@ class ElixMPNN(nn.Module):
 
         # Potts decoder
         self.use_potts = self.cfg.potts.use_potts
+        self.sidechain_prediction_cfg = cfg.get("sidechain_prediction", {})
+        self.use_sidechain_prediction = bool(self.sidechain_prediction_cfg.get("enabled", False))
+        if self.use_sidechain_prediction and not self.use_potts:
+            raise ValueError("sidechain_prediction.enabled=true requires potts.use_potts=true")
+
         if self.use_potts:
             self.k_neighbors_potts = cfg.potts.get("k_neighbors_potts", None)
             self.max_dist_potts = cfg.potts.get("max_dist_potts", None)
@@ -179,6 +187,18 @@ class ElixMPNN(nn.Module):
                 dropout=cfg.dropout_p,
             )
             self.decoder_S_potts = potts_init()
+
+            if self.use_sidechain_prediction:
+                sidechain_hidden_dim = int(self.sidechain_prediction_cfg.get("hidden_dim", self.hidden_dim))
+                self.chi_angle_prediction_head = ChiAnglePredictionHead(
+                    input_dim=self.dim_nodes_potts,
+                    hidden_dim=sidechain_hidden_dim,
+                    num_chi=int(self.sidechain_prediction_cfg.get("num_chi", 4)),
+                    num_bins=int(self.sidechain_prediction_cfg.get("num_bins", 72)),
+                    dropout_p=float(self.sidechain_prediction_cfg.get("dropout_p", cfg.dropout_p)),
+                )
+            else:
+                self.chi_angle_prediction_head = None
 
         # Output layers
         self.W_out = nn.Linear(self.hidden_dim, self.n_tokens, bias=True)
@@ -258,10 +278,17 @@ class ElixMPNN(nn.Module):
         h_E = self._expand_potts_edges(h_V, h_E, E_idx, h_V_C_skip)
 
         # Potts model
+        sidechain_prediction_aux = None
         if self.use_potts:
             if self.norm_potts_inputs:
                 h_V_potts = self.norm_potts_inputs_nodes(h_V_potts)
                 h_E = self.norm_potts_inputs_edges(h_E)
+
+            if self.chi_angle_prediction_head is not None:
+                sidechain_prediction_aux = self.chi_angle_prediction_head(
+                    h_V_potts,
+                    chi_angles=batch.get("chi_angles", None) if not is_sampling else None,
+                )
 
             if self.max_dist_potts is not None:
                 protein_residue_node_mask_2d = protein_residue_node_mask_2d * (D_neighbors <= self.max_dist_potts)  # mask out edges that are too far away
@@ -287,6 +314,8 @@ class ElixMPNN(nn.Module):
         mpnn_feature_dict = {"h_V": h_V, "h_ESV": h_E, "E_idx": E_idx} # Todo: Need to change "h_ESV" to "h_E" in the pipeline later
         if self.use_potts:
             mpnn_feature_dict["potts_decoder_aux"] = potts_decoder_aux
+        if sidechain_prediction_aux is not None:
+            mpnn_feature_dict["sidechain_prediction_aux"] = sidechain_prediction_aux
 
         return logits, mpnn_feature_dict
 

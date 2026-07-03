@@ -70,6 +70,31 @@ _ATOM_CHIRALITY_TAG_TO_ID = {
 }
 
 
+# Standard heavy-atom sidechain chi definitions.  These intentionally omit the
+# rotatable hydrogen chis used by LASErMPNN because this featurizer commonly
+# removes hydrogens.
+_STANDARD_AA_HEAVY_CHI_ATOMS = {
+    "ARG": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD"), ("CB", "CG", "CD", "NE"), ("CG", "CD", "NE", "CZ")),
+    "ASN": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "OD1")),
+    "ASP": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "OD1")),
+    "CYS": (("N", "CA", "CB", "SG"),),
+    "GLN": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD"), ("CB", "CG", "CD", "OE1")),
+    "GLU": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD"), ("CB", "CG", "CD", "OE1")),
+    "HIS": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "ND1")),
+    "ILE": (("N", "CA", "CB", "CG1"), ("CA", "CB", "CG1", "CD1")),
+    "LEU": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")),
+    "LYS": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD"), ("CB", "CG", "CD", "CE"), ("CG", "CD", "CE", "NZ")),
+    "MET": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "SD"), ("CB", "CG", "SD", "CE")),
+    "PHE": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")),
+    "PRO": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD")),
+    "SER": (("N", "CA", "CB", "OG"),),
+    "THR": (("N", "CA", "CB", "OG1"),),
+    "TRP": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")),
+    "TYR": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")),
+    "VAL": (("N", "CA", "CB", "CG1"),),
+}
+
+
 def _encode_atom_chirality_tags(stereo_values: Sequence[Any] | np.ndarray) -> np.ndarray:
     encoded = np.zeros(len(stereo_values), dtype=np.int64)
     for idx, value in enumerate(stereo_values):
@@ -79,6 +104,65 @@ def _encode_atom_chirality_tags(stereo_values: Sequence[Any] | np.ndarray) -> np
             value = value.decode()
         encoded[idx] = _ATOM_CHIRALITY_TAG_TO_ID.get(str(value).strip().upper(), 0)
     return encoded
+
+
+def _dihedral_degrees(coords: torch.Tensor) -> torch.Tensor:
+    """Compute dihedral angles in degrees for coords shaped [..., 4, 3]."""
+    b0 = coords[..., 0, :] - coords[..., 1, :]
+    b1 = coords[..., 1, :] - coords[..., 2, :]
+    b2 = coords[..., 2, :] - coords[..., 3, :]
+
+    n1 = torch.cross(b0, b1, dim=-1)
+    n2 = torch.cross(b1, b2, dim=-1)
+    b1_norm = torch.linalg.vector_norm(b1, dim=-1, keepdim=True).clamp(min=1e-8)
+    m1 = torch.cross(n1, b1 / b1_norm, dim=-1)
+    x = torch.sum(n1 * n2, dim=-1)
+    y = torch.sum(m1 * n2, dim=-1)
+    return torch.rad2deg(torch.atan2(y, x))
+
+
+def _compute_standard_aa_chi_targets(
+    atom_array: AtomArray,
+    atom_to_token_map: torch.Tensor,
+    n_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    chi_angles = torch.full((n_tokens, 4), torch.nan, dtype=torch.float32)
+    chi_mask = torch.zeros((n_tokens, 4), dtype=torch.float32)
+
+    atom_to_token_np = atom_to_token_map.detach().cpu().numpy()
+    atom_names = np.asarray(atom_array.atom_name).astype(str)
+    res_names = np.asarray(atom_array.res_name).astype(str)
+    occupancy = np.asarray(atom_array.occupancy)
+    coords = torch.as_tensor(atom_array.coord, dtype=torch.float32)
+
+    for token_idx in range(n_tokens):
+        atom_indices = np.flatnonzero(atom_to_token_np == token_idx)
+        if atom_indices.size == 0:
+            continue
+
+        chi_atom_defs = _STANDARD_AA_HEAVY_CHI_ATOMS.get(str(res_names[atom_indices[0]]))
+        if not chi_atom_defs:
+            continue
+
+        atom_idx_by_name = {}
+        for atom_idx in atom_indices:
+            if occupancy[atom_idx] <= 0:
+                continue
+            atom_name = atom_names[atom_idx].strip()
+            if atom_name not in atom_idx_by_name:
+                atom_idx_by_name[atom_name] = int(atom_idx)
+
+        for chi_idx, atom_name_tuple in enumerate(chi_atom_defs):
+            if not all(atom_name in atom_idx_by_name for atom_name in atom_name_tuple):
+                continue
+            coord_idxs = [atom_idx_by_name[atom_name] for atom_name in atom_name_tuple]
+            chi_coords = coords[coord_idxs]
+            if not torch.isfinite(chi_coords).all():
+                continue
+            chi_angles[token_idx, chi_idx] = _dihedral_degrees(chi_coords)
+            chi_mask[token_idx, chi_idx] = 1.0
+
+    return chi_angles, chi_mask
 
 
 # Keep track of the token/atom dimensions of the features for padding & cropping
@@ -118,6 +202,8 @@ FEAT_TO_TOKEN_DIM = {
     "noised_o_coords": [0],
     "noised_pseudo_cb_coords": [0],
     "token_is_prot_std_aa": [0],
+    "chi_angles": [0],
+    "chi_mask": [0],
 
     # optional features that might not be present
     "seq_cond_mask": [0],
@@ -300,6 +386,12 @@ class FeaturizeCoordsAndMasks(Transform):
         # Add protein_standard_residue mask
         feats["atom_is_prot_std_aa"] = feats["atom_is_protein_chain"] * (1 - feats["atom_is_atomized"])
         feats["token_is_prot_std_aa"] = feats["token_is_protein_chain"] * (1 - feats["is_atomized"].float())
+
+        feats["chi_angles"], feats["chi_mask"] = _compute_standard_aa_chi_targets(
+            atom_array=atom_array,
+            atom_to_token_map=feats["atom_to_token_map"],
+            n_tokens=N_tokens,
+        )
                 
         return data
 
