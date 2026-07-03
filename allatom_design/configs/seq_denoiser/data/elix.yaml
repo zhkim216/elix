@@ -1,10 +1,10 @@
 task: ${model.task}
 dataset_impl: atomworks_sd
 pdb_path: /scratch/users/zhkim216/datasets/atomworks_pdb_full_v9
-train_metadata_path: /scratch/users/zhkim216/datasets/atomworks_pdb_full_v9/metadata_ligval_seq_clustered_external_evidence_ver5.parquet
+train_metadata_path: /scratch/users/zhkim216/datasets/atomworks_pdb_full_v9/final/step2_annotate_metal_evidence/outputs/metadata_ligval_metalfixed_metal_evidence_seq_clustered_03.parquet
 
 validation_ids_file: null
-val_metadata_path: /scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs/metadata_for_training_nativeval_sm_metal.parquet
+val_metadata_path: /scratch/users/zhkim216/datasets/evaluation_datasets/nativeval/metadata_for_training_nativeval.parquet
 
 debug: ${train.debug}
 debug_num_ids: 10000
@@ -21,30 +21,19 @@ val_exclusion_cluster_id_col: q_pn_unit_cluster_03_id
 
 query_pn_unit_iids_only: true
 
-# --- nonpolymer / metal evidence & quality filters ---
-allowed_evidence_columns:
-  - metal_medba_evidence
-  - metal_pubmed_evidence
-  - q_pn_unit_has_bird_prd_identifier
-
 bml_center:
   metal:
-    external_evidence_policy: external_evidence
+    external_evidence_policy: ["pubmed", "medba"]
     allowed_ccd_codes: null
     min_protein_donor_atoms: 3
     min_avg_occupancy_nonpolymer: 0.5
   small_molecule:
-    artifact_list_path: /scratch/users/zhkim216/datasets/artifact_lists/artifact_sources_by_ccd_JH_ver2.tsv
-    artifact_external_evidence_policy: filter_all_artifacts
+    external_evidence_policy: ["klifs", "prd"]
     min_contacting_protein_atoms: 20
     min_contacting_protein_atom_ratio: 1.0
     min_avg_occupancy_nonpolymer: 0.5
     max_missing_atom_fraction: 0.2
-  nucleic_acid:
-    # Distance cutoff (A) used to group nucleic-acid pn_units into a single nucleic-acid group.
-    group_distance_cutoff: 4.5
-    # Max number of residues for a nucleic-acid group to be treated as a nuc-ligand center.
-    ligand_max_residues: 10
+    exclude_maybe_covalently_linked_small_molecules: true
 
 bml_context:
   enabled: true

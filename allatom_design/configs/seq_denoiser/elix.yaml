@@ -102,6 +102,8 @@ loss:
     potts_composite_loss: 1.0
     potts_composite_loss_msa: 0.0
     potts_pseudolikelihood_loss: 0.0
+    sidechain_chi_loss: 0.0
+    sidechain_chi_offset_loss: 0.0
   seq_loss:
     label_smoothing: 0.1
     per_token_avg: false

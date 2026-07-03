@@ -57,4 +57,11 @@ mpnn:
       reduce: "mean" # "mean", "sqrt"
       num_heads: 4
 
+  sidechain_prediction:
+    enabled: false
+    hidden_dim: ${denoiser.mpnn.hidden_dim}
+    num_chi: 4
+    num_bins: 72
+    dropout_p: ${denoiser.mpnn.dropout_p}
+
   expansion_mode: "node_concat" # null, node_concat, node_concat_context_skip, multi_head_factor, node_concat_multi_head

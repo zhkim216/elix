@@ -11,6 +11,12 @@ from torchtyping import TensorType
 
 import allatom_design.model.seq_denoiser.denoisers.seq_design.potts as potts
 from allatom_design.data import const
+from allatom_design.model.seq_denoiser.denoisers.sidechain_prediction.chi_angle_loss import (
+    chi_target_bins_and_offsets,
+    masked_chi_accuracy,
+    masked_chi_cross_entropy,
+    masked_chi_offset_mse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +42,21 @@ class SDLoss(nn.Module):
 
         # Define losses based on task
         if self.task == "seq_des":
-            self.loss_keys = {"seq_loss", "potts_composite_loss", "potts_pseudolikelihood_loss"}
+            self.loss_keys = {
+                "seq_loss",
+                "potts_composite_loss",
+                "potts_pseudolikelihood_loss",
+                "sidechain_chi_loss",
+                "sidechain_chi_offset_loss",
+            }
         elif self.task == "lc_seq_des":
-            self.loss_keys = {"seq_loss", "potts_composite_loss", "potts_pseudolikelihood_loss"}
+            self.loss_keys = {
+                "seq_loss",
+                "potts_composite_loss",
+                "potts_pseudolikelihood_loss",
+                "sidechain_chi_loss",
+                "sidechain_chi_offset_loss",
+            }
         else:
             raise ValueError(f"Unrecognized task: {self.task}")
 
@@ -151,6 +169,50 @@ class SDLoss(nn.Module):
                     if pl_ligand_pocket_loss is not None:
                         aux_monitor["ligand_pocket_potts_pseudolikelihood_loss"] = pl_ligand_pocket_loss.mean().detach().clone()
 
+        sidechain_prediction_aux = outputs.get("sidechain_prediction_aux")
+        sidechain_loss_requested = (
+            self.loss_weights.get("sidechain_chi_loss", 0.0) > 0.0
+            or self.loss_weights.get("sidechain_chi_offset_loss", 0.0) > 0.0
+        )
+        if sidechain_prediction_aux is None:
+            if sidechain_loss_requested:
+                raise ValueError("Sidechain loss requested but outputs['sidechain_prediction_aux'] is missing")
+        elif "chi_angles" not in batch or "chi_mask" not in batch:
+            if sidechain_loss_requested:
+                raise ValueError("Sidechain loss requested but batch['chi_angles'] or batch['chi_mask'] is missing")
+        else:
+            sidechain_token_mask = (
+                outputs["protein_residue_node_mask"]
+                * outputs["seq_cond_mask"]
+                * (1.0 - outputs["sidechain_context_token_mask"])
+            )
+            chi_loss_mask = sidechain_token_mask.unsqueeze(-1) * batch["chi_mask"]
+            aux["sidechain_chi_loss"] = masked_chi_cross_entropy(
+                sidechain_prediction_aux["chi_logits"],
+                batch["chi_angles"],
+                chi_loss_mask,
+            )
+            target_chi_offsets = sidechain_prediction_aux.get("target_chi_offsets", None)
+            if target_chi_offsets is None:
+                _, target_chi_offsets = chi_target_bins_and_offsets(
+                    batch["chi_angles"],
+                    sidechain_prediction_aux["chi_logits"].shape[-1],
+                )
+            aux["sidechain_chi_offset_loss"] = masked_chi_offset_mse(
+                sidechain_prediction_aux["chi_offsets"],
+                target_chi_offsets,
+                chi_loss_mask,
+            )
+            aux_monitor["sidechain_chi_acc"] = masked_chi_accuracy(
+                sidechain_prediction_aux["chi_logits"],
+                batch["chi_angles"],
+                chi_loss_mask,
+            ).detach().clone()
+            aux_monitor["sidechain_num_valid_chi"] = chi_loss_mask.sum().detach().clone()
+            aux_monitor["sidechain_num_supervised_tokens"] = (
+                (chi_loss_mask.sum(dim=-1) > 0).float().sum().detach().clone()
+            )
+
         # Aggregate losses
         total_loss = 0.0        
         for loss_name, loss in aux.items():
@@ -166,7 +228,7 @@ class SDLoss(nn.Module):
             if eval_total:
                 if loss_name in self.loss_keys:
                     # Only allow losses that are in the loss_keys to contribute to the total loss
-                    total_loss += loss * self.loss_weights[loss_name]  # apply manual per-loss loss weighting
+                    total_loss += loss * self.loss_weights.get(loss_name, 0.0)  # apply manual per-loss loss weighting
 
         if eval_total:
             aux["total_loss"] = total_loss
