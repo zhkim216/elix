@@ -25,6 +25,9 @@ bml_center:
   metal:
     external_evidence_policy: ["pubmed", "medba"]
     allowed_ccd_codes: null
+    # Shared by BML metal centers, BML metal context, and metal-protein interface rows.
+    donor_elements: ["N", "O", "S", "Se", "F", "Cl", "Br", "I"]
+    max_donor_distance_angstrom: 3.0
     min_protein_donor_atoms: 3
     min_avg_occupancy_nonpolymer: 0.5
   small_molecule:
