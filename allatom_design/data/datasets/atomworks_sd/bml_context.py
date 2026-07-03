@@ -10,6 +10,7 @@ This module owns the train-time BML metadata contract:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 import logging
 from typing import Any
@@ -25,6 +26,7 @@ from allatom_design.data.datasets.atomworks_sd.selectors import (
 from allatom_design.data.utils.pn_unit import (
     contact_count,
     contact_within_cutoff,
+    metal_donor_contact_count,
     natural_key,
     parse_partner_list,
     series_has_any_exact_ccd,
@@ -74,6 +76,34 @@ CONTEXT_REQUIRED_COLUMNS = [
     "q_pn_unit_is_peptide",
     "q_pn_unit_is_nuc",
 ]
+
+
+@dataclass(frozen=True)
+class MetalDonorPolicy:
+    donor_elements: tuple[str, ...] | None = None
+    max_donor_distance_angstrom: float | None = None
+
+    @classmethod
+    def from_cfg(cls, cfg: dict | DictConfig | None) -> "MetalDonorPolicy":
+        cfg = cfg or {}
+        return cls(
+            donor_elements=_optional_normalized_elements(cfg.get("donor_elements", None)),
+            max_donor_distance_angstrom=_optional_positive_float(
+                cfg.get("max_donor_distance_angstrom", None),
+                key="bml_center.metal.max_donor_distance_angstrom",
+            ),
+        )
+
+    def count(self, contact: dict) -> int:
+        return metal_donor_contact_count(
+            contact,
+            donor_elements=self.donor_elements,
+            max_distance_angstrom=self.max_donor_distance_angstrom,
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self.donor_elements is not None or self.max_donor_distance_angstrom is not None
 
 
 @dataclass(frozen=True)
@@ -256,6 +286,7 @@ class BMLContextPolicy:
 class BMLPolicy:
     center: BMLCenterPolicy
     context: BMLContextPolicy
+    metal_donor: MetalDonorPolicy
 
     @classmethod
     def from_cfg(cls, cfg: dict | DictConfig | None) -> "BMLPolicy":
@@ -265,9 +296,12 @@ class BMLPolicy:
                 "AtomWorks SD data config must define nested `bml_center`. "
                 "Legacy flat BML keys are no longer supported."
             )
+        center_cfg = cfg.get("bml_center", {})
+        center_metal_cfg = (center_cfg or {}).get("metal", {})
         return cls(
-            center=BMLCenterPolicy.from_cfg(cfg.get("bml_center", {})),
+            center=BMLCenterPolicy.from_cfg(center_cfg),
             context=BMLContextPolicy.from_cfg(cfg.get("bml_context", {})),
+            metal_donor=MetalDonorPolicy.from_cfg(center_metal_cfg),
         )
 
 
@@ -318,12 +352,21 @@ def annotate_bml_context(
 
     pn_unit_kind = _pn_unit_kind(out)
     lookup = build_pn_unit_index_lookup(out)
+    metal_donor_stats: dict[str, int] = {}
+
+    def count_metal_donor_contact(contact: dict) -> int:
+        count = policy.metal_donor.count(contact)
+        _update_metal_donor_policy_stats(policy.metal_donor, contact, count, metal_donor_stats)
+        return count
+
     metal_edges = _build_contact_edges(
         out,
         "q_pn_unit_per_partner_contacts_metal",
         pn_unit_kind,
         lookup,
+        count_fn=count_metal_donor_contact,
     )
+    _log_metal_donor_policy_stats(policy.metal_donor, metal_donor_stats)
     protein_partner_passes = pn_unit_kind.eq("protein")
 
     metal_protein_donor_counts = _sum_edge_counts(
@@ -640,6 +683,8 @@ def _build_contact_edges(
     column: str,
     pn_unit_kind: pd.Series,
     lookup: dict[tuple[str, str, str], Any],
+    *,
+    count_fn: Callable[[dict], int] = contact_count,
 ) -> pd.DataFrame:
     records = []
     missing_partner_rows = 0
@@ -664,7 +709,7 @@ def _build_contact_edges(
             if not partner_indices:
                 missing_partner_rows += 1
                 continue
-            count = contact_count(contact)
+            count = count_fn(contact)
             for partner_idx in partner_indices:
                 records.append(
                     {
@@ -706,6 +751,82 @@ def _sum_edge_counts(
         .sum()
         .reindex(index, fill_value=0)
         .astype(int)
+    )
+
+
+def _update_metal_donor_policy_stats(
+    policy: MetalDonorPolicy,
+    contact: dict,
+    count: int,
+    stats: dict[str, int],
+) -> None:
+    if not policy.enabled:
+        return
+    raw_count = contact_count(contact)
+    stats["contacts_seen"] = stats.get("contacts_seen", 0) + 1
+    stats["raw_count"] = stats.get("raw_count", 0) + raw_count
+    stats["filtered_count"] = stats.get("filtered_count", 0) + max(0, int(count))
+    if raw_count > 0 and count <= 0:
+        stats["contacts_zero_after_policy"] = stats.get("contacts_zero_after_policy", 0) + 1
+        stats["raw_count_zero_after_policy"] = (
+            stats.get("raw_count_zero_after_policy", 0) + raw_count
+        )
+
+    donor_atoms = contact.get("donor_atoms")
+    if policy.max_donor_distance_angstrom is not None and not isinstance(donor_atoms, list):
+        stats["contacts_missing_donor_atoms"] = stats.get("contacts_missing_donor_atoms", 0) + 1
+        stats["raw_count_missing_donor_atoms"] = (
+            stats.get("raw_count_missing_donor_atoms", 0) + raw_count
+        )
+        return
+    if not isinstance(donor_atoms, list):
+        return
+
+    donor_element_set = set(policy.donor_elements) if policy.donor_elements is not None else None
+    for atom in donor_atoms:
+        if not isinstance(atom, dict):
+            continue
+        element = str(atom.get("element", "")).strip().upper()
+        if donor_element_set is not None and element not in donor_element_set:
+            stats["atoms_excluded_by_element"] = stats.get("atoms_excluded_by_element", 0) + 1
+            continue
+        if policy.max_donor_distance_angstrom is None:
+            continue
+        try:
+            distance = float(atom.get("distance"))
+        except (TypeError, ValueError):
+            stats["atoms_missing_or_invalid_distance"] = (
+                stats.get("atoms_missing_or_invalid_distance", 0) + 1
+            )
+            continue
+        if distance > policy.max_donor_distance_angstrom:
+            stats["atoms_excluded_by_distance"] = stats.get("atoms_excluded_by_distance", 0) + 1
+
+
+def _log_metal_donor_policy_stats(
+    policy: MetalDonorPolicy,
+    stats: dict[str, int],
+) -> None:
+    if not policy.enabled:
+        return
+    logger.info(
+        "Applied BML metal donor policy donor_elements=%s max_donor_distance_angstrom=%s: "
+        "contacts_seen=%d raw_count=%d filtered_count=%d contacts_zero_after_policy=%d "
+        "raw_count_zero_after_policy=%d contacts_missing_donor_atoms=%d "
+        "raw_count_missing_donor_atoms=%d atoms_excluded_by_element=%d "
+        "atoms_excluded_by_distance=%d atoms_missing_or_invalid_distance=%d.",
+        policy.donor_elements,
+        policy.max_donor_distance_angstrom,
+        stats.get("contacts_seen", 0),
+        stats.get("raw_count", 0),
+        stats.get("filtered_count", 0),
+        stats.get("contacts_zero_after_policy", 0),
+        stats.get("raw_count_zero_after_policy", 0),
+        stats.get("contacts_missing_donor_atoms", 0),
+        stats.get("raw_count_missing_donor_atoms", 0),
+        stats.get("atoms_excluded_by_element", 0),
+        stats.get("atoms_excluded_by_distance", 0),
+        stats.get("atoms_missing_or_invalid_distance", 0),
     )
 
 
@@ -790,10 +911,29 @@ def _optional_float(value) -> float | None:
     return float(value)
 
 
+def _optional_positive_float(value, *, key: str) -> float | None:
+    parsed = _optional_float(value)
+    if parsed is not None and parsed <= 0.0:
+        raise ValueError(f"`{key}` must be positive when set.")
+    return parsed
+
+
 def _optional_int(value) -> int | None:
     if value is None:
         return None
     return int(value)
+
+
+def _optional_normalized_elements(value) -> tuple[str, ...] | None:
+    values = _optional_list(value)
+    if values is None:
+        return None
+    normalized = tuple(
+        dict.fromkeys(str(element).strip().upper() for element in values if str(element).strip())
+    )
+    if not normalized:
+        raise ValueError("`bml_center.metal.donor_elements` must be null or non-empty.")
+    return normalized
 
 
 def _truthy(value) -> bool:

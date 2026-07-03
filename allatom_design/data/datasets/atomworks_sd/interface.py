@@ -4,6 +4,7 @@ Builds the metal-protein, small-molecule-protein and protein-protein interface
 rows that, together with protein monomer chains, make up the train index.
 """
 
+from collections.abc import Callable
 import logging
 
 import pandas as pd
@@ -168,7 +169,11 @@ def _build_protein_metal_interface_rows(
 
     rows = []
     for center in metal_center_df.itertuples(index=False):
-        donor_count, protein_rows = _collect_metal_protein_donor_partners(center, protein_lookup)
+        donor_count, protein_rows = _collect_metal_protein_donor_partners(
+            center,
+            protein_lookup,
+            count_fn=policy.metal_donor.count,
+        )
         if donor_count < min_donors or len(protein_rows) == 0:
             continue
 
@@ -543,17 +548,19 @@ def _collect_contacted_protein_rows(
     return int(total), list(protein_rows_by_iid.values())
 
 
-def _collect_metal_protein_donor_partners(center, protein_lookup: dict) -> tuple[int, list]:
+def _collect_metal_protein_donor_partners(
+    center,
+    protein_lookup: dict,
+    *,
+    count_fn: Callable[[dict], int] = contact_count,
+) -> tuple[int, list]:
     contacts = parse_partner_list(getattr(center, "q_pn_unit_per_partner_contacts_metal"))
     total = 0
     protein_rows_by_iid = {}
     for contact in contacts:
         if not isinstance(contact, dict):
             continue
-        try:
-            count = int(contact.get("count", 0))
-        except (TypeError, ValueError):
-            count = 0
+        count = count_fn(contact)
         resolved = _resolve_partner_rows(
             center.pdb_id,
             center.assembly_id,
@@ -561,7 +568,7 @@ def _collect_metal_protein_donor_partners(center, protein_lookup: dict) -> tuple
             contact.get("chain_iid"),
             protein_lookup,
         )
-        if not resolved:
+        if not resolved or count <= 0:
             continue
         total += count
         for protein in resolved:

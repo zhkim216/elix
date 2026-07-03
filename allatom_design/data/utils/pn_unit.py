@@ -9,6 +9,7 @@ the preprocessing pipelines and legacy code:
 """
 
 import ast
+from collections.abc import Sequence
 import json
 import re
 from pathlib import Path
@@ -108,6 +109,72 @@ def contact_count(contact: dict) -> int:
             return int(value)
         except (TypeError, ValueError):
             continue
+    return 0
+
+
+def _normalized_element_set(elements: Sequence[str] | None) -> set[str] | None:
+    if elements is None:
+        return None
+    return {str(element).strip().upper() for element in elements if str(element).strip()}
+
+
+def metal_donor_contact_count(
+    contact: dict,
+    *,
+    donor_elements: Sequence[str] | None = None,
+    max_distance_angstrom: float | None = None,
+) -> int:
+    """Count metal donor contacts under an optional element/distance policy.
+
+    Without a policy, preserve the legacy aggregate count contract. Once a
+    distance cutoff is requested, the only trustworthy source is nested
+    ``donor_atoms[*].distance``; aggregate counts and ``element_counts`` do not
+    carry distance information.
+    """
+    donor_element_set = _normalized_element_set(donor_elements)
+    if donor_element_set is None and max_distance_angstrom is None:
+        return contact_count(contact)
+
+    donor_atoms = contact.get("donor_atoms")
+    if max_distance_angstrom is not None:
+        if not isinstance(donor_atoms, list):
+            return 0
+        count = 0
+        for atom in donor_atoms:
+            if not isinstance(atom, dict):
+                continue
+            if donor_element_set is not None:
+                element = str(atom.get("element", "")).strip().upper()
+                if element not in donor_element_set:
+                    continue
+            try:
+                distance = float(atom.get("distance"))
+            except (TypeError, ValueError):
+                continue
+            if distance <= max_distance_angstrom:
+                count += 1
+        return count
+
+    element_counts = contact.get("element_counts")
+    if isinstance(element_counts, dict):
+        total = 0
+        for element, value in element_counts.items():
+            if str(element).strip().upper() not in donor_element_set:
+                continue
+            try:
+                total += int(value)
+            except (TypeError, ValueError):
+                continue
+        return total
+
+    if isinstance(donor_atoms, list):
+        return sum(
+            1
+            for atom in donor_atoms
+            if isinstance(atom, dict)
+            and str(atom.get("element", "")).strip().upper() in donor_element_set
+        )
+
     return 0
 
 
