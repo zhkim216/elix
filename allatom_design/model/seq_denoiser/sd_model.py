@@ -103,7 +103,7 @@ class SeqDenoiser(nn.Module):
         if sampling_inputs["add_noise"]:
             raise NotImplementedError("Adding noise is not implemented yet")
 
-        potts_decoder_aux, batch = self.denoiser.compute_potts_params(batch, sampling_inputs=sampling_inputs)
+        potts_decoder_aux, batch, sampling_inputs = self.denoiser.compute_potts_params(batch, sampling_inputs=sampling_inputs)
 
         return potts_decoder_aux, batch
 

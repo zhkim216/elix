@@ -53,7 +53,9 @@ class ElixMPNN(nn.Module):
         self.num_decoder_layers = cfg.num_decoder_layers
         self.use_mpnn_decoder = cfg.get("use_mpnn_decoder", True)
         self.k_neighbors = cfg.k_neighbors
-        self.n_tokens = const.AF3_ENCODING.n_tokens
+        self.use_potts_encoding = bool(cfg.get("use_potts_encoding", False))
+        self.sequence_encoding = const.POTTS_ENCODING if self.use_potts_encoding else const.AF3_ENCODING
+        self.n_tokens = self.sequence_encoding.n_tokens
         self.expansion_mode = cfg.get("expansion_mode", None)
         self.use_context_skip_connection = cfg.get("use_context_skip_connection", False)
         self.use_potts_context_skip_concat = self.expansion_mode == "node_concat_context_skip"
@@ -222,16 +224,24 @@ class ElixMPNN(nn.Module):
     def forward(self, batch: dict[str, TensorType["b ..."]], is_sampling: bool):
         # Get token-level features
         B, N, C = batch["restype"].shape
+        if C != self.n_tokens:
+            raise ValueError(
+                f"ElixMPNN expected restype alphabet size {self.n_tokens}, got {C}. "
+                "Check denoiser.mpnn.use_potts_encoding and restype projection."
+            )
         h_V = torch.zeros((B, N, self.hidden_dim), device=batch["restype"].device)
 
         # Concatenate residue-level features to h_V
-        ## first, mask out residues using gap token
-        masked = F.one_hot(torch.full((B, N), const.AF3_ENCODING.token_to_idx["<G>"],
-                                      device=batch["restype"].device), num_classes=C).float()
+        if self.use_potts_encoding:
+            restype = batch["restype"]
+        else:
+            ## first, mask out residues using gap token
+            masked = F.one_hot(torch.full((B, N), const.AF3_ENCODING.token_to_idx["<G>"],
+                                          device=batch["restype"].device), num_classes=C).float()
 
-        #! (JH) During sampling, seq_cond_mask is also 1 for padded tokens
-        #! (JH) So padded parts are also considered as gaps here, but I guess it's okay.
-        restype = torch.where(batch["seq_cond_mask"].unsqueeze(-1).bool(), batch["restype"], masked)
+            #! (JH) During sampling, seq_cond_mask is also 1 for padded tokens
+            #! (JH) So padded parts are also considered as gaps here, but I guess it's okay.
+            restype = torch.where(batch["seq_cond_mask"].unsqueeze(-1).bool(), batch["restype"], masked)
         h_S = self.W_s(restype) #! (JH) different from the original lmpnn (zero-initialized)
 
         # Build graph and get edge features

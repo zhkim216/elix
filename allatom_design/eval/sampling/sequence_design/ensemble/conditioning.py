@@ -325,6 +325,9 @@ def compute_ensemble_potts_params(
     output_batch = dict(batch)
     output_batch["protein_residue_node_mask"] = representative_batch["protein_residue_node_mask"]
     output_batch["token_exists_mask"] = representative_batch["token_exists_mask"]
+    output_batch["restype"] = representative_batch["restype"]
+    if "target_restype" in representative_batch:
+        output_batch["target_restype"] = representative_batch["target_restype"]
     return potts_decoder_aux, output_batch, sampling_inputs
 
 
