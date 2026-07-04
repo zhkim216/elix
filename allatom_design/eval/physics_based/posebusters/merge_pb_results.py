@@ -3,7 +3,7 @@
 Run after all SLURM array tasks have completed.
 
 Usage:
-    python -m allatom_design.eval.posebusters.merge_pb_results \
+    python -m allatom_design.eval.physics_based.posebusters.merge_pb_results \
         --results_dir /path/to/pb_output \
         --output /path/to/pb_output/pb_metrics_merged.csv
 """

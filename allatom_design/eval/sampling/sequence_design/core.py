@@ -30,6 +30,11 @@ from allatom_design.eval.sampling.sequence_design.runtime_plan import (
     SamplingRuntimePlan,
     build_sampling_runtime_plan,
 )
+from allatom_design.eval.metrics.sequence_recovery import (
+    SequenceRecoveryMetricConfig,
+    build_sequence_recovery_metric_config,
+    make_sequence_recovery_metric_config,
+)
 from allatom_design.model.seq_denoiser.sd_model import SeqDenoiser
 
 
@@ -48,11 +53,26 @@ class SequenceDesignRunSpec:
     log_dir: Path
     pos_constraint_df: pd.DataFrame | None
     protein_only: bool
-    pocket_distances_for_seq_recovery: list[float] | None
-    pocket_distance_bins: list[tuple[float, float]] | None
-    pocket_n_min_ligand_atoms_for_seq_recovery: int
     csv_suffix: str
     guidance_cfg: DictConfig | None
+    sequence_recovery_metric_config: SequenceRecoveryMetricConfig | None = None
+    pocket_distances_for_seq_recovery: list[float] | None = None
+    pocket_distance_bins: list[tuple[float, float]] | None = None
+    pocket_n_min_ligand_atoms_for_seq_recovery: int = 1
+
+    def __post_init__(self) -> None:
+        if self.sequence_recovery_metric_config is not None:
+            return
+        object.__setattr__(
+            self,
+            "sequence_recovery_metric_config",
+            make_sequence_recovery_metric_config(
+                input_sample_is_designed=self.input_sample_is_designed,
+                pocket_distances_for_seq_recovery=self.pocket_distances_for_seq_recovery,
+                pocket_distance_bins=self.pocket_distance_bins,
+                n_min_ligand_atoms=self.pocket_n_min_ligand_atoms_for_seq_recovery,
+            ),
+        )
 
     def validate(self) -> None:
         if self.sample_dict is None:
@@ -69,6 +89,11 @@ class SequenceDesignRunSpec:
             self.sample_dict[sample_id]["input_sample_path"]
             for sample_id in self.sample_dict.keys()
         ]
+
+    @property
+    def input_sample_ids(self) -> list[str]:
+        self.validate()
+        return list(self.sample_dict.keys())
 
 
 def build_sequence_design_run_spec_from_cfg(
@@ -103,11 +128,10 @@ def build_sequence_design_run_spec_from_cfg(
         log_dir=log_dir,
         pos_constraint_df=pos_constraint_df,
         protein_only=cfg.get("protein_only", False),
-        pocket_distances_for_seq_recovery=cfg.pocket_cfg.pocket_distances_for_seq_recovery,
-        pocket_distance_bins=pocket_distance_bins,
-        pocket_n_min_ligand_atoms_for_seq_recovery=cfg.pocket_cfg.get(
-            "n_min_ligand_atoms_for_seq_recovery",
-            1,
+        sequence_recovery_metric_config=build_sequence_recovery_metric_config(
+            pocket_cfg=cfg.pocket_cfg,
+            input_sample_is_designed=cfg.input_sample_is_designed,
+            pocket_distance_bins=pocket_distance_bins,
         ),
         csv_suffix=csv_suffix,
         guidance_cfg=guidance_cfg,
@@ -126,6 +150,7 @@ def design_sequence(
     sampling_inputs_df: pd.DataFrame = None,
     selectivity_residue_alignment_df: pd.DataFrame | None = None,
     pdb_paths: list[str] = None,
+    sample_ids: list[str] | None = None,
     pdb_cfg: DictConfig | None = None,
     device: str = None,
     out_dir: str = None,
@@ -133,7 +158,8 @@ def design_sequence(
     protein_only: bool = False,
     pocket_distances_for_seq_recovery: list[float] = None,
     pocket_distance_bins: list[tuple[float, float]] | None = None,
-    pocket_n_min_ligand_atoms_for_seq_recovery: int = 5,
+    pocket_n_min_ligand_atoms_for_seq_recovery: int = 1,
+    sequence_recovery_metric_config: SequenceRecoveryMetricConfig | None = None,
     csv_suffix: str = "",
     guidance_cfg: DictConfig | None = None,
     sampling_plan: SamplingRuntimePlan | None = None,
@@ -151,6 +177,13 @@ def design_sequence(
         protein_only: If True, condition only on protein atoms (exclude ligands from atom_cond_mask).
     """
     # Set up outputs.
+    if sequence_recovery_metric_config is None:
+        sequence_recovery_metric_config = make_sequence_recovery_metric_config(
+            input_sample_is_designed=input_sample_is_designed,
+            pocket_distances_for_seq_recovery=pocket_distances_for_seq_recovery,
+            pocket_distance_bins=pocket_distance_bins,
+            n_min_ligand_atoms=pocket_n_min_ligand_atoms_for_seq_recovery,
+        )
     outputs = {}
 
     # directory for output PDBs
@@ -162,6 +195,7 @@ def design_sequence(
     if sampling_plan is None:
         sampling_plan = build_sampling_runtime_plan(
             pdb_paths=pdb_paths,
+            sample_ids=sample_ids,
             sampling_cfg=sampling_cfg,
             sampling_inputs_df=sampling_inputs_df,
             selectivity_residue_alignment_df=selectivity_residue_alignment_df,
@@ -189,13 +223,15 @@ def design_sequence(
         total=n_sampling_targets,
         desc=f"Sampling {n_sampling_targets} PDBs, {sampling_cfg.num_seqs_per_pdb} sequences per PDB...",
     )
-    batch_iter = sampling_plan.iter_batches(batch_size=sampling_cfg.batch_size)
+    batch_iter = sampling_plan.iter_input_batches(batch_size=sampling_cfg.batch_size)
 
     with parallel_context_manager as parallel_pool:
-        for batch_pdb_paths in batch_iter:
+        for input_batch in batch_iter:
+            batch_pdb_paths = input_batch.pdb_paths
             B = sampling_plan.target_count(batch_pdb_paths)
 
             batch = get_sd_batch(pdb_paths = batch_pdb_paths,
+                                 sample_ids=input_batch.sample_ids,
                                  sample_is_designed = input_sample_is_designed,
                                  cif_parse_cfg = cif_parse_cfg,
                                  preprocess_cfg = preprocess_cfg,
@@ -244,9 +280,7 @@ def design_sequence(
                 sample_out_dir=sample_out_dir,
                 sample_out_dir_for_af3_tc=sample_out_dir_for_af3_tc,
                 cif_save_cfg=cif_save_cfg,
-                pocket_distances_for_seq_recovery=pocket_distances_for_seq_recovery,
-                pocket_distance_bins=pocket_distance_bins,
-                pocket_n_min_ligand_atoms_for_seq_recovery=pocket_n_min_ligand_atoms_for_seq_recovery,
+                sequence_recovery_metric_config=sequence_recovery_metric_config,
             )
             pbar.update(B)
     pbar.close()
@@ -277,7 +311,8 @@ def iter_design_sequence_per_checkpoint(
     protein_only: bool = False,
     pocket_distances_for_seq_recovery: list[float] | None = None,
     pocket_distance_bins: list[tuple[float, float]] | None = None,
-    pocket_n_min_ligand_atoms_for_seq_recovery: int = 5,
+    pocket_n_min_ligand_atoms_for_seq_recovery: int = 1,
+    sequence_recovery_metric_config: SequenceRecoveryMetricConfig | None = None,
     csv_suffix: str = "",
     guidance_cfg: DictConfig | None = None,
     runtime_plan_builder: Callable[..., SamplingRuntimePlan] | None = None,
@@ -296,9 +331,15 @@ def iter_design_sequence_per_checkpoint(
         log_dir=log_dir,
         pos_constraint_df=pos_constraint_df,
         protein_only=protein_only,
-        pocket_distances_for_seq_recovery=pocket_distances_for_seq_recovery,
-        pocket_distance_bins=pocket_distance_bins,
-        pocket_n_min_ligand_atoms_for_seq_recovery=pocket_n_min_ligand_atoms_for_seq_recovery,
+        sequence_recovery_metric_config=(
+            sequence_recovery_metric_config
+            or make_sequence_recovery_metric_config(
+                input_sample_is_designed=input_sample_is_designed,
+                pocket_distances_for_seq_recovery=pocket_distances_for_seq_recovery,
+                pocket_distance_bins=pocket_distance_bins,
+                n_min_ligand_atoms=pocket_n_min_ligand_atoms_for_seq_recovery,
+            )
+        ),
         csv_suffix=csv_suffix,
         guidance_cfg=guidance_cfg,
     )
@@ -318,6 +359,7 @@ def iter_design_sequence_for_run_spec(
     device = "cuda" if torch.cuda.is_available() else "cpu"
     ckpt_infos = get_checkpoints(run_spec.design_cfg)
     input_sample_paths = run_spec.input_sample_paths
+    input_sample_ids = run_spec.input_sample_ids
 
     for ckpt_info in tqdm(ckpt_infos, desc="Designing sequence"):
         sd_ckpt = ckpt_info["ckpt_path"]
@@ -348,15 +390,12 @@ def iter_design_sequence_for_run_spec(
             sampling_inputs_df=run_spec.sampling_inputs_df,
             selectivity_residue_alignment_df=run_spec.selectivity_residue_alignment_df,
             pdb_paths=input_sample_paths,
+            sample_ids=input_sample_ids,
             device=device,
             out_dir=str(log_dir_per_ckpt),
             pos_constraint_df=run_spec.pos_constraint_df,
             protein_only=run_spec.protein_only,
-            pocket_distances_for_seq_recovery=run_spec.pocket_distances_for_seq_recovery,
-            pocket_distance_bins=run_spec.pocket_distance_bins,
-            pocket_n_min_ligand_atoms_for_seq_recovery=(
-                run_spec.pocket_n_min_ligand_atoms_for_seq_recovery
-            ),
+            sequence_recovery_metric_config=run_spec.sequence_recovery_metric_config,
             csv_suffix=run_spec.csv_suffix,
             guidance_cfg=run_spec.guidance_cfg,
             sampling_plan=sampling_plan,

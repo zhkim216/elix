@@ -16,6 +16,7 @@ from allatom_design.eval.sampling.sequence_design.guidance import (
     guidance_mode,
 )
 from allatom_design.eval.sampling.sequence_design.runtime_plan import (
+    SamplingRuntimeInputBatch,
     SamplingRuntimePlan,
     normalize_pos_constraint_df,
 )
@@ -31,12 +32,16 @@ MODE_SELECTIVITY_PAIR = "selectivity_pair"
 class SelectivitySamplingRuntimePlan(SamplingRuntimePlan):
     """Runtime plan for paired selectivity sequence design."""
 
-    def iter_batches(self, *, batch_size: int) -> Iterator[list[str]]:
+    def iter_input_batches(self, *, batch_size: int) -> Iterator[SamplingRuntimeInputBatch]:
         del batch_size
-        yield from iter_selectivity_pair_batches(
+        for pdb_paths in iter_selectivity_pair_batches(
             pdb_paths=self.pdb_paths,
             sampling_inputs_df=self.sampling_inputs_df,
-        )
+        ):
+            yield SamplingRuntimeInputBatch(
+                pdb_paths=pdb_paths,
+                sample_ids=[Path(pdb_path).stem for pdb_path in pdb_paths],
+            )
 
 
 def build_selectivity_sampling_runtime_plan(

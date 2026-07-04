@@ -10,7 +10,11 @@ from allatom_design.eval.run_logging import wandb_setup
 from allatom_design.eval.run_logging import print_phase
 from allatom_design.eval.sampling.sequence_design.config import resolve_input_cfgs
 from allatom_design.eval.sampling.sequence_design.inputs import prepare_sample_dict
-from allatom_design.eval.table_io import load_optional_csv
+from allatom_design.eval.utils.table_io import load_optional_csv
+from allatom_design.eval.utils.sampling_inputs import (
+    merge_role_pos_constraints,
+    normalize_role_sampling_inputs_df,
+)
 from allatom_design.eval.sampling.sequence_design.evaluation import (
     evaluate_af3_for_checkpoint,
     pocket_distance_bins,
@@ -23,6 +27,7 @@ from allatom_design.eval.sampling.sequence_design.two_stage import (
     build_two_stage_design_context,
     design_sequence_two_stage,
 )
+from allatom_design.eval.metrics.sequence_recovery import build_sequence_recovery_metric_config
 
 
 def _two_stage_enabled(cfg: DictConfig) -> bool:
@@ -124,11 +129,10 @@ def _run_two_stage_elix(
         stage1_sampling_inputs_df=sampling_inputs_df,
         log_dir=log_dir,
         protein_only=cfg.get("protein_only", False),
-        pocket_distances_for_seq_recovery=cfg.pocket_cfg.pocket_distances_for_seq_recovery,
-        pocket_distance_bins=pocket_distance_bins(cfg),
-        pocket_n_min_ligand_atoms_for_seq_recovery=cfg.pocket_cfg.get(
-            "n_min_ligand_atoms_for_seq_recovery",
-            1,
+        sequence_recovery_metric_config=build_sequence_recovery_metric_config(
+            pocket_cfg=cfg.pocket_cfg,
+            input_sample_is_designed=cfg.input_sample_is_designed,
+            pocket_distance_bins=pocket_distance_bins(cfg),
         ),
         csv_suffix=csv_suffix,
         stage1_guidance_cfg=two_stage_context.stage1_guidance_cfg,
@@ -164,6 +168,23 @@ def _run_two_stage_elix(
         gc.collect()
 
 
+def load_sampling_runtime_tables(cfg: DictConfig) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    sampling_inputs_df = load_optional_csv(cfg.get("sampling_inputs_csv", None))
+    sampling_inputs_df = normalize_role_sampling_inputs_df(sampling_inputs_df)
+    pos_constraint_df = load_optional_csv(cfg.get("pos_constraint_csv", None))
+    pos_constraint_df = merge_role_pos_constraints(
+        pos_constraint_df=pos_constraint_df,
+        sampling_inputs_df=sampling_inputs_df,
+    )
+    if _two_stage_enabled(cfg) and pos_constraint_df is not None:
+        raise ValueError(
+            "two_stage mode creates stage2 positional constraints internally; "
+            "role-schema fixed_pos_* columns and pos_constraint_csv are not supported "
+            "for two-stage stage1 inputs"
+        )
+    return sampling_inputs_df, pos_constraint_df
+
+
 def run_elix(cfg: DictConfig) -> None:
     _reject_selectivity_guidance(cfg)
 
@@ -190,8 +211,7 @@ def run_elix(cfg: DictConfig) -> None:
         yaml.safe_dump(cfg_dict, f)
 
     # Load sampling inputs and position constraints.
-    sampling_inputs_df = load_optional_csv(cfg.get("sampling_inputs_csv", None))
-    pos_constraint_df = load_optional_csv(cfg.pos_constraint_csv)
+    sampling_inputs_df, pos_constraint_df = load_sampling_runtime_tables(cfg)
 
     # Prepare input path and ID dictionaries.
     print_phase("Phase 1: Preparing samples")

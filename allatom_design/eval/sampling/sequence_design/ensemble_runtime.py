@@ -20,6 +20,7 @@ from allatom_design.eval.sampling.sequence_design.ensemble.ligand_conformer impo
 from allatom_design.eval.sampling.sequence_design.ensemble.pharm_retrieval import (
     stage_pharm_retrieval_ensembles,
 )
+from allatom_design.eval.utils.sampling_inputs import is_role_sampling_inputs
 
 
 MODE_LIGAND_CONFORMER_ENSEMBLE = "ligand_conformer_ensemble"
@@ -45,6 +46,10 @@ def build_ensemble_runtime_staging(
     csv_suffix: str = "",
 ) -> EnsembleRuntimeStaging | None:
     if ligand_conformer_conditioning_enabled(sampling_inputs_for_setup):
+        _reject_role_sampling_inputs_for_staged_ensemble(
+            sampling_inputs_df,
+            mode="ligand_conformer",
+        )
         if guidance_is_enabled(guidance_cfg):
             raise NotImplementedError(
                 "ligand_conformer ensemble_conditioning is not supported "
@@ -67,6 +72,10 @@ def build_ensemble_runtime_staging(
         )
 
     if pharm_retrieval_conditioning_enabled(sampling_inputs_for_setup):
+        _reject_role_sampling_inputs_for_staged_ensemble(
+            sampling_inputs_df,
+            mode="pharm_retrieval",
+        )
         if guidance_is_enabled(guidance_cfg):
             raise NotImplementedError(
                 "pharm_retrieval ensemble_conditioning is not supported "
@@ -93,4 +102,18 @@ def _staging_message(label: str, ensemble_staging: EnsembleStagingResult) -> str
     return (
         f"Staged {label} ensemble members in "
         f"{ensemble_staging.root_dir}; manifest: {ensemble_staging.manifest_path}"
+    )
+
+
+def _reject_role_sampling_inputs_for_staged_ensemble(
+    sampling_inputs_df: pd.DataFrame | None,
+    *,
+    mode: str,
+) -> None:
+    if not is_role_sampling_inputs(sampling_inputs_df):
+        return
+    raise NotImplementedError(
+        "role-schema sampling_inputs_csv is not supported with "
+        f"small_molecule.mode={mode!r}. Use gaussian ensemble conditioning or "
+        "disable role-schema sampling for staged ligand/pharm workflows."
     )

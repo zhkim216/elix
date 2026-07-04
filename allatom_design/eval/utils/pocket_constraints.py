@@ -135,6 +135,15 @@ def create_pos_constraint_dict_from_pocket(
         function=np.any,
     )
     protein_mask = annotated_atom_array.chain_type == aw_enums.ChainType.POLYPEPTIDE_L
+    if receptor_pn_unit_iids:
+        if "pn_unit_iid" not in annotated_atom_array.get_annotation_categories():
+            raise ValueError("pn_unit_iid annotation is required for receptor-scoped constraints")
+        receptor_iid_set = {str(pn_unit_iid) for pn_unit_iid in receptor_pn_unit_iids}
+        receptor_mask = np.isin(
+            annotated_atom_array.get_annotation("pn_unit_iid").astype(str),
+            list(receptor_iid_set),
+        )
+        protein_mask = protein_mask & receptor_mask
 
     if constraint_type == "pocket":
         constrained_mask = protein_mask & residue_wise_pocket_mask

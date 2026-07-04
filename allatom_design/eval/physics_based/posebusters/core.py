@@ -1,11 +1,12 @@
 """PoseBusters evaluation for AF3 predicted ligand poses.
 
 Canonical PoseBusters library. Consumers:
-``allatom_design.eval.glide.pipeline`` (integrated Glide + PB pipeline) and
-``allatom_design.eval.posebusters.run_pb_eval`` (standalone PB CLI).
+``allatom_design.eval.physics_based.composer`` (integrated physics-based
+pipeline) and ``allatom_design.eval.physics_based.posebusters.run_pb_eval``
+(standalone PB CLI).
 
 Modular functions for:
-- Preparing PB inputs from CIF files (reuses glide/preprocessing.py)
+- Preparing PB inputs from CIF files (reuses physics_based/structure_prep.py)
 - Running PB validity checks (single or batch)
 - Computing pb_valid summary metric
 - Discovering AF3 prediction CIF files
@@ -25,16 +26,46 @@ Note:
 import logging
 import math
 import os
+import importlib
+import sys
 from functools import partial
 from multiprocessing import Pool
 from pathlib import Path
 
 import pandas as pd
-from posebusters import PoseBusters
 
-from allatom_design.eval.glide.preprocessing import preprocess_structure
+from allatom_design.eval.physics_based.structure_prep import preprocess_structure
 
 logger = logging.getLogger(__name__)
+
+
+def _load_posebusters_class():
+    """Import the external ``posebusters`` package without local package shadowing."""
+    local_physics_based_dir = Path(__file__).resolve().parents[1]
+    local_posebusters_dir = Path(__file__).resolve().parent
+    original_sys_path = list(sys.path)
+    shadowed_module = sys.modules.get("posebusters")
+    shadowed_file = getattr(shadowed_module, "__file__", None)
+    if shadowed_file is not None and Path(shadowed_file).resolve().is_relative_to(local_posebusters_dir):
+        sys.modules.pop("posebusters", None)
+
+    try:
+        sys.path = [
+            path
+            for path in original_sys_path
+            if Path(path or os.getcwd()).resolve() != local_physics_based_dir
+        ]
+        module = importlib.import_module("posebusters")
+    finally:
+        sys.path = original_sys_path
+
+    module_file = getattr(module, "__file__", None)
+    if module_file is not None and Path(module_file).resolve().is_relative_to(local_posebusters_dir):
+        raise ImportError("external 'posebusters' package is shadowed by eval/physics_based/posebusters")
+    return module.PoseBusters
+
+
+PoseBusters = _load_posebusters_class()
 
 # ---------------------------------------------------------------------------
 # Monkey-patch: fix rdkit pip-wheel segfault in PoseBusters flatness check.
@@ -184,7 +215,7 @@ PB_LOADING_COLUMNS = [
 
 
 # ---------------------------------------------------------------------------
-# 1. Input preparation (reuses glide/preprocessing.py)
+# 1. Input preparation (reuses physics_based/structure_prep.py)
 # ---------------------------------------------------------------------------
 
 def prepare_pb_inputs(
@@ -192,10 +223,11 @@ def prepare_pb_inputs(
     out_dir: str,
     sample_id: str | None = None,
     cif_parse_cfg: dict | None = None,
+    structure_prep_cfg: dict | None = None,
 ) -> dict[str, str]:
     """Convert an AF3 CIF to ligand SDF + receptor PDB for PoseBusters.
 
-    Reuses ``preprocess_structure()`` from glide/preprocessing.py so that
+    Reuses ``preprocess_structure()`` from physics_based/structure_prep.py so that
     the CIF -> PDB/SDF conversion is shared across Glide and PB pipelines.
 
     Returns:
@@ -206,6 +238,9 @@ def prepare_pb_inputs(
         out_dir=out_dir,
         sample_id=sample_id,
         cif_parse_cfg=cif_parse_cfg,
+        ligand_sdf_add_missing_atoms=(
+            structure_prep_cfg or {}
+        ).get("ligand_sdf_add_missing_atoms", True),
     )
     return {
         "mol_pred": result["ligand_sdf_path"],
@@ -302,6 +337,31 @@ def add_pb_valid(
     return bust_results
 
 
+def run_pb_and_summarize(
+    *,
+    mol_pred: str,
+    mol_cond: str,
+    prefix: str,
+    pb_cfg: dict | None = None,
+) -> dict:
+    """Run PoseBusters and return a single-row flat dict with prefixed columns."""
+    pb_cfg = pb_cfg or {}
+    result_df = run_pb_single(
+        mol_pred=mol_pred,
+        mol_cond=mol_cond,
+        config=pb_cfg.get("config", "dock"),
+        full_report=pb_cfg.get("full_report", False),
+    )
+    if result_df.empty:
+        return {f"{prefix}_error": "empty_result"}
+
+    result_df = add_pb_valid(result_df)
+    return {
+        f"{prefix}_{column}": result_df.iloc[0][column]
+        for column in result_df.columns
+    }
+
+
 # ---------------------------------------------------------------------------
 # 4. CIF discovery
 # ---------------------------------------------------------------------------
@@ -355,6 +415,7 @@ def _evaluate_single_entry(
     out_dir: str,
     config: str = "dock",
     cif_parse_cfg: dict | None = None,
+    structure_prep_cfg: dict | None = None,
     full_report: bool = False,
 ) -> dict:
     """Evaluate one CIF through the full PB pipeline.
@@ -372,6 +433,7 @@ def _evaluate_single_entry(
             out_dir=work_dir,
             sample_id=sample_id,
             cif_parse_cfg=cif_parse_cfg,
+            structure_prep_cfg=structure_prep_cfg,
         )
 
         result_df = run_pb_single(
@@ -440,6 +502,7 @@ def evaluate_batch(
     out_dir: str,
     config: str = "dock",
     cif_parse_cfg: dict | None = None,
+    structure_prep_cfg: dict | None = None,
     num_workers: int = 1,
     full_report: bool = False,
 ) -> pd.DataFrame:
@@ -450,6 +513,7 @@ def evaluate_batch(
         out_dir: Working directory for intermediate PDB/SDF files.
         config: ``"dock"`` or ``"redock"``.
         cif_parse_cfg: Passed to the CIF parser (plain dict, not DictConfig).
+        structure_prep_cfg: Shared receptor/ligand artifact preparation config.
         num_workers: Parallel workers.  1 = sequential.
         full_report: False (default) for boolean summary columns,
             True for detailed per-subtest metrics.
@@ -466,6 +530,7 @@ def evaluate_batch(
         out_dir=out_dir,
         config=config,
         cif_parse_cfg=cif_parse_cfg,
+        structure_prep_cfg=structure_prep_cfg,
         full_report=full_report,
     )
 

@@ -15,6 +15,7 @@ import argparse
 from collections import defaultdict
 from pathlib import Path
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -24,7 +25,10 @@ from tqdm import tqdm
 
 from atomworks.ml.transforms.atom_array import apply_and_spread_residue_wise
 
-from allatom_design.data.transform.custom_transforms import annotate_ligand_pockets
+from allatom_design.eval.utils.pocket_constraints import (
+    annotate_ligand_pocket,
+    resolve_pocket_annotation_method,
+)
 from allatom_design.utils.atom_array_utils import get_valid_standard_aa_residue_mask
 from allatom_design.utils.sample_io_utils import load_example_with_parse
 
@@ -52,15 +56,104 @@ DESIGNED_CIF_PARSE_CFG = {
 }
 
 
+@dataclass(frozen=True)
+class SequenceRecoveryMetricConfig:
+    enabled: bool = True
+    pocket_distances_for_seq_recovery: Sequence[float] | None = None
+    pocket_distance_bins: Sequence[tuple[float, float]] | None = None
+    n_min_ligand_atoms: int = 1
+    pocket_annotation_method: str = "all_atom"
+
+
+def resolve_sequence_recovery_pocket_annotation_method(
+    *,
+    pocket_cfg: dict | None = None,
+    input_sample_is_designed: bool = False,
+) -> str:
+    raw_method = None
+    if pocket_cfg is not None:
+        raw_method = pocket_cfg.get("seq_recovery_pocket_annotation_method", None)
+    if raw_method is None or str(raw_method).lower() == "auto":
+        return "calpha" if input_sample_is_designed else "all_atom"
+    return resolve_pocket_annotation_method(str(raw_method))
+
+
+def build_sequence_recovery_metric_config(
+    *,
+    pocket_cfg: dict | None,
+    input_sample_is_designed: bool,
+    pocket_distance_bins: Sequence[tuple[float, float]] | None = None,
+    enabled: bool = True,
+) -> SequenceRecoveryMetricConfig:
+    pocket_distances = None
+    n_min_ligand_atoms = 1
+    if pocket_cfg is not None:
+        pocket_distances = pocket_cfg.get("pocket_distances_for_seq_recovery", None)
+        n_min_ligand_atoms = pocket_cfg.get("n_min_ligand_atoms_for_seq_recovery", 1)
+    return SequenceRecoveryMetricConfig(
+        enabled=enabled,
+        pocket_distances_for_seq_recovery=pocket_distances,
+        pocket_distance_bins=pocket_distance_bins,
+        n_min_ligand_atoms=int(n_min_ligand_atoms),
+        pocket_annotation_method=resolve_sequence_recovery_pocket_annotation_method(
+            pocket_cfg=pocket_cfg,
+            input_sample_is_designed=input_sample_is_designed,
+        ),
+    )
+
+
+def make_sequence_recovery_metric_config(
+    *,
+    input_sample_is_designed: bool,
+    pocket_distances_for_seq_recovery: Sequence[float] | None = None,
+    pocket_distance_bins: Sequence[tuple[float, float]] | None = None,
+    n_min_ligand_atoms: int = 1,
+    pocket_annotation_method: str | None = None,
+    enabled: bool = True,
+) -> SequenceRecoveryMetricConfig:
+    if pocket_annotation_method is None:
+        pocket_annotation_method = "calpha" if input_sample_is_designed else "all_atom"
+    return SequenceRecoveryMetricConfig(
+        enabled=enabled,
+        pocket_distances_for_seq_recovery=pocket_distances_for_seq_recovery,
+        pocket_distance_bins=pocket_distance_bins,
+        n_min_ligand_atoms=n_min_ligand_atoms,
+        pocket_annotation_method=resolve_pocket_annotation_method(pocket_annotation_method),
+    )
+
+
+def _annotate_sequence_recovery_pocket(
+    atom_array: AtomArray,
+    *,
+    pocket_distance: float,
+    n_min_ligand_atoms: int,
+    annotation_name: str,
+    pocket_annotation_method: str,
+    receptor_pn_unit_iids: list[str] | None = None,
+    ligand_pn_unit_iids: list[str] | None = None,
+) -> AtomArray:
+    return annotate_ligand_pocket(
+        atom_array=atom_array,
+        pocket_distance=pocket_distance,
+        n_min_ligand_atoms=n_min_ligand_atoms,
+        annotation_name=annotation_name,
+        pocket_annotation_method=pocket_annotation_method,
+        receptor_pn_unit_iids=receptor_pn_unit_iids,
+        ligand_pn_unit_iids=ligand_pn_unit_iids,
+    )
+
+
 def calculate_sequence_recovery(input_atom_array: AtomArray, designed_atom_array: AtomArray,
                                 pocket_distances_for_seq_recovery: Sequence[float] | None = None,
                                 pocket_distance_bins: Sequence[tuple[float, float]] | None = None,
-                                n_min_ligand_atoms: int = 5) -> dict[str, float]:
+                                n_min_ligand_atoms: int = 1,
+                                pocket_annotation_method: str = "all_atom") -> dict[str, float]:
     """
     Calculate sequence recovery and pocket sequence recovery between input and designed atom arrays.
     """
     if pocket_distances_for_seq_recovery is None:
         pocket_distances_for_seq_recovery = (4.0, 5.0, 6.0)
+    pocket_annotation_method = resolve_pocket_annotation_method(pocket_annotation_method)
     seq_recovery_metrics = {}
 
     input_valid_residue_mask = get_valid_standard_aa_residue_mask(input_atom_array)
@@ -78,11 +171,12 @@ def calculate_sequence_recovery(input_atom_array: AtomArray, designed_atom_array
     edge_to_residue_mask: dict[float, np.ndarray] = {}
 
     for pocket_distance in pocket_distances_for_seq_recovery:
-        input_atom_array = annotate_ligand_pockets(
+        input_atom_array = _annotate_sequence_recovery_pocket(
             input_atom_array,
             pocket_distance=pocket_distance,
             n_min_ligand_atoms=n_min_ligand_atoms,
             annotation_name=f"is_ligand_pocket_{pocket_distance}",
+            pocket_annotation_method=pocket_annotation_method,
         )
         input_pocket_residue_mask = apply_and_spread_residue_wise(
             input_atom_array,
@@ -109,11 +203,12 @@ def calculate_sequence_recovery(input_atom_array: AtomArray, designed_atom_array
                     continue
                 if d not in edge_to_residue_mask:
                     ann = f"is_ligand_pocket_{d}"
-                    input_atom_array = annotate_ligand_pockets(
+                    input_atom_array = _annotate_sequence_recovery_pocket(
                         input_atom_array,
                         pocket_distance=d,
                         n_min_ligand_atoms=n_min_ligand_atoms,
                         annotation_name=ann,
+                        pocket_annotation_method=pocket_annotation_method,
                     )
                     edge_to_residue_mask[d] = apply_and_spread_residue_wise(
                         input_atom_array,
@@ -173,9 +268,12 @@ def _compute_recovery(native_aa, designed_aa, pocket_distances):
     ligand_pn_unit_iids = list(np.unique(designed_aa[~designed_aa.is_polymer].pn_unit_iid))
 
     for pocket_distance in pocket_distances:
-        native_aa = annotate_ligand_pockets(
-            native_aa, pocket_distance=pocket_distance,
+        native_aa = _annotate_sequence_recovery_pocket(
+            native_aa,
+            pocket_distance=pocket_distance,
             annotation_name=f"is_ligand_pocket_{pocket_distance}",
+            n_min_ligand_atoms=5,
+            pocket_annotation_method="all_atom",
             receptor_pn_unit_iids=receptor_pn_unit_iids,
             ligand_pn_unit_iids=ligand_pn_unit_iids,
         )

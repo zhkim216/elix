@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterator
 
 import numpy as np
@@ -25,7 +26,10 @@ from allatom_design.eval.sampling.sequence_design.guidance import (
 from allatom_design.eval.sampling.sequence_design.ensemble.staging import (
     EnsembleStagingResult,
 )
-from allatom_design.eval.sampling.sequence_design.masks import initialize_sampling_masks
+from allatom_design.eval.sampling.sequence_design.masks import (
+    apply_role_context_conditioning_masks,
+    initialize_sampling_masks,
+)
 
 
 MODE_DEFAULT = "default"
@@ -40,21 +44,52 @@ class SamplingRuntimeBatch:
 
 
 @dataclass(frozen=True)
+class SamplingRuntimeInputBatch:
+    pdb_paths: list[str]
+    sample_ids: list[str]
+
+
+@dataclass(frozen=True)
 class SamplingRuntimePlan:
     mode: str
     pdb_paths: list[str]
     sampling_inputs_df: pd.DataFrame | None
     pos_constraint_df: pd.DataFrame | None
+    sample_ids: list[str] | None = None
     guidance_cfg: DictConfig | dict | None = None
     selectivity_residue_alignment_df: pd.DataFrame | None = None
     ensemble_staging: EnsembleStagingResult | None = None
     staging_message: str | None = None
 
+    def __post_init__(self) -> None:
+        sample_ids = self.sample_ids
+        if sample_ids is None:
+            sample_ids = [Path(pdb_path).stem for pdb_path in self.pdb_paths]
+            object.__setattr__(self, "sample_ids", sample_ids)
+        if len(sample_ids) != len(self.pdb_paths):
+            raise ValueError(
+                f"sample_ids length ({len(sample_ids)}) must match pdb_paths length "
+                f"({len(self.pdb_paths)})"
+            )
+
     def iter_batches(self, *, batch_size: int) -> Iterator[list[str]]:
+        for input_batch in self.iter_input_batches(batch_size=batch_size):
+            yield input_batch.pdb_paths
+
+    def iter_input_batches(self, *, batch_size: int) -> Iterator[SamplingRuntimeInputBatch]:
         if self.ensemble_staging is not None:
-            yield from self.ensemble_staging.iter_member_batches(max_members=int(batch_size))
+            for pdb_paths in self.ensemble_staging.iter_member_batches(max_members=int(batch_size)):
+                yield SamplingRuntimeInputBatch(
+                    pdb_paths=pdb_paths,
+                    sample_ids=[Path(pdb_path).stem for pdb_path in pdb_paths],
+                )
         else:
-            yield from _iter_default_sampling_batches(self.pdb_paths, batch_size)
+            for start in range(0, len(self.pdb_paths), batch_size):
+                end = start + batch_size
+                yield SamplingRuntimeInputBatch(
+                    pdb_paths=self.pdb_paths[start:end],
+                    sample_ids=self.sample_ids[start:end],
+                )
 
     def target_count(self, batch_pdb_paths: list[str] | None = None) -> int:
         if self.ensemble_staging is not None:
@@ -93,6 +128,11 @@ class SamplingRuntimePlan:
             device=device,
         )
         batch = initialize_sampling_masks(batch, protein_only=protein_only)
+        batch = apply_role_context_conditioning_masks(
+            batch,
+            self.sampling_inputs_df,
+            verbose=sampling_cfg.verbose,
+        )
         batch = parse_fixed_pos_info(
             batch,
             self.pos_constraint_df,
@@ -130,6 +170,7 @@ class SamplingRuntimePlan:
 def build_sampling_runtime_plan(
     *,
     pdb_paths: list[str],
+    sample_ids: list[str] | None = None,
     sampling_cfg: DictConfig,
     sampling_inputs_df: pd.DataFrame | None,
     selectivity_residue_alignment_df: pd.DataFrame | None,
@@ -175,6 +216,7 @@ def build_sampling_runtime_plan(
     return SamplingRuntimePlan(
         mode=MODE_DEFAULT,
         pdb_paths=pdb_paths,
+        sample_ids=sample_ids,
         sampling_inputs_df=sampling_inputs_df,
         pos_constraint_df=normalize_pos_constraint_df(pos_constraint_df),
         guidance_cfg=guidance_cfg,
@@ -192,6 +234,7 @@ def _plan_from_ensemble_staging(
     return SamplingRuntimePlan(
         mode=mode,
         pdb_paths=ensemble_staging.pdb_paths,
+        sample_ids=None,
         sampling_inputs_df=ensemble_staging.sampling_inputs_df,
         pos_constraint_df=normalize_pos_constraint_df(
             ensemble_staging.expand_pos_constraints(pos_constraint_df)
