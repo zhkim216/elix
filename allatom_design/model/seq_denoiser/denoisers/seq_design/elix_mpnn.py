@@ -198,6 +198,7 @@ class ElixMPNN(nn.Module):
                     num_chi=int(self.sidechain_prediction_cfg.get("num_chi", 4)),
                     num_bins=int(self.sidechain_prediction_cfg.get("num_bins", 72)),
                     dropout_p=float(self.sidechain_prediction_cfg.get("dropout_p", cfg.dropout_p)),
+                    use_node_norm=bool(self.sidechain_prediction_cfg.get("use_node_norm", True)),
                 )
             else:
                 self.chi_angle_prediction_head = None

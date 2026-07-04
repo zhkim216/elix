@@ -115,6 +115,16 @@ class LitSeqDenoiser(L.LightningModule):
         """Return the SDLoss violation accumulator, regardless of compile wrapping."""
         return self.loss._nonstd_aa_violation_count
 
+    @staticmethod
+    def _validation_metric_phase(metric_name: str) -> str:
+        if metric_name.startswith(("seq_", "ligand_pocket_seq_")):
+            return "val_seq"
+        if metric_name.startswith("sidechain_"):
+            return "val_sidechain"
+        if metric_name.startswith(("potts_", "ligand_pocket_potts_")):
+            return "val_potts"
+        return "val"
+
 
     def validation_step(self, batch: dict[str, TensorType["b ..."]], batch_idx: int, dataloader_idx: int = 0):
         # Lightning automatically disables grads + sets model to eval mode
@@ -177,7 +187,8 @@ class LitSeqDenoiser(L.LightningModule):
 
         log_dict = {}
         for k, v in aux.items():
-            log_dict[f"{phase}{phase_suffix}/{k}{key_suffix}"] = v
+            metric_phase = self._validation_metric_phase(k) if phase == "val" else phase
+            log_dict[f"{metric_phase}{phase_suffix}/{k}{key_suffix}"] = v
 
         self.log_dict(
             log_dict,

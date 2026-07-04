@@ -25,7 +25,7 @@ class SDInterpolant(nn.Module, ABC):
         - t: the sampled timestep [b]
         - x_noised: the noised coordinates (xt) [b n a 3]
         - aatype_noised: the noised aatype [b n]
-        - mlm_mask: 1 if the residue is kept, 0 if it is masked [b n]
+        - seq_keep_mask: 1 if the residue is kept, 0 if it is masked [b n]
         """
         pass
 
@@ -50,6 +50,6 @@ class SDInterpolant(nn.Module, ABC):
                                  TensorType["b n", int],
                                  TensorType["b n", int]]:
         """
-        Add noise to x and aatype. Return x_noised, aatype_noised, and mlm_mask.
+        Add noise to x and aatype. Return x_noised, aatype_noised, and seq_keep_mask.
         """
         pass

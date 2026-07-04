@@ -9,7 +9,7 @@
 # with EXP_NAME_BASE manually.
 #SBATCH --job-name=elix_exp12
 #SBATCH -p possu
-#SBATCH --array=0-7
+#SBATCH --array=0-8
 #SBATCH --gres=gpu:2
 #SBATCH --mem=96G
 #SBATCH --cpus-per-task=16
@@ -60,9 +60,10 @@ CONFIGS=(
   "token768|"
   "token768_potts_encoding|denoiser.mpnn.use_potts_encoding=true"
   "token768_potts_encoding_exclude_maybe_coval_dropout02|denoiser.mpnn.use_potts_encoding=true denoiser.mpnn.dropout_p=0.2"
-  "token768_potts_encoding_exclude_maybe_coval_codesign1|denoiser.mpnn.use_potts_encoding=true denoiser.mpnn.sidechain_prediction.enabled=true denoiser.mpnn.sidechain_prediction.num_chi=4 denoiser.mpnn.sidechain_prediction.num_bins=72 loss.loss_weights.sidechain_chi_loss=1.0 loss.loss_weights.sidechain_chi_offset_loss=0.5"
-  "token768_potts_encoding_exclude_maybe_coval_codesign1|denoiser.mpnn.use_potts_encoding=true denoiser.mpnn.sidechain_prediction.enabled=true denoiser.mpnn.sidechain_prediction.num_chi=4 denoiser.mpnn.sidechain_prediction.num_bins=72 loss.loss_weights.sidechain_chi_loss=0.5 loss.loss_weights.sidechain_chi_offset_loss=0.25"
-  "token768_potts_encoding_exclude_maybe_coval_codesign1|denoiser.mpnn.use_potts_encoding=true denoiser.mpnn.sidechain_prediction.enabled=true denoiser.mpnn.sidechain_prediction.num_chi=4 denoiser.mpnn.sidechain_prediction.num_bins=72 loss.loss_weights.sidechain_chi_loss=0.25 loss.loss_weights.sidechain_chi_offset_loss=0.125"
+  "token768_potts_encoding_exclude_maybe_coval_codesign_chi025_offset0125_node_norm_on|denoiser.mpnn.use_potts_encoding=true denoiser.mpnn.sidechain_prediction.enabled=true denoiser.mpnn.sidechain_prediction.num_chi=4 denoiser.mpnn.sidechain_prediction.num_bins=72 denoiser.mpnn.sidechain_prediction.use_node_norm=true loss.loss_weights.sidechain_chi_loss=0.25 loss.loss_weights.sidechain_chi_offset_loss=0.125"
+  "token768_potts_encoding_exclude_maybe_coval_codesign_chi025_offset0125_node_norm_off|denoiser.mpnn.use_potts_encoding=true denoiser.mpnn.sidechain_prediction.enabled=true denoiser.mpnn.sidechain_prediction.num_chi=4 denoiser.mpnn.sidechain_prediction.num_bins=72 denoiser.mpnn.sidechain_prediction.use_node_norm=false loss.loss_weights.sidechain_chi_loss=0.25 loss.loss_weights.sidechain_chi_offset_loss=0.125"
+  "token768_potts_encoding_exclude_maybe_coval_codesign_chi0125_offset00625_node_norm_on|denoiser.mpnn.use_potts_encoding=true denoiser.mpnn.sidechain_prediction.enabled=true denoiser.mpnn.sidechain_prediction.num_chi=4 denoiser.mpnn.sidechain_prediction.num_bins=72 denoiser.mpnn.sidechain_prediction.use_node_norm=true loss.loss_weights.sidechain_chi_loss=0.125 loss.loss_weights.sidechain_chi_offset_loss=0.0625"
+  "token768_potts_encoding_exclude_maybe_coval_codesign_chi0125_offset00625_node_norm_off|denoiser.mpnn.use_potts_encoding=true denoiser.mpnn.sidechain_prediction.enabled=true denoiser.mpnn.sidechain_prediction.num_chi=4 denoiser.mpnn.sidechain_prediction.num_bins=72 denoiser.mpnn.sidechain_prediction.use_node_norm=false loss.loss_weights.sidechain_chi_loss=0.125 loss.loss_weights.sidechain_chi_offset_loss=0.0625"
 )
 
 IDX=$((ARRAY_TASK_ID))
