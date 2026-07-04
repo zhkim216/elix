@@ -79,6 +79,31 @@ if [[ -z "${CONFIG_NAME}" ]]; then
 fi
 EXP_NAME="${EXP_NAME_BASE}_cfg${IDX}_${CONFIG_NAME}"
 
+# Auto-resume: if a checkpoint already exists for this cfg's run, resume from
+# the one with the highest step. Otherwise start fresh (ckpt_path=null).
+# Checkpoints live at ${OUT_DIR}/${PROJECT}/${EXP_NAME}/checkpoints/sd-step*.ckpt
+CKPT_DIR="${OUT_DIR}/${PROJECT}/${EXP_NAME}/checkpoints"
+RESUME_CKPT="null"
+if [[ -d "${CKPT_DIR}" ]]; then
+  LATEST_CKPT=""
+  MAX_STEP=-1
+  for ckpt in "${CKPT_DIR}"/sd-step*.ckpt; do
+    [[ -e "${ckpt}" ]] || continue
+    step="$(basename "${ckpt}")"
+    step="${step#sd-step}"
+    step="${step%%-*}"
+    [[ "${step}" =~ ^[0-9]+$ ]] || continue
+    if (( step > MAX_STEP )); then
+      MAX_STEP="${step}"
+      LATEST_CKPT="${ckpt}"
+    fi
+  done
+  if [[ -n "${LATEST_CKPT}" ]]; then
+    RESUME_CKPT="${LATEST_CKPT}"
+  fi
+fi
+echo "  resume_ckpt_path: ${RESUME_CKPT}"
+
 INTERFACE_TYPE_FILTER="n_prot == 1"
 INTERFACE_FILTER_OVERRIDE=("data.train_filters.interface_filter.2=[\"${INTERFACE_TYPE_FILTER}\"]")
 
@@ -113,6 +138,13 @@ echo "  out_dir: ${OUT_DIR}"
 echo "  hydra_dir: ${HYDRA_DIR}/${EXP_NAME}"
 echo "  torchinductor_cache: ${TORCHINDUCTOR_CACHE_DIR}"
 
+SLURM_JOB_ID_FOR_DDP="${SLURM_JOB_ID:-0}"
+export MASTER_ADDR=127.0.0.1
+export MASTER_PORT=$((20000 + (SLURM_JOB_ID_FOR_DDP % 40000) + ARRAY_TASK_ID))
+export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+echo "[DDP] MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT} (job=${SLURM_JOB_ID:-manual} task=${ARRAY_TASK_ID})"
+echo "[GPU] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset} SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-unset} SLURM_GPUS_ON_NODE=${SLURM_GPUS_ON_NODE:-unset}"
+
 DEBUG= HYDRA_FULL_ERROR=1 WANDB__SERVICE_WAIT=300 \
 python3 allatom_design/train_seq_denoiser.py \
     --config-path configs/seq_denoiser \
@@ -131,7 +163,7 @@ python3 allatom_design/train_seq_denoiser.py \
     trainer.strategy="ddp_find_unused_parameters_true" \
     denoiser.name="${DENOISER_TYPE}" \
     resume.use_current_cfg=true \
-    resume.ckpt_path=null \
+    resume.ckpt_path="${RESUME_CKPT}" \
     loss.loss_weights.seq_loss=1.0 \
     loss.main_seq_loss_pocket_only=false \
     loss.main_potts_loss_pocket_only=false \
