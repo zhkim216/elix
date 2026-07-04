@@ -64,5 +64,6 @@ mpnn:
     num_chi: 4
     num_bins: 72
     dropout_p: ${denoiser.mpnn.dropout_p}
+    use_node_norm: true
 
   expansion_mode: "node_concat" # null, node_concat, node_concat_context_skip, multi_head_factor, node_concat_multi_head

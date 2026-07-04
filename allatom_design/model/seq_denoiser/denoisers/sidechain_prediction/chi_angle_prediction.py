@@ -23,12 +23,13 @@ class ChiAnglePredictionHead(nn.Module):
         num_chi: int = 4,
         num_bins: int = 72,
         dropout_p: float = 0.0,
+        use_node_norm: bool = True,
         ):
         super().__init__()
         self.num_chi = num_chi
         self.num_bins = num_bins
 
-        self.node_norm = nn.LayerNorm(input_dim)
+        self.node_norm = nn.LayerNorm(input_dim) if use_node_norm else nn.Identity()
         self.chi_prediction_layers = nn.ModuleList(
             [
                 nn.Sequential(
