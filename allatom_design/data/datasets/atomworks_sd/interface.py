@@ -26,6 +26,7 @@ from allatom_design.data.datasets.atomworks_sd.bml_context import (
     BML_CENTER_METAL_COL,
     BML_CENTER_SMALL_MOLECULE_COL,
     build_pn_unit_index_lookup,
+    context_expansion_source_rows,
     ensure_bml_context_annotations,
     expand_bml_context_query_iids,
 )
@@ -182,7 +183,7 @@ def _build_protein_metal_interface_rows(
         protein_clusters = tuple(row.q_pn_unit_cluster_id for row in protein_rows)
         crop_center_iids = [center.q_pn_unit_iid, *protein_iids]
         query_iids = expand_bml_context_query_iids(
-            source_rows=[center],
+            source_rows=context_expansion_source_rows(policy, [center], protein_rows),
             crop_center_pn_unit_iids=crop_center_iids,
             metadata_df=metadata_df,
             lookup=context_lookup,
@@ -243,7 +244,7 @@ def _build_small_molecule_interface_rows(
         protein_clusters = tuple(row.q_pn_unit_cluster_id for row in protein_rows)
         crop_center_iids = [center.q_pn_unit_iid, *protein_iids]
         query_iids = expand_bml_context_query_iids(
-            source_rows=[center],
+            source_rows=context_expansion_source_rows(policy, [center], protein_rows),
             crop_center_pn_unit_iids=crop_center_iids,
             metadata_df=metadata_df,
             lookup=context_lookup,
@@ -308,7 +309,7 @@ def _build_peptide_interface_rows(
         protein_clusters = tuple(row.q_pn_unit_cluster_id for row in protein_rows)
         crop_center_iids = [center.q_pn_unit_iid, *protein_iids]
         query_iids = expand_bml_context_query_iids(
-            source_rows=[center],
+            source_rows=context_expansion_source_rows(policy, [center], protein_rows),
             crop_center_pn_unit_iids=crop_center_iids,
             metadata_df=metadata_df,
             lookup=context_lookup,
@@ -379,7 +380,7 @@ def _build_nucleic_acid_ligand_interface_rows(
         protein_clusters = tuple(row.q_pn_unit_cluster_id for row in protein_rows)
         crop_center_iids = [*ligand_iids, *protein_iids]
         query_iids = expand_bml_context_query_iids(
-            source_rows=group_rows,
+            source_rows=context_expansion_source_rows(policy, group_rows, protein_rows),
             crop_center_pn_unit_iids=crop_center_iids,
             metadata_df=metadata_df,
             lookup=context_lookup,
