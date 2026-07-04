@@ -40,6 +40,11 @@ bml_center:
 
 bml_context:
   enabled: true
+  # Context-selection scheme. Options:
+  #   iterative_context_refinement — Gauss-Seidel fixed point over mutual contacts (default).
+  #   protein_proximity_context    — single-pass occ/missing quality gate; 5A proximity to the
+  #                                  interface protein(s)+center(s) enforced by query expansion.
+  scheme: iterative_context_refinement
   contact_distance_cutoff: 5.0
   max_iterations: 10
   small_molecule:

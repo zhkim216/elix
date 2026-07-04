@@ -36,6 +36,21 @@ from allatom_design.data.utils.pn_unit import (
 logger = logging.getLogger(__name__)
 
 
+# Context-selection schemes (config key ``bml_context.scheme``).
+# * ``iterative_context_refinement`` — Gauss-Seidel fixed point over mutual
+#   metal/small-molecule/halide contacts (the legacy default).
+# * ``protein_proximity_context`` — single-pass quality gate (occupancy /
+#   completeness) unioned with the BML centers; 5A proximity to the interface
+#   protein(s) and center(s) is enforced later by the per-interface query
+#   expansion, so no contact-count thresholds apply here.
+SCHEME_ITERATIVE_CONTEXT_REFINEMENT = "iterative_context_refinement"
+SCHEME_PROTEIN_PROXIMITY_CONTEXT = "protein_proximity_context"
+VALID_CONTEXT_SCHEMES = (
+    SCHEME_ITERATIVE_CONTEXT_REFINEMENT,
+    SCHEME_PROTEIN_PROXIMITY_CONTEXT,
+)
+
+
 BML_CENTER_SMALL_MOLECULE_COL = "q_pn_unit_is_biologically_meaningful_small_molecule"
 BML_CENTER_METAL_COL = "q_pn_unit_is_biologically_meaningful_metal"
 
@@ -259,6 +274,7 @@ class BMLCenterPolicy:
 @dataclass(frozen=True)
 class BMLContextPolicy:
     enabled: bool
+    scheme: str
     contact_distance_cutoff: float
     max_iterations: int
     small_molecule: SmallMoleculeContextPolicy
@@ -270,8 +286,15 @@ class BMLContextPolicy:
     @classmethod
     def from_cfg(cls, cfg: dict | DictConfig | None) -> "BMLContextPolicy":
         cfg = cfg or {}
+        scheme = str(cfg.get("scheme", SCHEME_ITERATIVE_CONTEXT_REFINEMENT))
+        if scheme not in VALID_CONTEXT_SCHEMES:
+            raise ValueError(
+                f"Unknown `bml_context.scheme`: {scheme!r}. "
+                f"Expected one of {VALID_CONTEXT_SCHEMES}."
+            )
         return cls(
             enabled=bool(cfg.get("enabled", False)),
+            scheme=scheme,
             contact_distance_cutoff=float(cfg.get("contact_distance_cutoff", 5.0)),
             max_iterations=int(cfg.get("max_iterations", 10)),
             small_molecule=SmallMoleculeContextPolicy.from_cfg(cfg.get("small_molecule", {})),
@@ -391,26 +414,30 @@ def annotate_bml_context(
     if not policy.context.enabled:
         return out
 
-    small_molecule_edges = _build_contact_edges(
-        out,
-        "q_pn_unit_per_partner_contacts_small_molecule",
-        pn_unit_kind,
-        lookup,
-    )
-    halide_edges = _build_contact_edges(
-        out,
-        "q_pn_unit_per_partner_contacts_halide",
-        pn_unit_kind,
-        lookup,
-    )
-
-    context_masks = _solve_context_fixed_point(
-        out,
-        small_molecule_edges=small_molecule_edges,
-        metal_edges=metal_edges,
-        halide_edges=halide_edges,
-        policy=policy,
-    )
+    if policy.context.scheme == SCHEME_PROTEIN_PROXIMITY_CONTEXT:
+        # Single-pass quality gate; contact edges are only needed by the
+        # fixed-point scheme, so skip building the small-molecule/halide edges.
+        context_masks = _context_masks_quality_filter(out, policy=policy)
+    else:
+        small_molecule_edges = _build_contact_edges(
+            out,
+            "q_pn_unit_per_partner_contacts_small_molecule",
+            pn_unit_kind,
+            lookup,
+        )
+        halide_edges = _build_contact_edges(
+            out,
+            "q_pn_unit_per_partner_contacts_halide",
+            pn_unit_kind,
+            lookup,
+        )
+        context_masks = _solve_context_fixed_point(
+            out,
+            small_molecule_edges=small_molecule_edges,
+            metal_edges=metal_edges,
+            halide_edges=halide_edges,
+            policy=policy,
+        )
     for col, mask in context_masks.items():
         out[col] = mask.astype(bool)
     return out
@@ -476,6 +503,102 @@ def expand_bml_context_query_iids(
                     stats.skipped_ineligible_partners += 1
 
     return [*ordered_centers, *sorted(extra_iids, key=natural_key)]
+
+
+def context_expansion_source_rows(policy: BMLPolicy, centers, protein_rows) -> list:
+    """Source rows whose 5A contacts seed the per-interface context expansion.
+
+    The ``protein_proximity_context`` scheme expands around both the interface
+    center(s) and the contacting protein(s); the fixed-point scheme expands
+    around the center(s) only (legacy behavior).
+    """
+    if policy.context.scheme == SCHEME_PROTEIN_PROXIMITY_CONTEXT:
+        return [*centers, *protein_rows]
+    return list(centers)
+
+
+def _context_masks_quality_filter(
+    metadata_df: pd.DataFrame,
+    *,
+    policy: BMLPolicy,
+) -> dict[str, pd.Series]:
+    """Context eligibility for the ``protein_proximity_context`` scheme.
+
+    Single-pass quality gate unioned with the BML centers, reusing the center
+    occupancy/completeness thresholds. Metal and halide ions are single atoms,
+    so only occupancy gates them. No contact-count threshold is applied: 5A
+    proximity is enforced downstream by the per-interface query expansion.
+    """
+    index = metadata_df.index
+    occupancy = pd.to_numeric(
+        metadata_df["q_pn_unit_avg_occupancy_nonpolymer"],
+        errors="coerce",
+    )
+
+    def _occupancy_pass(threshold: float | None) -> pd.Series:
+        if threshold is None:
+            return pd.Series(True, index=index)
+        return occupancy.fillna(-np.inf) >= threshold
+
+    # Small molecule: occupancy + heavy-atom completeness, unioned with centers.
+    expected = pd.to_numeric(
+        metadata_df["q_pn_unit_expected_heavy_atoms_non_polymer"],
+        errors="coerce",
+    )
+    resolved = pd.to_numeric(
+        metadata_df["q_pn_unit_num_resolved_atoms"],
+        errors="coerce",
+    )
+    denom = expected.where(expected > 0, np.nan)
+    missing_fraction = 1.0 - (resolved / denom)
+    sm_policy = policy.center.small_molecule
+    ctx_small_molecule = _bool_col(metadata_df, "q_pn_unit_is_small_molecule") & _occupancy_pass(
+        sm_policy.min_avg_occupancy_nonpolymer
+    )
+    if sm_policy.max_missing_atom_fraction is not None:
+        ctx_small_molecule = ctx_small_molecule & (
+            missing_fraction.fillna(np.inf) <= sm_policy.max_missing_atom_fraction
+        )
+    ctx_small_molecule = ctx_small_molecule | _bool_col(metadata_df, BML_CENTER_SMALL_MOLECULE_COL)
+
+    # Metal ion: occupancy only (single atom), unioned with metal centers.
+    ctx_metal = (
+        _bool_col(metadata_df, "q_pn_unit_is_metal")
+        & _occupancy_pass(policy.center.metal.min_avg_occupancy_nonpolymer)
+    ) | _bool_col(metadata_df, BML_CENTER_METAL_COL)
+
+    # Halide ion: allowed CCD + occupancy only (single atom); never a center.
+    allowed_halide = series_has_any_exact_ccd(
+        metadata_df["q_pn_unit_non_polymer_res_names"],
+        policy.context.halide.allowed_ccd_codes,
+        index=index,
+    )
+    ctx_halide = (
+        _bool_col(metadata_df, "q_pn_unit_is_halide")
+        & allowed_halide
+        & _occupancy_pass(policy.context.halide.min_avg_occupancy_nonpolymer)
+    )
+
+    # Peptide / nucleic-acid chains: any within proximity (no quality metric),
+    # gated only by the config enable switch — matches the fixed-point scheme.
+    ctx_peptide = (
+        _bool_col(metadata_df, "q_pn_unit_is_peptide")
+        if policy.context.peptide.enabled
+        else pd.Series(False, index=index)
+    )
+    ctx_nuc = (
+        _bool_col(metadata_df, "q_pn_unit_is_nuc")
+        if policy.context.nucleic_acid.enabled
+        else pd.Series(False, index=index)
+    )
+
+    return {
+        CONTEXT_SMALL_MOLECULE_COL: ctx_small_molecule.fillna(False).astype(bool),
+        CONTEXT_METAL_COL: ctx_metal.fillna(False).astype(bool),
+        CONTEXT_HALIDE_COL: ctx_halide.fillna(False).astype(bool),
+        CONTEXT_PEPTIDE_COL: ctx_peptide.fillna(False).astype(bool),
+        CONTEXT_NUCLEIC_ACID_CHAINS_COL: ctx_nuc.fillna(False).astype(bool),
+    }
 
 
 def _solve_context_fixed_point(

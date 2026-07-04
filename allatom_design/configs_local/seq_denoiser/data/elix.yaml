@@ -1,10 +1,10 @@
 task: ${model.task}
 dataset_impl: atomworks_sd
 pdb_path: /home/yjhk/model-dev/datasets/atomworks_pdb_full_v9
-train_metadata_path: /home/yjhk/model-dev/datasets/atomworks_pdb_full_v9/debug_metadata_ligval_seq_clustered_external_evidence_ver5.parquet
+train_metadata_path: /home/yjhk/model-dev/datasets/atomworks_pdb_full_v9/debug_metadata_seq_clustered_03_finalized.parquet
 
 validation_ids_file: null
-val_metadata_path: /home/yjhk/model-dev/datasets/val_cifs/nativeval_cifs/metadata_for_training_nativeval_sm_metal.parquet
+val_metadata_path: /home/yjhk/model-dev/datasets/evaluation_datasets/nativeval/metadata_for_training_nativeval.parquet
 
 debug: ${train.debug}
 debug_num_ids: 10000
@@ -15,35 +15,52 @@ exclude_val_cluster: true
 # --- protein-cluster column selection ---
 # Cluster column used for cluster-balanced sampling weights and protein_cluster_multiset.
 # Choose among: q_pn_unit_cluster_{03,04,05,06,07}_id, q_pn_unit_cluster_foldseek_id.
-cluster_id_col: q_pn_unit_cluster_04_id
+cluster_id_col: q_pn_unit_cluster_03_id
 # Cluster column used to remove train/val overlap (sequence-identity leakage). Fixed to seq cluster 0.3.
 val_exclusion_cluster_id_col: q_pn_unit_cluster_03_id
 
 query_pn_unit_iids_only: true
 
-# --- nonpolymer / metal evidence & quality filters ---
-allowed_evidence_columns:
-  - metal_medba_evidence
-  - metal_pubmed_evidence
-  - q_pn_unit_has_bird_prd_identifier
-metal_external_evidence_policy: external_evidence
-allowed_ccd_codes: null
-min_protein_donor_atoms: 3
-min_avg_occupancy_nonpolymer: 0.5
+bml_center:
+  metal:
+    external_evidence_policy: ["pubmed", "medba"]
+    allowed_ccd_codes: null
+    # Shared by BML metal centers, BML metal context, and metal-protein interface rows.
+    donor_elements: ["N", "O", "S", "Se", "F", "Cl", "Br", "I"]
+    max_donor_distance_angstrom: 3.0
+    min_protein_donor_atoms: 3
+    min_avg_occupancy_nonpolymer: 0.5
+  small_molecule:
+    external_evidence_policy: ["klifs", "prd"]
+    min_contacting_protein_atoms: 20
+    min_contacting_protein_atom_ratio: 1.0
+    min_avg_occupancy_nonpolymer: 0.5
+    max_missing_atom_fraction: 0.2
+    exclude_maybe_covalently_linked_small_molecules: true
 
-# --- small-molecule-specific filters ---
-small_molecule_artifact_list_path: /home/yjhk/model-dev/datasets/artifact_lists/artifact_sources_by_ccd_JH_ver2.tsv
-small_molecule_artifact_external_evidence_policy: filter_all_artifacts
-min_contacting_protein_atoms_small_molecule: 20
-min_contacting_protein_atom_ratio_small_molecule: 1.0
-min_avg_occupancy_nonpolymer_small_molecule: 0.5
-max_missing_atom_fraction_small_molecule: 0.2
-
-# --- nucleic-acid group / nuc-ligand interface filters ---
-# Distance cutoff (A) used to group nucleic-acid pn_units into a single nucleic-acid group.
-nucleic_acid_group_distance_cutoff: 4.5
-# Max number of residues for a nucleic-acid group to be treated as a nuc-ligand center.
-nucleic_acid_ligand_max_residues: 10
+bml_context:
+  enabled: true
+  # Context-selection scheme. Options:
+  #   iterative_context_refinement — Gauss-Seidel fixed point over mutual contacts (default).
+  #   protein_proximity_context    — single-pass occ/missing quality gate; 5A proximity to the
+  #                                  interface protein(s)+center(s) enforced by query expansion.
+  scheme: iterative_context_refinement
+  contact_distance_cutoff: 5.0
+  max_iterations: 10
+  small_molecule:
+    min_contacting_heavy_atoms: 20
+    min_contacting_heavy_atom_ratio: 1.0
+  metal:
+    min_coordinating_atoms: 3
+    min_avg_occupancy_nonpolymer: 0.5
+  halide:
+    allowed_ccd_codes: ["F"]
+    min_non_carbon_contacts: 3
+    min_avg_occupancy_nonpolymer: 0.5
+  peptide:
+    enabled: true
+  nucleic_acid:
+    enabled: true
 
 train_filters:
   metadata_filter:
