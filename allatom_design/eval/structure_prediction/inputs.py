@@ -5,7 +5,7 @@ from typing import Any
 from omegaconf import DictConfig, OmegaConf
 
 from allatom_design.data.transform.sd_featurizer import featurizer_af3_prediction
-from allatom_design.eval.input_preprocessing import preprocess_input
+from allatom_design.eval.utils.input_preprocessing import preprocess_input
 from allatom_design.utils.sample_io_utils import load_example_with_parse
 
 

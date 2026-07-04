@@ -21,13 +21,11 @@ from atomworks.ml.transforms.atom_array import apply_and_spread_residue_wise
 from biotite.structure import AtomArray
 from omegaconf import OmegaConf
 
-from allatom_design.data.transform.custom_transforms import (
-    annotate_ligand_pockets,
-    annotate_ligand_pockets_calpha,
-    annotate_ligand_pockets_pseudocb,
+from allatom_design.eval.utils.pocket_constraints import (
+    annotate_ligand_pocket,
+    resolve_pocket_annotation_method,
 )
-from allatom_design.eval.utils.constraint_utils import resolve_pocket_annotation_method
-from allatom_design.eval.utils.sequence_recovery import DESIGNED_CIF_PARSE_CFG
+from allatom_design.eval.metrics.sequence_recovery import DESIGNED_CIF_PARSE_CFG
 from allatom_design.utils.atom_array_utils import get_valid_standard_aa_residue_mask
 from allatom_design.utils.sample_io_utils import load_example_with_parse
 
@@ -463,27 +461,13 @@ def _pocket_residue_mask_for_distance(
 ) -> np.ndarray:
     annotation_name = f"sequence_entropy_pocket_{_format_distance_label(pocket_distance)}"
     atom_array = atom_array.copy()
-    if pocket_annotation_method == "calpha":
-        atom_array = annotate_ligand_pockets_calpha(
-            atom_array=atom_array,
-            pocket_distance=pocket_distance,
-            n_min_ligand_atoms=1,
-            annotation_name=annotation_name,
-        )
-    elif pocket_annotation_method == "pseudocb":
-        atom_array = annotate_ligand_pockets_pseudocb(
-            atom_array=atom_array,
-            pocket_distance=pocket_distance,
-            n_min_ligand_atoms=1,
-            annotation_name=annotation_name,
-        )
-    else:
-        atom_array = annotate_ligand_pockets(
-            atom_array=atom_array,
-            pocket_distance=pocket_distance,
-            n_min_ligand_atoms=1,
-            annotation_name=annotation_name,
-        )
+    atom_array = annotate_ligand_pocket(
+        atom_array=atom_array,
+        pocket_distance=pocket_distance,
+        n_min_ligand_atoms=1,
+        annotation_name=annotation_name,
+        pocket_annotation_method=pocket_annotation_method,
+    )
     return apply_and_spread_residue_wise(
         atom_array,
         atom_array.get_annotation(annotation_name),

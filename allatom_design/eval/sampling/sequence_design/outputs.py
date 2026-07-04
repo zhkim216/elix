@@ -23,8 +23,11 @@ from allatom_design.eval.sampling.sequence_design.guidance import (
     guidance_is_enabled,
 )
 from allatom_design.eval.selectivity import SELECTIVITY_GUIDANCE_METADATA_KEYS
-from allatom_design.eval.metrics.sequence_recovery import calculate_sequence_recovery
-from allatom_design.eval.sampling_inputs import (
+from allatom_design.eval.metrics.sequence_recovery import (
+    SequenceRecoveryMetricConfig,
+    calculate_sequence_recovery,
+)
+from allatom_design.eval.utils.sampling_inputs import (
     matched_sampling_input_row,
     resolve_query_pn_unit_iids_from_sampling_row,
     sampling_ligand_ccd_by_iid as ligand_ccd_by_iid_from_sampling_row,
@@ -169,9 +172,7 @@ def record_designed_sample_output(
     sample_out_dir: Path,
     sample_out_dir_for_af3_tc: Path,
     cif_save_cfg: DictConfig | dict | None,
-    pocket_distances_for_seq_recovery: list[float] | None,
-    pocket_distance_bins: list[tuple[float, float]] | None,
-    pocket_n_min_ligand_atoms_for_seq_recovery: int,
+    sequence_recovery_metric_config: SequenceRecoveryMetricConfig,
 ) -> None:
     """Save one designed sample and append its output metadata."""
     chain_info = non_rcsb.initialize_chain_info_from_atom_array(designed_atom_array)
@@ -196,14 +197,18 @@ def record_designed_sample_output(
     save_cif_file(designed_atom_array_with_gaps, out_file_for_af3_tc, cif_save_cfg=cif_save_cfg)
     output["designed_sample_path_for_af3_tc"].append(str(out_file_for_af3_tc))
 
-    seq_recovery_metrics = calculate_sequence_recovery(
-        input_atom_array,
-        designed_atom_array,
-        pocket_distances_for_seq_recovery=pocket_distances_for_seq_recovery,
-        pocket_distance_bins=pocket_distance_bins,
-        n_min_ligand_atoms=pocket_n_min_ligand_atoms_for_seq_recovery,
-    )
-    output["seq_recovery_metrics"].append(seq_recovery_metrics)
+    if sequence_recovery_metric_config.enabled:
+        seq_recovery_metrics = calculate_sequence_recovery(
+            input_atom_array,
+            designed_atom_array,
+            pocket_distances_for_seq_recovery=(
+                sequence_recovery_metric_config.pocket_distances_for_seq_recovery
+            ),
+            pocket_distance_bins=sequence_recovery_metric_config.pocket_distance_bins,
+            n_min_ligand_atoms=sequence_recovery_metric_config.n_min_ligand_atoms,
+            pocket_annotation_method=sequence_recovery_metric_config.pocket_annotation_method,
+        )
+        output["seq_recovery_metrics"].append(seq_recovery_metrics)
 
 
 def record_sampled_batch_outputs(
@@ -217,9 +222,7 @@ def record_sampled_batch_outputs(
     sample_out_dir: Path,
     sample_out_dir_for_af3_tc: Path,
     cif_save_cfg: DictConfig | dict | None,
-    pocket_distances_for_seq_recovery: list[float] | None,
-    pocket_distance_bins: list[tuple[float, float]] | None,
-    pocket_n_min_ligand_atoms_for_seq_recovery: int,
+    sequence_recovery_metric_config: SequenceRecoveryMetricConfig,
 ) -> None:
     """Record designed atom arrays and metadata produced for one runtime batch."""
     example_id_to_batch_idx = {eid: idx for idx, eid in enumerate(batch["example_id"])}
@@ -234,6 +237,8 @@ def record_sampled_batch_outputs(
         native_res_name_by_chain_res_id = batch["native_res_name_by_chain_res_id"][batch_idx]
         if "reference_sample_atom_array" not in output:
             output["reference_sample_atom_array"] = input_atom_array.copy()
+        if "sequence_recovery_metric_config" not in output:
+            output["sequence_recovery_metric_config"] = sequence_recovery_metric_config
         output["native_res_name_by_chain_res_id"] = native_res_name_by_chain_res_id
 
         # Per-(schedule, gamma) counter so that tagged sample ids reset
@@ -262,9 +267,7 @@ def record_sampled_batch_outputs(
                 sample_out_dir=sample_out_dir,
                 sample_out_dir_for_af3_tc=sample_out_dir_for_af3_tc,
                 cif_save_cfg=cif_save_cfg,
-                pocket_distances_for_seq_recovery=pocket_distances_for_seq_recovery,
-                pocket_distance_bins=pocket_distance_bins,
-                pocket_n_min_ligand_atoms_for_seq_recovery=pocket_n_min_ligand_atoms_for_seq_recovery,
+                sequence_recovery_metric_config=sequence_recovery_metric_config,
             )
 
 
@@ -383,6 +386,7 @@ def _build_designed_sample_pdb_chain_info(
         sampling_inputs_df,
         pdb_id,
         pdb_key=input_sample_id,
+        sample_id=input_sample_id,
     )
     query_pn_unit_iids = resolve_query_pn_unit_iids_from_sampling_row(sampling_row)
     if len(query_pn_unit_iids) == 0 and previous_chain_info:
@@ -440,28 +444,29 @@ def _build_design_metric_rows(
     guidance_metrics_list = []
     for example_id, output in outputs.items():
         sample_ids = output["designed_sample_id"]
-        seq_recovery_metrics = output["seq_recovery_metrics"]
+        seq_recovery_metrics = output.get("seq_recovery_metrics")
 
         for i, sample_id in enumerate(sample_ids):
-            row = {
-                "example_id": example_id,
-                "designed_sample_id": sample_id,
-                **seq_recovery_metrics[i],
-            }
+            row = {"example_id": example_id, "designed_sample_id": sample_id}
+            has_seq_metrics = seq_recovery_metrics is not None and i < len(seq_recovery_metrics)
+            if has_seq_metrics:
+                row.update(seq_recovery_metrics[i])
             if guidance_enabled:
                 guidance_row = _build_guidance_row(output, i, len(sample_ids))
-                row.update(guidance_row)
                 guidance_metrics_list.append({
                     "example_id": example_id,
                     "designed_sample_id": sample_id,
                     **guidance_row,
                 })
-            seq_recovery_metrics_list.append(row)
+                if has_seq_metrics:
+                    row.update(guidance_row)
+            if has_seq_metrics:
+                seq_recovery_metrics_list.append(row)
 
-            metrics_to_print = ", ".join(
-                f"{key}: {value:.3f}" for key, value in seq_recovery_metrics[i].items()
-            )
-            print(f"sample {i} of {example_id}: {metrics_to_print}")
+                metrics_to_print = ", ".join(
+                    f"{key}: {value:.3f}" for key, value in seq_recovery_metrics[i].items()
+                )
+                print(f"sample {i} of {example_id}: {metrics_to_print}")
 
     return seq_recovery_metrics_list, guidance_metrics_list
 
@@ -478,10 +483,11 @@ def _write_design_metric_tables(
         guidance_enabled=guidance_enabled,
     )
 
-    pd.DataFrame(seq_recovery_metrics_list).to_csv(
-        Path(log_dir_per_ckpt, f"seq_recovery_metrics{csv_suffix}.csv"),
-        index=False,
-    )
+    if len(seq_recovery_metrics_list) > 0:
+        pd.DataFrame(seq_recovery_metrics_list).to_csv(
+            Path(log_dir_per_ckpt, f"seq_recovery_metrics{csv_suffix}.csv"),
+            index=False,
+        )
     if guidance_enabled and len(guidance_metrics_list) > 0:
         pd.DataFrame(guidance_metrics_list).to_csv(
             Path(log_dir_per_ckpt, f"guidance_metrics{csv_suffix}.csv"),
@@ -503,6 +509,19 @@ def _attach_designed_sample_outputs(
         sample_entry["designed_sample_path_for_af3_tc"] = output["designed_sample_path_for_af3_tc"]
         if "reference_sample_atom_array" in output:
             sample_entry["reference_sample_atom_array"] = output["reference_sample_atom_array"]
+        if "sequence_recovery_metric_config" in output:
+            sample_entry["sequence_recovery_metric_config"] = output["sequence_recovery_metric_config"]
+        if (
+            "binding_site_plddt_reference_atom_array" not in sample_entry
+            and "reference_sample_atom_array" in output
+        ):
+            sample_entry["binding_site_plddt_reference_atom_array"] = output["reference_sample_atom_array"]
+        if (
+            "binding_site_plddt_metric_config" not in sample_entry
+            and "sequence_recovery_metric_config" in output
+            and output["sequence_recovery_metric_config"].enabled
+        ):
+            sample_entry["binding_site_plddt_metric_config"] = output["sequence_recovery_metric_config"]
         if "native_res_name_by_chain_res_id" in output:
             sample_entry["native_res_name_by_chain_res_id"] = output[
                 "native_res_name_by_chain_res_id"

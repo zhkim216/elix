@@ -1,12 +1,12 @@
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterator
 
 import pandas as pd
 from omegaconf import DictConfig, OmegaConf
 
-from allatom_design.eval.pocket_constraints import (
+from allatom_design.eval.utils.pocket_constraints import (
     create_pos_constraint_dict_from_pocket,
     resolve_pocket_annotation_method,
 )
@@ -18,6 +18,16 @@ from allatom_design.eval.sampling.sequence_design.checkpoints import ckpt_label
 from allatom_design.eval.sampling.sequence_design.core import (
     SequenceDesignRunSpec,
     iter_design_sequence_for_run_spec,
+)
+from allatom_design.eval.utils.sampling_inputs import (
+    is_role_sampling_inputs,
+    matched_role_sampling_input_row,
+    role_binder_pn_unit_iids_from_sampling_row,
+    role_context_pn_unit_iids_from_sampling_row,
+)
+from allatom_design.eval.metrics.sequence_recovery import (
+    SequenceRecoveryMetricConfig,
+    make_sequence_recovery_metric_config,
 )
 
 
@@ -161,16 +171,36 @@ def _build_stage2_inputs_and_constraints(
     pocket_distance: float,
     pocket_annotation_method: str | None,
     use_calpha_for_pocket_annotation: bool,
+    stage1_sampling_inputs_df: pd.DataFrame | None = None,
 ) -> tuple[dict, pd.DataFrame, dict[str, dict[str, Any]]]:
     stage2_sample_dict: dict[str, dict[str, Any]] = {}
     constraint_rows = []
     lineage_by_stage1_sample_id: dict[str, dict[str, Any]] = {}
 
     for original_sample_id, stage1_entry in stage1_sample_dict_per_ckpt.items():
+        role_row = _role_row_for_stage1_input(
+            sampling_inputs_df=stage1_sampling_inputs_df,
+            original_sample_id=str(original_sample_id),
+        )
+        binder_pn_unit_iids = (
+            role_binder_pn_unit_iids_from_sampling_row(role_row)
+            if role_row is not None
+            else None
+        )
+        context_pn_unit_iids = (
+            role_context_pn_unit_iids_from_sampling_row(role_row)
+            if role_row is not None
+            else None
+        )
         designed_sample_ids = stage1_entry.get("designed_sample_id", [])
         designed_sample_paths = stage1_entry.get("designed_sample_path", [])
         designed_atom_arrays = stage1_entry.get("designed_sample_atom_array", [])
         designed_sample_seqs = stage1_entry.get("designed_sample_seq", [])
+        plddt_reference_atom_array = stage1_entry.get(
+            "binding_site_plddt_reference_atom_array",
+            stage1_entry.get("reference_sample_atom_array"),
+        )
+        plddt_metric_config = stage1_entry.get("binding_site_plddt_metric_config")
 
         for sample_idx, stage1_sample_id in enumerate(designed_sample_ids):
             stage1_sample_path = designed_sample_paths[sample_idx]
@@ -188,15 +218,30 @@ def _build_stage2_inputs_and_constraints(
                 constraint_type=stage2_constraint_type,
                 pocket_annotation_method=pocket_annotation_method,
                 use_calpha_for_pocket_annotation=use_calpha_for_pocket_annotation,
+                receptor_pn_unit_iids=binder_pn_unit_iids,
+                ligand_pn_unit_iids=context_pn_unit_iids,
                 sample_path=stage1_sample_path,
                 return_ligand_mpnn_format=False,
             )
+            if context_pn_unit_iids:
+                constraint_row = _apply_role_context_constraints(
+                    constraint_row,
+                    context_pn_unit_iids=context_pn_unit_iids,
+                )
             constraint_rows.append(constraint_row)
 
             stage2_sample_dict[stage1_sample_id] = {
                 "input_sample_path": stage1_sample_path,
                 "input_sample_id": stage1_sample_id,
             }
+            if plddt_reference_atom_array is not None:
+                stage2_sample_dict[stage1_sample_id]["binding_site_plddt_reference_atom_array"] = (
+                    plddt_reference_atom_array
+                )
+            if plddt_metric_config is not None:
+                stage2_sample_dict[stage1_sample_id]["binding_site_plddt_metric_config"] = (
+                    plddt_metric_config
+                )
             if "pdb_chain_info" in stage1_entry:
                 stage2_sample_dict[stage1_sample_id]["pdb_chain_info"] = copy.deepcopy(
                     stage1_entry["pdb_chain_info"]
@@ -306,6 +351,74 @@ def _stage2_constraint_csv_path(
     )
 
 
+def _role_row_for_stage1_input(
+    *,
+    sampling_inputs_df: pd.DataFrame | None,
+    original_sample_id: str,
+) -> pd.Series | None:
+    if sampling_inputs_df is None or not is_role_sampling_inputs(sampling_inputs_df):
+        return None
+    return matched_role_sampling_input_row(
+        sampling_inputs_df,
+        sample_id=str(original_sample_id),
+    )
+
+
+def _chain_id_from_pn_unit_iid(pn_unit_iid: str) -> str:
+    text = str(pn_unit_iid).strip()
+    if "_" not in text:
+        return text
+    return text.rsplit("_", 1)[0]
+
+
+def _constraint_text(raw_value: Any) -> str:
+    if raw_value is None or pd.isna(raw_value):
+        return ""
+    return str(raw_value).strip()
+
+
+def _merge_constraint_text(raw_value: Any, additions: list[str]) -> str:
+    parts = [part.strip() for part in _constraint_text(raw_value).split(",") if part.strip()]
+    for addition in additions:
+        if addition not in parts:
+            parts.append(addition)
+    return ",".join(parts)
+
+
+def _context_chain_constraints(context_pn_unit_iids: list[str]) -> list[str]:
+    chain_ids: list[str] = []
+    for pn_unit_iid in context_pn_unit_iids:
+        chain_id = _chain_id_from_pn_unit_iid(pn_unit_iid)
+        if len(chain_id) != 1:
+            raise ValueError(
+                "two-stage role context whole-chain constraints require single-letter "
+                f"chain IDs; got {chain_id!r} from pn_unit_iid {pn_unit_iid!r}"
+            )
+        if chain_id not in chain_ids:
+            chain_ids.append(chain_id)
+    return chain_ids
+
+
+def _apply_role_context_constraints(
+    constraint_row: dict[str, Any],
+    *,
+    context_pn_unit_iids: list[str],
+) -> dict[str, Any]:
+    context_chain_constraints = _context_chain_constraints(context_pn_unit_iids)
+    if not context_chain_constraints:
+        return constraint_row
+    constraint_row = dict(constraint_row)
+    constraint_row["fixed_pos_seq"] = _merge_constraint_text(
+        constraint_row.get("fixed_pos_seq"),
+        context_chain_constraints,
+    )
+    constraint_row["fixed_pos_scn"] = _merge_constraint_text(
+        constraint_row.get("fixed_pos_scn"),
+        context_chain_constraints,
+    )
+    return constraint_row
+
+
 def _prepare_stage2_design_artifacts(
     *,
     stage1_sample_dict_per_ckpt: dict,
@@ -322,6 +435,7 @@ def _prepare_stage2_design_artifacts(
     pocket_annotation_method: str | None,
     use_calpha_for_pocket_annotation: bool,
     csv_suffix: str,
+    stage1_sampling_inputs_df: pd.DataFrame | None,
 ) -> _Stage2DesignArtifacts:
     stage2_sample_dict, stage2_pos_constraint_df, lineage_by_stage1_sample_id = (
         _build_stage2_inputs_and_constraints(
@@ -335,6 +449,7 @@ def _prepare_stage2_design_artifacts(
             pocket_distance=pocket_distance,
             pocket_annotation_method=pocket_annotation_method,
             use_calpha_for_pocket_annotation=use_calpha_for_pocket_annotation,
+            stage1_sampling_inputs_df=stage1_sampling_inputs_df,
         )
     )
     stage2_base_log_dir = _stage2_base_log_dir(
@@ -374,9 +489,7 @@ def _build_stage2_run_spec(
     featurizer_cfg: DictConfig | None,
     cif_save_cfg: DictConfig | None,
     protein_only: bool,
-    pocket_distances_for_seq_recovery: list[float] | None,
-    pocket_distance_bins: list[tuple[float, float]] | None,
-    pocket_n_min_ligand_atoms_for_seq_recovery: int,
+    sequence_recovery_metric_config: SequenceRecoveryMetricConfig,
     csv_suffix: str,
     stage2_guidance_cfg: DictConfig | None,
 ) -> SequenceDesignRunSpec:
@@ -394,9 +507,7 @@ def _build_stage2_run_spec(
         log_dir=stage2_artifacts.base_log_dir,
         pos_constraint_df=stage2_artifacts.pos_constraint_df,
         protein_only=protein_only,
-        pocket_distances_for_seq_recovery=pocket_distances_for_seq_recovery,
-        pocket_distance_bins=pocket_distance_bins,
-        pocket_n_min_ligand_atoms_for_seq_recovery=pocket_n_min_ligand_atoms_for_seq_recovery,
+        sequence_recovery_metric_config=sequence_recovery_metric_config,
         csv_suffix=csv_suffix,
         guidance_cfg=stage2_guidance_cfg,
     )
@@ -426,7 +537,8 @@ def design_sequence_two_stage(
     protein_only: bool = False,
     pocket_distances_for_seq_recovery: list[float] | None = None,
     pocket_distance_bins: list[tuple[float, float]] | None = None,
-    pocket_n_min_ligand_atoms_for_seq_recovery: int = 5,
+    pocket_n_min_ligand_atoms_for_seq_recovery: int = 1,
+    sequence_recovery_metric_config: SequenceRecoveryMetricConfig | None = None,
     csv_suffix: str = "",
     stage1_guidance_cfg: DictConfig | None = None,
     stage2_guidance_cfg: DictConfig | None = None,
@@ -448,6 +560,13 @@ def design_sequence_two_stage(
     )
 
     stage1_log_dir = log_dir / direction / f"stage1_{stage1_region}" / stage1_model_label
+    if sequence_recovery_metric_config is None:
+        sequence_recovery_metric_config = make_sequence_recovery_metric_config(
+            input_sample_is_designed=input_sample_is_designed,
+            pocket_distances_for_seq_recovery=pocket_distances_for_seq_recovery,
+            pocket_distance_bins=pocket_distance_bins,
+            n_min_ligand_atoms=pocket_n_min_ligand_atoms_for_seq_recovery,
+        )
     stage1_run_spec = SequenceDesignRunSpec(
         seed=seed,
         input_sample_is_designed=input_sample_is_designed,
@@ -462,9 +581,7 @@ def design_sequence_two_stage(
         log_dir=stage1_log_dir,
         pos_constraint_df=None,
         protein_only=protein_only,
-        pocket_distances_for_seq_recovery=pocket_distances_for_seq_recovery,
-        pocket_distance_bins=pocket_distance_bins,
-        pocket_n_min_ligand_atoms_for_seq_recovery=pocket_n_min_ligand_atoms_for_seq_recovery,
+        sequence_recovery_metric_config=sequence_recovery_metric_config,
         csv_suffix=csv_suffix,
         guidance_cfg=stage1_guidance_cfg,
     )
@@ -486,6 +603,7 @@ def design_sequence_two_stage(
             pocket_annotation_method=pocket_annotation_method,
             use_calpha_for_pocket_annotation=use_calpha_for_pocket_annotation,
             csv_suffix=csv_suffix,
+            stage1_sampling_inputs_df=stage1_sampling_inputs_df,
         )
 
         stage2_run_spec = _build_stage2_run_spec(
@@ -497,9 +615,10 @@ def design_sequence_two_stage(
             featurizer_cfg=featurizer_cfg,
             cif_save_cfg=cif_save_cfg,
             protein_only=protein_only,
-            pocket_distances_for_seq_recovery=pocket_distances_for_seq_recovery,
-            pocket_distance_bins=pocket_distance_bins,
-            pocket_n_min_ligand_atoms_for_seq_recovery=pocket_n_min_ligand_atoms_for_seq_recovery,
+            sequence_recovery_metric_config=replace(
+                sequence_recovery_metric_config,
+                enabled=False,
+            ),
             csv_suffix=csv_suffix,
             stage2_guidance_cfg=stage2_guidance_cfg,
         )

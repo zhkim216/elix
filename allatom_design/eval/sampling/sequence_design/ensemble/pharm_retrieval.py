@@ -9,7 +9,7 @@ from typing import Any
 import pandas as pd
 from omegaconf import DictConfig
 
-from allatom_design.eval.sampling_inputs import (
+from allatom_design.eval.utils.sampling_inputs import (
     matched_sampling_input_row,
     parse_query_pn_unit_iids,
     resolve_query_pn_unit_iids_from_sampling_row,

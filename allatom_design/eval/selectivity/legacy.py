@@ -4,7 +4,7 @@ from typing import Any
 
 import pandas as pd
 
-from allatom_design.eval.sampling_inputs import parse_query_pn_unit_iids
+from allatom_design.eval.utils.sampling_inputs import parse_query_pn_unit_iids
 from allatom_design.eval.selectivity.pairs import normalize_target_ligand_side
 
 

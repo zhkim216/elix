@@ -481,7 +481,7 @@ def prepare_forward_passes(
     Returns:
         (batch_A, batch_B) -- independent shallow-tensor clones ready for forward.
     """
-    from allatom_design.eval.eval_utils.seq_des_utils import initialize_sampling_masks
+    from allatom_design.eval.sampling.sequence_design.masks import initialize_sampling_masks
 
     base = _shallow_tensor_clone(batch)
     base = initialize_sampling_masks(base, protein_only=False)
@@ -515,6 +515,49 @@ def run_potts_forward_prepared(
         batch, sampling_inputs=sampling_inputs
     )
     return potts_decoder_aux
+
+
+def compute_potts_deltas(
+    potts_a: dict[str, torch.Tensor],
+    potts_b: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Return per-token Potts parameter changes between two prepared passes."""
+    h_delta = (potts_a["h"] - potts_b["h"]).square().sum(dim=-1).sqrt()
+    j_delta_edges = (potts_a["J"] - potts_b["J"]).square().sum(dim=(-2, -1)).sqrt()
+    j_delta = (j_delta_edges * potts_a["mask_ij"].float()).sum(dim=-1)
+    mask_i = potts_a["mask_i"].bool()
+    combined = h_delta + j_delta
+
+    if h_delta.shape[0] == 1:
+        return {
+            "delta_h": h_delta[0],
+            "delta_J": j_delta[0],
+            "delta_combined": combined[0],
+            "mask_i": mask_i[0],
+        }
+
+    return {
+        "delta_h": h_delta,
+        "delta_J": j_delta,
+        "delta_combined": combined,
+        "mask_i": mask_i,
+    }
+
+
+def map_token_to_residue_info(atom_array: AtomArray) -> list[tuple[str, int, str]]:
+    """Map protein CA token order to ``(chain_id, res_id, res_name)`` tuples."""
+    ca_mask = (
+        (atom_array.atom_name == "CA")
+        & filter_canonical_amino_acids(atom_array)
+    )
+    token_info: list[tuple[str, int, str]] = []
+    for cid, rid, rname in zip(
+        atom_array.chain_id[ca_mask],
+        atom_array.res_id[ca_mask],
+        atom_array.res_name[ca_mask],
+    ):
+        token_info.append((str(cid), int(rid), str(rname)))
+    return token_info
 
 
 ###########################################################

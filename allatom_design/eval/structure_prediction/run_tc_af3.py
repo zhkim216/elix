@@ -5,7 +5,7 @@ from omegaconf import OmegaConf, DictConfig
 import yaml
 from tqdm import tqdm
 
-from allatom_design.eval.input_files import get_pdb_files
+from allatom_design.eval.utils.input_files import get_pdb_files
 from allatom_design.eval.run_logging import wandb_setup
 from allatom_design.eval.structure_prediction.af3_input_utils import (
     filter_sample_paths_by_sampling_inputs,

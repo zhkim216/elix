@@ -1,4 +1,5 @@
 import re
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -15,10 +16,9 @@ from allatom_design.data.const import METAL_ELEMENTS
 from allatom_design.data.transform.custom_transforms import (
     count_metal_coordinating_protein_residues,
 )
-from allatom_design.utils.sample_io_utils import save_cif_file
 
 from allatom_design.eval.metrics.af3_confidence import extract_af3_confidence_metrics
-from allatom_design.eval.pocket_constraints import (
+from allatom_design.eval.utils.pocket_constraints import (
     annotate_ligand_pocket,
     resolve_pocket_annotation_method,
 )
@@ -29,6 +29,7 @@ def _docking_metric_error(
     message: str,
     ligand_ccd_code: str | None = None,
     metric_metadata: dict[str, float | int | str | None] | None = None,
+    extra_metric_defaults: dict[str, float | int | str | None] | None = None,
 ) -> dict[str, float | int | str | None]:
     result = {
         "error": message,
@@ -41,6 +42,8 @@ def _docking_metric_error(
         "interface_min_pae": None,
         "ligand_ccd_code": ligand_ccd_code,
     }
+    if extra_metric_defaults:
+        result.update(extra_metric_defaults)
     if metric_metadata:
         result.update(metric_metadata)
         if ligand_ccd_code is not None:
@@ -331,20 +334,6 @@ def _extract_confidence_metrics(
     }
 
 
-def _maybe_save_aligned(
-    pred_aligned_atom_array: AtomArray,
-    pred_sample_path: str | Path,
-    save_aligned: bool,
-) -> None:
-    if not save_aligned:
-        return
-    out_file = Path(pred_sample_path).parent / f"{Path(pred_sample_path).stem}_pocket_aligned.cif"
-    try:
-        save_cif_file(pred_aligned_atom_array, out_file)
-    except Exception as exc:
-        print(f"Warning: Failed to save aligned structure: {exc}")
-
-
 def _annotate_reference_ligand_pocket(
     *,
     reference_atom_array: AtomArray,
@@ -380,6 +369,210 @@ def _annotate_reference_ligand_pocket(
     )
     annotated.set_annotation(annotation_name, pocket_mask)
     return annotated
+
+
+def _align_prediction_on_global_receptor_ca(
+    *,
+    sample_atom_array: AtomArray,
+    pred_atom_array: AtomArray,
+    sample_ca_indices: np.ndarray,
+    pred_ca_indices: np.ndarray,
+) -> tuple[AtomArray | None, str | None]:
+    sample_ca = sample_atom_array[sample_ca_indices]
+    pred_ca = pred_atom_array[pred_ca_indices]
+    if not (sample_ca.res_name == pred_ca.res_name).all():
+        return None, "Amino acid residues in sample and pred receptor CA atoms must match"
+    pred_aligned_atom_array, _ = align_atom_arrays(
+        mbl_sele=pred_ca,
+        tgt_sele=sample_ca,
+        mbl_full=pred_atom_array,
+    )
+    return pred_aligned_atom_array, None
+
+
+def _binding_site_ca_rmsd_after_global_alignment(
+    *,
+    sample_atom_array: AtomArray,
+    pred_aligned_atom_array: AtomArray,
+    sample_ca_indices: np.ndarray,
+    pred_ca_indices: np.ndarray,
+    reference_binding_site_ca_mask: np.ndarray,
+) -> float:
+    sample_bs_ca = sample_atom_array[sample_ca_indices][reference_binding_site_ca_mask]
+    pred_bs_ca = pred_aligned_atom_array[pred_ca_indices][reference_binding_site_ca_mask]
+    coord_delta = pred_bs_ca.coord - sample_bs_ca.coord
+    return float(np.sqrt(np.mean(np.sum(coord_delta * coord_delta, axis=1))))
+
+
+def _pred_binding_site_mask_from_reference(
+    *,
+    reference_atom_array: AtomArray,
+    sample_atom_array: AtomArray,
+    pred_atom_array: AtomArray,
+    pocket_distance: float,
+    receptor_pn_unit_iids: list[str],
+    ligand_pn_unit_iids: list[str],
+    pocket_annotation_method: str,
+    n_min_ligand_atoms: int,
+) -> tuple[np.ndarray | None, int, str | None]:
+    annotation_name = f"is_ligand_pocket_for_plddt_{float(pocket_distance)}"
+    reference_atom_array = _annotate_reference_ligand_pocket(
+        reference_atom_array=reference_atom_array,
+        pocket_distance=pocket_distance,
+        annotation_name=annotation_name,
+        receptor_pn_unit_iids=receptor_pn_unit_iids,
+        ligand_pn_unit_iids=ligand_pn_unit_iids,
+        method=pocket_annotation_method,
+        n_min_ligand_atoms=n_min_ligand_atoms,
+    )
+    reference_binding_site_residue_mask = (
+        reference_atom_array.get_annotation(annotation_name)
+        & np.isin(reference_atom_array.pn_unit_iid, receptor_pn_unit_iids)
+    )
+    reference_ca_indices, _, pred_ca_indices, error = _joint_resolved_reference_sample_pred_ca_indices(
+        reference_atom_array=reference_atom_array,
+        sample_atom_array=sample_atom_array,
+        pred_atom_array=pred_atom_array,
+        receptor_pn_unit_iids=receptor_pn_unit_iids,
+    )
+    if error:
+        return None, 0, error
+    reference_binding_site_ca_mask = reference_binding_site_residue_mask[reference_ca_indices]
+    n_residues = int(reference_binding_site_ca_mask.sum())
+    pred_binding_site_ca_full_mask = np.zeros(len(pred_atom_array), dtype=bool)
+    pred_binding_site_ca_full_mask[pred_ca_indices[reference_binding_site_ca_mask]] = True
+    pred_binding_site_mask = (
+        _spread_atom_mask_by_residue(pred_atom_array, pred_binding_site_ca_full_mask)
+        & np.isin(pred_atom_array.pn_unit_iid, receptor_pn_unit_iids)
+        & (pred_atom_array.res_name != "UNK")
+    )
+    return pred_binding_site_mask, n_residues, None
+
+
+def _binding_site_plddt_metric_names_for_distance(distance: float) -> tuple[str, str]:
+    suffix = str(float(distance))
+    return f"binding_site_plddt_{suffix}", f"binding_site_n_residues_{suffix}"
+
+
+def _binding_site_plddt_metric_names_for_bin(lo: float, hi: float) -> tuple[str, str]:
+    suffix = f"{float(lo)}_to_{float(hi)}"
+    return f"binding_site_plddt_bin_{suffix}", f"binding_site_n_residues_bin_{suffix}"
+
+
+def _configured_binding_site_plddt_defaults(
+    *,
+    pocket_distances: Sequence[float] | None,
+    pocket_distance_bins: Sequence[tuple[float, float]] | None,
+) -> dict[str, float | int | None]:
+    defaults: dict[str, float | int | None] = {}
+    for distance in pocket_distances or []:
+        metric_key, n_key = _binding_site_plddt_metric_names_for_distance(float(distance))
+        defaults[metric_key] = None
+        defaults[n_key] = 0
+    for lo, hi in pocket_distance_bins or []:
+        metric_key, n_key = _binding_site_plddt_metric_names_for_bin(float(lo), float(hi))
+        defaults[metric_key] = None
+        defaults[n_key] = 0
+    return defaults
+
+
+def _extract_mean_plddt_for_mask(
+    *,
+    pred_sample_path: str | Path,
+    pred_atom_array: AtomArray,
+    mask: np.ndarray,
+    n_residues: int,
+) -> float | None:
+    if n_residues == 0:
+        return float("nan")
+    confidence_dir = str(Path(pred_sample_path).parent)
+    stem = str(Path(pred_sample_path).stem)
+    full_confidence_file_path = f"{confidence_dir}/{re.sub(r'_model$', '_confidences', stem)}.json"
+    try:
+        return extract_af3_confidence_metrics(
+            confidence_file_path=full_confidence_file_path,
+            atom_array=pred_atom_array,
+            mask=mask,
+            metrics_to_extract="atom_plddts",
+            return_mean=True,
+        )
+    except Exception:
+        return None
+
+
+def _extract_configured_binding_site_plddt_metrics(
+    *,
+    pred_sample_path: str | Path,
+    pred_atom_array: AtomArray,
+    sample_atom_array: AtomArray,
+    reference_atom_array: AtomArray,
+    receptor_pn_unit_iids: list[str],
+    ligand_pn_unit_iids: list[str],
+    pocket_annotation_method: str,
+    pocket_distances: Sequence[float] | None,
+    pocket_distance_bins: Sequence[tuple[float, float]] | None,
+    n_min_ligand_atoms: int,
+) -> dict[str, float | int | None]:
+    metrics: dict[str, float | int | None] = {}
+    edge_to_mask_and_count: dict[float, tuple[np.ndarray | None, int, str | None]] = {}
+
+    def _get_edge(distance: float) -> tuple[np.ndarray | None, int, str | None]:
+        distance = float(distance)
+        if distance not in edge_to_mask_and_count:
+            edge_to_mask_and_count[distance] = _pred_binding_site_mask_from_reference(
+                reference_atom_array=reference_atom_array,
+                sample_atom_array=sample_atom_array,
+                pred_atom_array=pred_atom_array,
+                pocket_distance=distance,
+                receptor_pn_unit_iids=receptor_pn_unit_iids,
+                ligand_pn_unit_iids=ligand_pn_unit_iids,
+                pocket_annotation_method=pocket_annotation_method,
+                n_min_ligand_atoms=n_min_ligand_atoms,
+            )
+        return edge_to_mask_and_count[distance]
+
+    for distance in pocket_distances or []:
+        metric_key, n_key = _binding_site_plddt_metric_names_for_distance(float(distance))
+        mask, n_residues, error = _get_edge(float(distance))
+        metrics[n_key] = n_residues
+        metrics[metric_key] = (
+            None
+            if error or mask is None
+            else _extract_mean_plddt_for_mask(
+                pred_sample_path=pred_sample_path,
+                pred_atom_array=pred_atom_array,
+                mask=mask,
+                n_residues=n_residues,
+            )
+        )
+
+    for lo, hi in pocket_distance_bins or []:
+        lo_f, hi_f = float(lo), float(hi)
+        metric_key, n_key = _binding_site_plddt_metric_names_for_bin(lo_f, hi_f)
+        hi_mask, _, hi_error = _get_edge(hi_f)
+        if hi_error or hi_mask is None:
+            metrics[n_key] = 0
+            metrics[metric_key] = None
+            continue
+        if lo_f == 0.0:
+            bin_mask = hi_mask
+        else:
+            lo_mask, _, lo_error = _get_edge(lo_f)
+            if lo_error or lo_mask is None:
+                metrics[n_key] = 0
+                metrics[metric_key] = None
+                continue
+            bin_mask = hi_mask & ~lo_mask
+        bin_ca_count = int(np.sum(bin_mask & (pred_atom_array.atom_name == "CA")))
+        metrics[n_key] = bin_ca_count
+        metrics[metric_key] = _extract_mean_plddt_for_mask(
+            pred_sample_path=pred_sample_path,
+            pred_atom_array=pred_atom_array,
+            mask=bin_mask,
+            n_residues=bin_ca_count,
+        )
+
+    return metrics
 
 
 def _heavy_ligand_mask(atom_array: AtomArray, ligand_pn_unit_iids: list[str]) -> np.ndarray:
@@ -514,15 +707,30 @@ def _compute_metal_docking_metrics_atomarray(
     ligand_ccd_code: str | None,
     save_aligned: bool = True,
     reference_pocket_annotation_method: str = "all_atom",
+    binding_site_plddt_distances: Sequence[float] | None = None,
+    binding_site_plddt_bins: Sequence[tuple[float, float]] | None = None,
+    binding_site_plddt_reference_atom_array: AtomArray | None = None,
+    binding_site_plddt_reference_pocket_annotation_method: str | None = None,
+    binding_site_plddt_reference_ligand_pn_unit_iids: list[str] | None = None,
+    binding_site_plddt_n_min_ligand_atoms: int = 1,
     metric_metadata: dict[str, float | int | str | None] | None = None,
 ) -> dict[str, float | int | str | None]:
+    extra_metric_defaults = _configured_binding_site_plddt_defaults(
+        pocket_distances=binding_site_plddt_distances,
+        pocket_distance_bins=binding_site_plddt_bins,
+    )
     _, _, _, error = _matched_metal_atom_masks(
         sample_atom_array=sample_atom_array,
         pred_atom_array=pred_atom_array,
         metal_pn_unit_iids=metal_pn_unit_iids,
     )
     if error:
-        return _docking_metric_error(error, ligand_ccd_code=ligand_ccd_code, metric_metadata=metric_metadata)
+        return _docking_metric_error(
+            error,
+            ligand_ccd_code=ligand_ccd_code,
+            metric_metadata=metric_metadata,
+            extra_metric_defaults=extra_metric_defaults,
+        )
 
     normalized_reference_elements = np.array([
         normalize_ccd_code(element) for element in reference_atom_array.element
@@ -538,6 +746,7 @@ def _compute_metal_docking_metrics_atomarray(
             "No resolved reference metal coordinates found",
             ligand_ccd_code=ligand_ccd_code,
             metric_metadata=metric_metadata,
+            extra_metric_defaults=extra_metric_defaults,
         )
 
     reference_atom_array = _annotate_reference_ligand_pocket(
@@ -561,32 +770,45 @@ def _compute_metal_docking_metrics_atomarray(
         receptor_pn_unit_iids=receptor_pn_unit_iids,
     )
     if error:
-        return _docking_metric_error(error, ligand_ccd_code=ligand_ccd_code, metric_metadata=metric_metadata)
+        return _docking_metric_error(
+            error,
+            ligand_ccd_code=ligand_ccd_code,
+            metric_metadata=metric_metadata,
+            extra_metric_defaults=extra_metric_defaults,
+        )
 
     sample_ca = sample_atom_array[sample_ca_indices]
-    pred_ca = pred_atom_array[pred_ca_indices]
     reference_binding_site_ca_mask = reference_binding_site_residue_mask[reference_ca_indices]
 
     sample_binding_site_ca = sample_ca[reference_binding_site_ca_mask]
-    pred_binding_site_ca = pred_ca[reference_binding_site_ca_mask]
 
     if len(sample_binding_site_ca) == 0:
         return _docking_metric_error(
             "No binding site CA atoms found",
             ligand_ccd_code=ligand_ccd_code,
             metric_metadata=metric_metadata,
+            extra_metric_defaults=extra_metric_defaults,
         )
-    if not (sample_binding_site_ca.res_name == pred_binding_site_ca.res_name).all():
+    pred_aligned_atom_array, error = _align_prediction_on_global_receptor_ca(
+        sample_atom_array=sample_atom_array,
+        pred_atom_array=pred_atom_array,
+        sample_ca_indices=sample_ca_indices,
+        pred_ca_indices=pred_ca_indices,
+    )
+    if error:
         return _docking_metric_error(
-            "Amino acid residues in sample and pred binding site must match",
+            error,
             ligand_ccd_code=ligand_ccd_code,
             metric_metadata=metric_metadata,
+            extra_metric_defaults=extra_metric_defaults,
         )
 
-    pred_aligned_atom_array, bs_rmsd = align_atom_arrays(
-        mbl_sele=pred_binding_site_ca,
-        tgt_sele=sample_binding_site_ca,
-        mbl_full=pred_atom_array,
+    bs_rmsd = _binding_site_ca_rmsd_after_global_alignment(
+        sample_atom_array=sample_atom_array,
+        pred_aligned_atom_array=pred_aligned_atom_array,
+        sample_ca_indices=sample_ca_indices,
+        pred_ca_indices=pred_ca_indices,
+        reference_binding_site_ca_mask=reference_binding_site_ca_mask,
     )
 
     pred_binding_site_ca_full_mask = np.zeros(len(pred_atom_array), dtype=bool)
@@ -602,7 +824,12 @@ def _compute_metal_docking_metrics_atomarray(
         metal_pn_unit_iids=metal_pn_unit_iids,
     )
     if error:
-        return _docking_metric_error(error, ligand_ccd_code=ligand_ccd_code, metric_metadata=metric_metadata)
+        return _docking_metric_error(
+            error,
+            ligand_ccd_code=ligand_ccd_code,
+            metric_metadata=metric_metadata,
+            extra_metric_defaults=extra_metric_defaults,
+        )
 
     sample_coords = sample_atom_array[sample_metal_mask].coord
     pred_coords = pred_aligned_atom_array[pred_metal_mask].coord
@@ -612,6 +839,7 @@ def _compute_metal_docking_metrics_atomarray(
             "No resolved matched metal atom pairs found",
             ligand_ccd_code=ligand_ccd_code,
             metric_metadata=metric_metadata,
+            extra_metric_defaults=extra_metric_defaults,
         )
 
     coord_delta = pred_coords[valid_pair_mask] - sample_coords[valid_pair_mask]
@@ -623,7 +851,27 @@ def _compute_metal_docking_metrics_atomarray(
         ligand_mask=pred_metal_mask,
         binding_site_mask=pred_binding_site_mask,
     )
-    _maybe_save_aligned(pred_aligned_atom_array, pred_sample_path, save_aligned)
+    configured_plddt = _extract_configured_binding_site_plddt_metrics(
+        pred_sample_path=pred_sample_path,
+        pred_atom_array=pred_aligned_atom_array,
+        sample_atom_array=sample_atom_array,
+        reference_atom_array=(
+            binding_site_plddt_reference_atom_array
+            if binding_site_plddt_reference_atom_array is not None
+            else reference_atom_array
+        ),
+        receptor_pn_unit_iids=receptor_pn_unit_iids,
+        ligand_pn_unit_iids=(
+            binding_site_plddt_reference_ligand_pn_unit_iids or metal_pn_unit_iids
+        ),
+        pocket_annotation_method=(
+            binding_site_plddt_reference_pocket_annotation_method
+            or reference_pocket_annotation_method
+        ),
+        pocket_distances=binding_site_plddt_distances,
+        pocket_distance_bins=binding_site_plddt_bins,
+        n_min_ligand_atoms=binding_site_plddt_n_min_ligand_atoms,
+    )
 
     return {
         "ligand_rmsd": ligand_rmsd,
@@ -631,6 +879,7 @@ def _compute_metal_docking_metrics_atomarray(
         "binding_site_rmsd": float(bs_rmsd),
         "num_bs_residues": int(reference_binding_site_ca_mask.sum()),
         **confidence,
+        **configured_plddt,
         "ligand_ccd_code": ligand_ccd_code,
         **(metric_metadata or {}),
     }
@@ -650,8 +899,18 @@ def _compute_small_molecule_docking_metrics_atomarray(
     reference_pocket_annotation_method: str = "calpha",
     ligand_smiles: list[str | None] | None = None,
     reference_ligand_pn_unit_iids: list[str] | None = None,
+    binding_site_plddt_distances: Sequence[float] | None = None,
+    binding_site_plddt_bins: Sequence[tuple[float, float]] | None = None,
+    binding_site_plddt_reference_atom_array: AtomArray | None = None,
+    binding_site_plddt_reference_pocket_annotation_method: str | None = None,
+    binding_site_plddt_reference_ligand_pn_unit_iids: list[str] | None = None,
+    binding_site_plddt_n_min_ligand_atoms: int = 1,
     metric_metadata: dict[str, float | int | str | None] | None = None,
 ) -> dict[str, float | int | str | None]:
+    extra_metric_defaults = _configured_binding_site_plddt_defaults(
+        pocket_distances=binding_site_plddt_distances,
+        pocket_distance_bins=binding_site_plddt_bins,
+    )
     reference_ligand_pn_unit_iids = reference_ligand_pn_unit_iids or ligand_pn_unit_iids
     has_smiles_ligand = bool(_nonempty_ligand_smiles(ligand_smiles))
     if has_smiles_ligand and (
@@ -661,6 +920,7 @@ def _compute_small_molecule_docking_metrics_atomarray(
             "SMILES docking metrics require exactly one predicted ligand iid and one reference ligand iid",
             ligand_ccd_code=ligand_ccd_code,
             metric_metadata=metric_metadata,
+            extra_metric_defaults=extra_metric_defaults,
         )
 
     reference_atom_array = _annotate_reference_ligand_pocket(
@@ -682,7 +942,12 @@ def _compute_small_molecule_docking_metrics_atomarray(
         receptor_pn_unit_iids=receptor_pn_unit_iids,
     )
     if error:
-        return _docking_metric_error(error, ligand_ccd_code=ligand_ccd_code, metric_metadata=metric_metadata)
+        return _docking_metric_error(
+            error,
+            ligand_ccd_code=ligand_ccd_code,
+            metric_metadata=metric_metadata,
+            extra_metric_defaults=extra_metric_defaults,
+        )
 
     sample_ca = sample_atom_array[sample_ca_indices]
     pred_ca = pred_atom_array[pred_ca_indices]
@@ -690,18 +955,7 @@ def _compute_small_molecule_docking_metrics_atomarray(
     # Get binding site mask for CA atoms
     reference_bs_ca_mask = reference_atom_array.is_ligand_pocket_for_metrics[reference_ca_indices]
 
-    # Get binding site CA atoms by sequential index
     sample_bs_sorted = sample_ca[reference_bs_ca_mask]
-    pred_bs_sorted = pred_ca[reference_bs_ca_mask]
-
-    # check if the binding site residues in sample and pred match
-    if not (sample_bs_sorted.res_name == pred_bs_sorted.res_name).all():
-        return _docking_metric_error(
-            "Amino acid residues in sample and pred binding site must match",
-            ligand_ccd_code=ligand_ccd_code,
-            metric_metadata=metric_metadata,
-        )
-
     num_bs_residues = np.sum(reference_bs_ca_mask)
 
     if len(sample_bs_sorted) == 0:
@@ -709,14 +963,29 @@ def _compute_small_molecule_docking_metrics_atomarray(
             "No binding site CA atoms found",
             ligand_ccd_code=ligand_ccd_code,
             metric_metadata=metric_metadata,
+            extra_metric_defaults=extra_metric_defaults,
         )
 
-    # Align pred onto ref using binding site CA atoms
-    # align_atom_arrays: aligns mbl_sele to tgt_sele, applies transform to mbl_full
-    pred_aligned_atom_array, bs_rmsd = align_atom_arrays(
-        mbl_sele=pred_bs_sorted,  # pred binding site (to be aligned)
-        tgt_sele=sample_bs_sorted,   # ref binding site (target)
-        mbl_full=pred_atom_array       # full pred structure (to be transformed)
+    pred_aligned_atom_array, error = _align_prediction_on_global_receptor_ca(
+        sample_atom_array=sample_atom_array,
+        pred_atom_array=pred_atom_array,
+        sample_ca_indices=sample_ca_indices,
+        pred_ca_indices=pred_ca_indices,
+    )
+    if error:
+        return _docking_metric_error(
+            error,
+            ligand_ccd_code=ligand_ccd_code,
+            metric_metadata=metric_metadata,
+            extra_metric_defaults=extra_metric_defaults,
+        )
+
+    bs_rmsd = _binding_site_ca_rmsd_after_global_alignment(
+        sample_atom_array=sample_atom_array,
+        pred_aligned_atom_array=pred_aligned_atom_array,
+        sample_ca_indices=sample_ca_indices,
+        pred_ca_indices=pred_ca_indices,
+        reference_binding_site_ca_mask=reference_bs_ca_mask,
     )
 
     # Prepare masks for ligand and binding site
@@ -740,6 +1009,7 @@ def _compute_small_molecule_docking_metrics_atomarray(
             "No predicted ligand atoms found",
             ligand_ccd_code=ligand_ccd_code,
             metric_metadata=metric_metadata,
+            extra_metric_defaults=extra_metric_defaults,
         )
 
     ligand_rmsd_metadata: dict[str, float | int | str | None] = {}
@@ -749,6 +1019,7 @@ def _compute_small_molecule_docking_metrics_atomarray(
                 "No explicit reference ligand atoms found for SMILES metric",
                 ligand_ccd_code=ligand_ccd_code,
                 metric_metadata=metric_metadata,
+                extra_metric_defaults=extra_metric_defaults,
             )
         reference_ligand_ccd_code = _ligand_ccd_code_for_iids(
             reference_atom_array,
@@ -760,7 +1031,12 @@ def _compute_small_molecule_docking_metrics_atomarray(
             pred_ligand_smiles=_nonempty_ligand_smiles(ligand_smiles)[0],
         )
         if error:
-            return _docking_metric_error(error, ligand_ccd_code=ligand_ccd_code, metric_metadata=metric_metadata)
+            return _docking_metric_error(
+                error,
+                ligand_ccd_code=ligand_ccd_code,
+                metric_metadata=metric_metadata,
+                extra_metric_defaults=extra_metric_defaults,
+            )
         ligand_rmsd = mcs_metrics.pop("ligand_rmsd")
         ligand_rmsd_metadata = {
             **mcs_metrics,
@@ -772,6 +1048,7 @@ def _compute_small_molecule_docking_metrics_atomarray(
                 "No ligand atoms found",
                 ligand_ccd_code=ligand_ccd_code,
                 metric_metadata=metric_metadata,
+                extra_metric_defaults=extra_metric_defaults,
             )
 
         # Match ligand atoms by name
@@ -784,6 +1061,7 @@ def _compute_small_molecule_docking_metrics_atomarray(
                 "No common ligand atoms",
                 ligand_ccd_code=ligand_ccd_code,
                 metric_metadata=metric_metadata,
+                extra_metric_defaults=extra_metric_defaults,
             )
 
         # Calculate symmetry-corrected RMSD using RDKit
@@ -806,7 +1084,7 @@ def _compute_small_molecule_docking_metrics_atomarray(
                 try:
                     # Use CalcRMS instead of GetBestRMS to compute symmetry-aware RMSD
                     # WITHOUT additional alignment (in-place calculation)
-                    # This is what we want for docking poses after binding site superposition
+                    # This is what we want for docking poses after receptor superposition
                     ligand_rmsd = rdMolAlign.CalcRMS(sample_mol, pred_mol)
                     print(f"using CalcRMS (no alignment, symmetry-aware): {ligand_rmsd:.4f} Å")
                     ligand_rmsd_metadata["ligand_rmsd_mode"] = "ccd_exact"
@@ -830,6 +1108,7 @@ def _compute_small_molecule_docking_metrics_atomarray(
                 "Failed to calculate ligand RMSD using RDKit",
                 ligand_ccd_code=ligand_ccd_code,
                 metric_metadata=metric_metadata,
+                extra_metric_defaults=extra_metric_defaults,
             )
 
 
@@ -840,13 +1119,34 @@ def _compute_small_molecule_docking_metrics_atomarray(
         ligand_mask=pred_ligand_mask,
         binding_site_mask=pred_binding_site_mask,
     )
-    _maybe_save_aligned(pred_aligned_atom_array, pred_sample_path, save_aligned)
+    configured_plddt = _extract_configured_binding_site_plddt_metrics(
+        pred_sample_path=pred_sample_path,
+        pred_atom_array=pred_aligned_atom_array,
+        sample_atom_array=sample_atom_array,
+        reference_atom_array=(
+            binding_site_plddt_reference_atom_array
+            if binding_site_plddt_reference_atom_array is not None
+            else reference_atom_array
+        ),
+        receptor_pn_unit_iids=receptor_pn_unit_iids,
+        ligand_pn_unit_iids=(
+            binding_site_plddt_reference_ligand_pn_unit_iids or reference_ligand_pn_unit_iids
+        ),
+        pocket_annotation_method=(
+            binding_site_plddt_reference_pocket_annotation_method
+            or reference_pocket_annotation_method
+        ),
+        pocket_distances=binding_site_plddt_distances,
+        pocket_distance_bins=binding_site_plddt_bins,
+        n_min_ligand_atoms=binding_site_plddt_n_min_ligand_atoms,
+    )
 
     return {
         "ligand_rmsd": ligand_rmsd,
         "binding_site_rmsd": float(bs_rmsd),
         "num_bs_residues": int(num_bs_residues),
         **confidence,
+        **configured_plddt,
         "ligand_ccd_code": ligand_ccd_code,
         **(metric_metadata or {}),
         **ligand_rmsd_metadata,
@@ -867,6 +1167,12 @@ def compute_docking_metrics_atomarray(*, pred_atom_array: AtomArray,
                                        ref_sample_is_designed: bool = True,
                                        reference_pocket_annotation_method: str | None = None,
                                        metal_pn_unit_iids: list[str] | None = None,
+                                       binding_site_plddt_distances: Sequence[float] | None = None,
+                                       binding_site_plddt_bins: Sequence[tuple[float, float]] | None = None,
+                                       binding_site_plddt_reference_atom_array: AtomArray | None = None,
+                                       binding_site_plddt_reference_pocket_annotation_method: str | None = None,
+                                       binding_site_plddt_reference_ligand_pn_unit_iids: list[str] | None = None,
+                                       binding_site_plddt_n_min_ligand_atoms: int = 1,
                                        ) -> dict[str, float]:
     """
     Compute docking metrics between a designed structure and its predicted structure, using atom array.
@@ -908,11 +1214,16 @@ def compute_docking_metrics_atomarray(*, pred_atom_array: AtomArray,
         )
     }
     metric_metadata.update(metal_donor_residue_metadata)
+    extra_metric_defaults = _configured_binding_site_plddt_defaults(
+        pocket_distances=binding_site_plddt_distances,
+        pocket_distance_bins=binding_site_plddt_bins,
+    )
     if ligand_smiles is not None and len(ligand_smiles) != len(ligand_pn_unit_iids):
         return _docking_metric_error(
             "ligand_smiles must have the same length as ligand_pn_unit_iids",
             ligand_ccd_code=ligand_ccd_code,
             metric_metadata=metric_metadata,
+            extra_metric_defaults=extra_metric_defaults,
         )
     selected_sample_metal_pn_unit_iids = _selected_metal_pn_unit_iids(sample_atom_array, ligand_pn_unit_iids)
     if reference_pocket_annotation_method is None:
@@ -947,6 +1258,16 @@ def compute_docking_metrics_atomarray(*, pred_atom_array: AtomArray,
             ligand_ccd_code=metal_ligand_ccd_code,
             save_aligned=save_aligned,
             reference_pocket_annotation_method=metal_reference_pocket_annotation_method,
+            binding_site_plddt_distances=binding_site_plddt_distances,
+            binding_site_plddt_bins=binding_site_plddt_bins,
+            binding_site_plddt_reference_atom_array=binding_site_plddt_reference_atom_array,
+            binding_site_plddt_reference_pocket_annotation_method=(
+                binding_site_plddt_reference_pocket_annotation_method
+            ),
+            binding_site_plddt_reference_ligand_pn_unit_iids=(
+                binding_site_plddt_reference_ligand_pn_unit_iids
+            ),
+            binding_site_plddt_n_min_ligand_atoms=binding_site_plddt_n_min_ligand_atoms,
             metric_metadata=metal_metadata,
         )
 
@@ -963,5 +1284,15 @@ def compute_docking_metrics_atomarray(*, pred_atom_array: AtomArray,
         reference_pocket_annotation_method=small_molecule_reference_pocket_annotation_method,
         ligand_smiles=ligand_smiles,
         reference_ligand_pn_unit_iids=reference_ligand_pn_unit_iids,
+        binding_site_plddt_distances=binding_site_plddt_distances,
+        binding_site_plddt_bins=binding_site_plddt_bins,
+        binding_site_plddt_reference_atom_array=binding_site_plddt_reference_atom_array,
+        binding_site_plddt_reference_pocket_annotation_method=(
+            binding_site_plddt_reference_pocket_annotation_method
+        ),
+        binding_site_plddt_reference_ligand_pn_unit_iids=(
+            binding_site_plddt_reference_ligand_pn_unit_iids
+        ),
+        binding_site_plddt_n_min_ligand_atoms=binding_site_plddt_n_min_ligand_atoms,
         metric_metadata=metric_metadata,
     )

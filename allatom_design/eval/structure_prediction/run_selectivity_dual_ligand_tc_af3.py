@@ -24,9 +24,9 @@ from allatom_design.eval.structure_prediction.af3_runner import (
     run_af3_template_conditioned,
 )
 from allatom_design.eval.structure_prediction.af3_json import make_af3_json
-from allatom_design.eval.input_files import get_pdb_files
+from allatom_design.eval.utils.input_files import get_pdb_files
 from allatom_design.eval.run_logging import wandb_setup
-from allatom_design.eval.sampling_inputs import parse_query_pn_unit_iids
+from allatom_design.eval.utils.sampling_inputs import parse_query_pn_unit_iids
 from allatom_design.eval.metrics import compute_docking_metrics_atomarray
 from allatom_design.eval.selectivity import (
     normalize_target_ligand_side,

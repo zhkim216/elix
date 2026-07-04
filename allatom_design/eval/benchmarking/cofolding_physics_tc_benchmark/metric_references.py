@@ -10,16 +10,16 @@ from omegaconf import OmegaConf
 from rdkit import Chem
 
 import atomworks.enums as aw_enums
-from atomworks.constants import METAL_ELEMENTS
 from atomworks.enums import ChainType
 from atomworks.io.tools.rdkit import atom_array_from_rdkit
 from atomworks.io.utils.sequence import get_1_from_3_letter_code
 
-from allatom_design.eval.utils.metrics.docking import compute_docking_metrics_atomarray
-from allatom_design.eval.utils.metrics.self_consistency import (
+from allatom_design.data.const import METAL_ELEMENTS
+from allatom_design.eval.metrics.docking import compute_docking_metrics_atomarray
+from allatom_design.eval.metrics.self_consistency import (
     compute_self_consistency_metrics_atomarray,
 )
-from allatom_design.eval.utils.misc import normalize_ccd_code
+from allatom_design.eval.chemical_components import normalize_ccd_code
 from allatom_design.utils.sample_io_utils import load_example_with_parse
 
 

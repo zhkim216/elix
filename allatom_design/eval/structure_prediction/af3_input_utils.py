@@ -10,8 +10,11 @@ import pandas as pd
 from omegaconf import DictConfig, OmegaConf
 
 from allatom_design.data.transform.sd_featurizer import featurizer_designed_samples
-from allatom_design.eval.input_preprocessing import preprocess_input
-from allatom_design.eval.sampling_inputs import resolve_query_pn_unit_iids
+from allatom_design.eval.utils.input_preprocessing import preprocess_input
+from allatom_design.eval.utils.sampling_inputs import (
+    is_role_sampling_inputs,
+    resolve_query_pn_unit_iids,
+)
 from allatom_design.utils.atom_array_utils import insert_unk_residues_for_gaps_in_atom_array
 from allatom_design.utils.sample_io_utils import load_example_with_parse, save_cif_file
 
@@ -21,6 +24,13 @@ def load_sampling_inputs_csv(sampling_inputs_csv: str | None) -> pd.DataFrame | 
         return None
 
     sampling_inputs_df = pd.read_csv(sampling_inputs_csv, keep_default_na=False)
+    if is_role_sampling_inputs(sampling_inputs_df):
+        raise ValueError(
+            "standalone AF3 structure-prediction entrypoints do not consume "
+            "role-schema sampling_inputs_csv directly; run sequence sampling through "
+            "allatom_design/eval/sampling/run_elix.py so derived runtime sample IDs "
+            "are carried into AF3 evaluation"
+        )
     if "pdb_id" not in sampling_inputs_df.columns and "pdb_key" not in sampling_inputs_df.columns:
         raise ValueError(
             "sampling_inputs_csv must contain at least one of 'pdb_id' or 'pdb_key' "

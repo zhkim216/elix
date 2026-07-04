@@ -12,7 +12,7 @@ from allatom_design.data.transform.ligand_conformers import (
     find_query_small_molecule_ligands,
     generate_ligand_conformer_decoys,
 )
-from allatom_design.eval.sampling_inputs import (
+from allatom_design.eval.utils.sampling_inputs import (
     matched_sampling_input_row,
     resolve_query_pn_unit_iids_from_sampling_row,
 )

@@ -49,6 +49,7 @@ from tqdm import tqdm
 
 from allatom_design.eval.allostery.allobench_utils import (
     build_allosteric_atom_mask,
+    compute_potts_deltas,
     compute_ortho_pocket_labels,
     compute_per_residue_min_dist_to_atoms,
     extract_protein_chain_sequences,
@@ -56,16 +57,13 @@ from allatom_design.eval.allostery.allobench_utils import (
     is_single_protein_chain,
     light_load_cif,
     load_allobench,
+    map_token_to_residue_info,
     prepare_forward_passes,
     run_mmseqs_alignment_batch,
     run_potts_forward_prepared,
     uniprot_idx_to_pdb_residue,
 )
-from allatom_design.eval.eval_utils.potts_utils import (
-    compute_potts_deltas,
-    map_token_to_residue_info,
-)
-from allatom_design.eval.utils.data_utils import get_sd_batch
+from allatom_design.eval.sampling.sequence_design.inputs import get_sd_batch
 from allatom_design.model.seq_denoiser.lit_sd_model import LitSeqDenoiser
 
 
