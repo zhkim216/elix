@@ -28,6 +28,47 @@ POS_CONSTRAINT_METADATA_COLUMNS = (
 )
 
 
+def _available_chain_ids(atom_array: AtomArray, chain_annotation: str) -> list[str]:
+    chain_ids = np.asarray(atom_array.get_annotation(chain_annotation)).astype(str)
+    return sorted(
+        {str(chain_id) for chain_id in chain_ids if str(chain_id) != ""},
+        key=lambda x: (-len(x), x),
+    )
+
+
+def _missing_chain_error(chain_id: str, available_chain_ids: list[str]) -> ValueError:
+    return ValueError(
+        f"Chain ID {chain_id} not found in chain annotation: {np.array(available_chain_ids)}."
+    )
+
+
+def _parse_fixed_pos_token(
+    pos: str,
+    available_chain_ids: list[str],
+) -> tuple[str, int | None, int | None]:
+    for chain_id in available_chain_ids:
+        if not pos.startswith(chain_id):
+            continue
+        suffix = pos[len(chain_id):]
+        if not suffix:
+            continue
+        match = re.fullmatch(r"(\d+)(?:-(\d+))?", suffix)
+        if match is not None:
+            start_residue = int(match.group(1))
+            end_residue = int(match.group(2)) if match.group(2) else start_residue
+            return chain_id, start_residue, end_residue
+
+    if pos in available_chain_ids:
+        return pos, None, None
+
+    inferred = re.fullmatch(r"([A-Za-z]+)(\d+)(?:-(\d+))?", pos)
+    if inferred is not None:
+        raise _missing_chain_error(inferred.group(1), available_chain_ids)
+    if re.fullmatch(r"[A-Za-z]+", pos) is not None:
+        raise _missing_chain_error(pos, available_chain_ids)
+    raise ValueError(f"Invalid position format: {pos}")
+
+
 def parse_fixed_pos_info(
     batch: dict[str, TensorType["b ..."]], pos_constraint_df: pd.DataFrame | None, verbose: bool = False
 ) -> dict[str, torch.Tensor]:
@@ -214,10 +255,12 @@ def parse_pos_restrict_aatype_info(
 
 def parse_fixed_pos_str(fixed_pos_str: str, atom_array: AtomArray) -> TensorType["k", int]:
     """
-    Parse a list of fixed positions in the format ["A", "B1", "C10-25", ...] and
-    return the corresponding list of absolute indices.
+    Parse fixed positions like ["A", "B1", "C10-25", "GA", "GA2-4"] and return
+    the corresponding list of absolute token indices.
     """
     chain_annotation = "chain_id"
+    chain_ids = _available_chain_ids(atom_array, chain_annotation)
+    atom_chain_ids = np.asarray(atom_array.get_annotation(chain_annotation)).astype(str)
     residue_index = atom_array.res_id[get_token_starts(atom_array)]
     fixed_indices = []
 
@@ -228,48 +271,30 @@ def parse_fixed_pos_str(fixed_pos_str: str, atom_array: AtomArray) -> TensorType
     fixed_pos_list = [item.strip() for item in fixed_pos_str.split(",") if item.strip()]
 
     for pos in fixed_pos_list:
-        match_with_residues = re.match(r"([A-Za-z])(\d+)(?:-(\d+))?$", pos)
-        match_chain_only = re.match(r"([A-Za-z])$", pos)
+        chain_id, start_residue, end_residue = _parse_fixed_pos_token(pos, chain_ids)
 
-        if match_with_residues:
-            chain_letter = match_with_residues.group(1)
-            start_residue = int(match_with_residues.group(2))
-            end_residue = int(match_with_residues.group(3)) if match_with_residues.group(3) else start_residue
-
-            if chain_letter not in atom_array.get_annotation(chain_annotation):
-                raise ValueError(
-                    f"Chain ID {chain_letter} not found in chain annotation: {np.unique(atom_array.get_annotation(chain_annotation))}."
-                )
-
-            atomwise_range_mask = (
-                (atom_array.get_annotation(chain_annotation) == chain_letter)
-                & (atom_array.res_id >= start_residue)
-                & (atom_array.res_id <= end_residue)
-            )
-            range_mask = apply_token_wise(atom_array, atomwise_range_mask, np.any)
-            matching_indices = np.where(range_mask)[0]
-
-            found_residues = set(residue_index[matching_indices].tolist())
-
-            for r in range(start_residue, end_residue + 1):
-                if r not in found_residues:
-                    print(f"Warning: Requested position {chain_letter}{r} not found in structure.")
-
-            fixed_indices.extend(matching_indices.tolist())
-        elif match_chain_only:
-            chain_letter = match_chain_only.group(1)
-
-            if chain_letter not in atom_array.get_annotation(chain_annotation):
-                raise ValueError(
-                    f"Chain ID {chain_letter} not found in chain annotation: {np.unique(atom_array.get_annotation(chain_annotation))}."
-                )
-
-            atomwise_chain_mask = atom_array.get_annotation(chain_annotation) == chain_letter
+        if start_residue is None:
+            atomwise_chain_mask = atom_chain_ids == chain_id
             chain_mask = apply_token_wise(atom_array, atomwise_chain_mask, np.any)
             matching_indices = np.where(chain_mask)[0]
             fixed_indices.extend(matching_indices.tolist())
-        else:
-            raise ValueError(f"Invalid position format: {pos}")
+            continue
+
+        atomwise_range_mask = (
+            (atom_chain_ids == chain_id)
+            & (atom_array.res_id >= start_residue)
+            & (atom_array.res_id <= end_residue)
+        )
+        range_mask = apply_token_wise(atom_array, atomwise_range_mask, np.any)
+        matching_indices = np.where(range_mask)[0]
+
+        found_residues = set(residue_index[matching_indices].tolist())
+
+        for r in range(start_residue, end_residue + 1):
+            if r not in found_residues:
+                print(f"Warning: Requested position {chain_id}{r} not found in structure.")
+
+        fixed_indices.extend(matching_indices.tolist())
 
     return fixed_indices
 

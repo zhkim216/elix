@@ -389,11 +389,8 @@ def _context_chain_constraints(context_pn_unit_iids: list[str]) -> list[str]:
     chain_ids: list[str] = []
     for pn_unit_iid in context_pn_unit_iids:
         chain_id = _chain_id_from_pn_unit_iid(pn_unit_iid)
-        if len(chain_id) != 1:
-            raise ValueError(
-                "two-stage role context whole-chain constraints require single-letter "
-                f"chain IDs; got {chain_id!r} from pn_unit_iid {pn_unit_iid!r}"
-            )
+        if not chain_id:
+            raise ValueError(f"Empty chain ID parsed from pn_unit_iid {pn_unit_iid!r}")
         if chain_id not in chain_ids:
             chain_ids.append(chain_id)
     return chain_ids
