@@ -1,11 +1,9 @@
 import gc
-from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pandas as pd
-import wandb
 
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
@@ -16,6 +14,7 @@ from allatom_design.eval.structure_prediction.af3_runner import (
     run_af3_single_sequence,
     run_af3_template_conditioned,
 )
+from allatom_design.eval.metrics.sequence_recovery import build_sequence_recovery_metric_config
 
 
 def _ligand_metric_values_from_chain_info(
@@ -46,6 +45,81 @@ def _ligand_metric_values_from_chain_info(
     return None
 
 
+def _pocket_distance_bins_from_cfg(pocket_cfg: DictConfig | dict | None) -> list[tuple[float, float]] | None:
+    if pocket_cfg is None:
+        return None
+    bins_raw = pocket_cfg.get("pocket_distance_bins", None)
+    return [tuple(b) for b in bins_raw] if bins_raw is not None else None
+
+
+def _select_indexed_or_scalar(value: Any, idx: int) -> Any:
+    if isinstance(value, list):
+        return value[idx] if idx < len(value) else None
+    return value
+
+
+@dataclass(frozen=True)
+class BindingSitePlddtContract:
+    reference_atom_array: Any
+    pocket_distances: Any
+    pocket_distance_bins: Any
+    pocket_annotation_method: str
+    n_min_ligand_atoms: int
+
+    def to_docking_kwargs(self, reference_ligand_pn_unit_iids: list[str] | None) -> dict[str, Any]:
+        return {
+            "binding_site_plddt_distances": self.pocket_distances,
+            "binding_site_plddt_bins": self.pocket_distance_bins,
+            "binding_site_plddt_reference_atom_array": self.reference_atom_array,
+            "binding_site_plddt_reference_pocket_annotation_method": (
+                self.pocket_annotation_method
+            ),
+            "binding_site_plddt_reference_ligand_pn_unit_iids": (
+                reference_ligand_pn_unit_iids
+            ),
+            "binding_site_plddt_n_min_ligand_atoms": self.n_min_ligand_atoms,
+        }
+
+
+def _binding_site_plddt_contract(
+    *,
+    subsample_dict: dict,
+    dsidx: int,
+    pocket_cfg: DictConfig | dict | None,
+    input_sample_is_designed: bool,
+    fallback_reference_atom_array: Any,
+) -> BindingSitePlddtContract:
+    reference_atom_array = _select_indexed_or_scalar(
+        subsample_dict.get("binding_site_plddt_reference_atom_array"),
+        dsidx,
+    )
+    if reference_atom_array is None:
+        reference_atom_array = fallback_reference_atom_array
+    metric_config = _select_indexed_or_scalar(
+        subsample_dict.get("binding_site_plddt_metric_config"),
+        dsidx,
+    )
+    if metric_config is None:
+        metric_config = _select_indexed_or_scalar(
+            subsample_dict.get("sequence_recovery_metric_config"),
+            dsidx,
+        )
+    if metric_config is None or not metric_config.enabled:
+        metric_config = build_sequence_recovery_metric_config(
+            pocket_cfg=pocket_cfg,
+            input_sample_is_designed=input_sample_is_designed,
+            pocket_distance_bins=_pocket_distance_bins_from_cfg(pocket_cfg),
+            enabled=True,
+        )
+    return BindingSitePlddtContract(
+        reference_atom_array=reference_atom_array,
+        pocket_distances=metric_config.pocket_distances_for_seq_recovery,
+        pocket_distance_bins=metric_config.pocket_distance_bins,
+        pocket_annotation_method=metric_config.pocket_annotation_method,
+        n_min_ligand_atoms=metric_config.n_min_ligand_atoms,
+    )
+
+
 # ============================================================================
 # AF3 Evaluation Functions
 # ============================================================================
@@ -73,7 +147,7 @@ def evaluate_af3_self_consistency(sample_dict: dict = None,
         pdb_chain_info: PDB chain info dictionary.
         out_dir: Output directory.
         cfg: Configuration object.
-        ckpt_info: Checkpoint info (optional, for wandb logging).
+        ckpt_info: Retained for caller compatibility; no best-aggregate logging is written.
     """
     # Import here to keep AF3 prediction featurization optional until metrics are requested.
     from allatom_design.eval.structure_prediction.inputs import prepare_af3_prediction
@@ -124,6 +198,13 @@ def evaluate_af3_self_consistency(sample_dict: dict = None,
             reference_sample_atom_array = subsample_dict.get('reference_sample_atom_array', designed_sample_atom_array)
             if isinstance(reference_sample_atom_array, list):
                 reference_sample_atom_array = reference_sample_atom_array[dsidx]
+            binding_site_plddt_contract = _binding_site_plddt_contract(
+                subsample_dict=subsample_dict,
+                dsidx=dsidx,
+                pocket_cfg=pocket_cfg,
+                input_sample_is_designed=input_sample_is_designed,
+                fallback_reference_atom_array=reference_sample_atom_array,
+            )
             pdb_chain_info = subsample_dict['pdb_chain_info']
             ss_json_path = subsample_dict['af3_ss_json_paths'][dsidx]
 
@@ -203,6 +284,15 @@ def evaluate_af3_self_consistency(sample_dict: dict = None,
                                 ligand_smiles=ligand_smiles,
                                 reference_ligand_pn_unit_iids=reference_ligand_pn_unit_iids,
                                 ref_sample_is_designed=input_sample_is_designed,
+                                # Annotate the docking reference pocket with the same method as
+                                # binding-site pLDDT (all_atom for native references) instead of
+                                # letting it default to calpha when two-stage forces
+                                # ref_sample_is_designed=True.
+                                reference_pocket_annotation_method=binding_site_plddt_contract.pocket_annotation_method,
+                                save_aligned=False,
+                                **binding_site_plddt_contract.to_docking_kwargs(
+                                    reference_ligand_pn_unit_iids
+                                ),
                             )
 
                         except Exception as e:
@@ -218,25 +308,11 @@ def evaluate_af3_self_consistency(sample_dict: dict = None,
             subsample_dict.pop('designed_sample_atom_array', None)
         gc.collect()
 
-    # Aggregate best metrics per designed_sample_id (best diffusion sample)
-    designed_sample_id_best_sc_metrics = _aggregate_best_sc_metrics_per_designed_sample(designed_sample_id_to_per_pred_sc_metrics)
-    designed_sample_id_best_docking_metrics = _aggregate_best_docking_metrics_per_designed_sample(designed_sample_id_to_per_pred_docking_metrics)
-
-    # Aggregate best metrics per input_sample_id (best designed sample)
-    input_sample_id_best_sc_metrics = _aggregate_best_sc_metrics_per_input_sample(designed_sample_id_best_sc_metrics)
-    input_sample_id_best_docking_metrics = _aggregate_best_docking_metrics_per_input_sample(designed_sample_id_best_docking_metrics)
-
     # Save results
     _save_metrics_results(
         out_dir=out_dir,
         designed_sample_id_to_per_pred_sc_metrics=designed_sample_id_to_per_pred_sc_metrics,
         designed_sample_id_to_per_pred_docking_metrics=designed_sample_id_to_per_pred_docking_metrics,
-        designed_sample_id_best_sc_metrics=designed_sample_id_best_sc_metrics,
-        designed_sample_id_best_docking_metrics=designed_sample_id_best_docking_metrics,
-        input_sample_id_best_sc_metrics=input_sample_id_best_sc_metrics,
-        input_sample_id_best_docking_metrics=input_sample_id_best_docking_metrics,
-        no_wandb=no_wandb,
-        ckpt_info=ckpt_info,
         csv_suffix=csv_suffix
     )
 
@@ -273,8 +349,8 @@ def evaluate_af3_docking_consistency(sample_dict: dict = None,
         preprocess_cfg: Preprocessing configuration for AF3 predictions.
         featurizer_cfg: Featurizer configuration for AF3 predictions.
         pocket_cfg: Pocket configuration for docking metrics.
-        ckpt_info: Checkpoint info (optional, for wandb logging).
-        no_wandb: If True, disable wandb logging.
+        ckpt_info: Retained for caller compatibility; no best-aggregate logging is written.
+        no_wandb: Retained for caller compatibility.
         calculate_metrics_only: If True, skip AF3 prediction and only compute metrics.
         csv_suffix: Optional suffix for CSV filenames (e.g. "_array_0" for array jobs).
     """
@@ -330,6 +406,13 @@ def evaluate_af3_docking_consistency(sample_dict: dict = None,
             reference_sample_atom_array = subsample_dict.get('reference_sample_atom_array', designed_sample_atom_array)
             if isinstance(reference_sample_atom_array, list):
                 reference_sample_atom_array = reference_sample_atom_array[dsidx]
+            binding_site_plddt_contract = _binding_site_plddt_contract(
+                subsample_dict=subsample_dict,
+                dsidx=dsidx,
+                pocket_cfg=pocket_cfg,
+                input_sample_is_designed=input_sample_is_designed,
+                fallback_reference_atom_array=reference_sample_atom_array,
+            )
             pdb_chain_info = subsample_dict['pdb_chain_info']
             tc_json_path = subsample_dict['af3_tc_json_paths'][dsidx]
 
@@ -412,6 +495,14 @@ def evaluate_af3_docking_consistency(sample_dict: dict = None,
                                 ligand_smiles=ligand_smiles,
                                 reference_ligand_pn_unit_iids=reference_ligand_pn_unit_iids,
                                 ref_sample_is_designed=input_sample_is_designed,
+                                # Annotate the docking reference pocket with the same method as
+                                # binding-site pLDDT (all_atom for native references) instead of
+                                # letting it default to calpha when two-stage forces
+                                # ref_sample_is_designed=True.
+                                reference_pocket_annotation_method=binding_site_plddt_contract.pocket_annotation_method,
+                                **binding_site_plddt_contract.to_docking_kwargs(
+                                    reference_ligand_pn_unit_iids
+                                ),
                             )
 
                         except Exception as e:
@@ -428,25 +519,11 @@ def evaluate_af3_docking_consistency(sample_dict: dict = None,
             subsample_dict.pop('designed_sample_atom_array', None)
         gc.collect()
 
-    # Aggregate best metrics per designed_sample_id (best diffusion sample)
-    designed_sample_id_best_sc_metrics = _aggregate_best_sc_metrics_per_designed_sample(designed_sample_id_to_per_pred_sc_metrics)
-    designed_sample_id_best_docking_metrics = _aggregate_best_docking_metrics_per_designed_sample(designed_sample_id_to_per_pred_docking_metrics)
-
-    # Aggregate best metrics per input_sample_id (best designed sample)
-    input_sample_id_best_sc_metrics = _aggregate_best_sc_metrics_per_input_sample(designed_sample_id_best_sc_metrics)
-    input_sample_id_best_docking_metrics = _aggregate_best_docking_metrics_per_input_sample(designed_sample_id_best_docking_metrics)
-
     # Save results with "tc_" prefix to distinguish from self-consistency (SS) results
     _save_metrics_results(
         out_dir=out_dir,
         designed_sample_id_to_per_pred_sc_metrics=designed_sample_id_to_per_pred_sc_metrics,
         designed_sample_id_to_per_pred_docking_metrics=designed_sample_id_to_per_pred_docking_metrics,
-        designed_sample_id_best_sc_metrics=designed_sample_id_best_sc_metrics,
-        designed_sample_id_best_docking_metrics=designed_sample_id_best_docking_metrics,
-        input_sample_id_best_sc_metrics=input_sample_id_best_sc_metrics,
-        input_sample_id_best_docking_metrics=input_sample_id_best_docking_metrics,
-        no_wandb=no_wandb,
-        ckpt_info=ckpt_info,
         csv_suffix=csv_suffix,
         mode_prefix="tc_"
     )
@@ -457,167 +534,34 @@ def evaluate_af3_docking_consistency(sample_dict: dict = None,
     print("="*80 + "\n")
 
 
-def _aggregate_best_sc_metrics_per_designed_sample(designed_sample_id_to_per_pred_sc_metrics: dict) -> dict:
-    """
-    Aggregate best self-consistency metrics per designed_sample_id (by max avg_ca_plddt across diffusion samples).
-
-    Returns:
-        dict: {designed_sample_id: {"input_sample_id": ..., "avg_ca_plddt": ..., "sc_ca_rmsd": ...}}
-    """
-    designed_sample_id_best_sc_metrics = {}
-    for designed_sample_id, per_pred_sc_metrics in designed_sample_id_to_per_pred_sc_metrics.items():
-        input_sample_id = per_pred_sc_metrics.get("input_sample_id")
-
-        # Filter only diffusion predictions (exclude metadata keys like "input_sample_id")
-        diffusion_preds = {k: v for k, v in per_pred_sc_metrics.items() if k.startswith("diffusion_")}
-
-        if not diffusion_preds:
-            continue
-
-        # Find the prediction with max avg_ca_plddt
-        best_pred = max(diffusion_preds.values(), key=lambda x: x["avg_ca_plddt"])
-        designed_sample_id_best_sc_metrics[designed_sample_id] = {
-            "input_sample_id": input_sample_id,
-            "avg_ca_plddt": best_pred["avg_ca_plddt"],
-            "sc_ca_rmsd": best_pred["sc_ca_rmsd"]
-        }
-    return designed_sample_id_best_sc_metrics
-
-
-_OPTIONAL_DOCKING_METRIC_FIELDS = (
-    "ligand_input_type",
-    "ligand_rmsd_mode",
-    "ligand_pn_unit_iids",
-    "reference_ligand_pn_unit_iids",
-    "reference_ligand_ccd_code",
-    "mcs_num_atoms",
-    "mcs_pred_coverage",
-    "mcs_reference_coverage",
-    "metal_num_predicted_coordinating_protein_residues",
-)
-
-
-def _copy_optional_docking_metric_fields(target: dict, source: dict) -> None:
-    for field in _OPTIONAL_DOCKING_METRIC_FIELDS:
-        if field in source:
-            target[field] = source.get(field)
-
-
-def _aggregate_best_docking_metrics_per_designed_sample(designed_sample_id_to_per_pred_docking_metrics: dict) -> dict:
-    """
-    Aggregate best docking metrics per designed_sample_id (by max ligand_plddt across diffusion samples).
-
-    Returns:
-        dict: {designed_sample_id: {"input_sample_id": ..., "ligand_rmsd": ..., ...}}
-    """
-    designed_sample_id_best_docking_metrics = {}
-    for designed_sample_id, per_pred_docking_metrics in designed_sample_id_to_per_pred_docking_metrics.items():
-        input_sample_id = per_pred_docking_metrics.get("input_sample_id")
-
-        # Filter only diffusion predictions with valid ligand_plddt
-        diffusion_preds = {
-            k: v for k, v in per_pred_docking_metrics.items()
-            if (
-                k.startswith("diffusion_")
-                and not v.get("error")
-                and "ligand_plddt" in v
-                and v["ligand_plddt"] is not None
-            )
-        }
-
-        if not diffusion_preds:
-            continue
-
-        # Find the prediction with max ligand_plddt
-        best_pred = max(diffusion_preds.values(), key=lambda x: x["ligand_plddt"])
-        best_metrics = {
-            "input_sample_id": input_sample_id,
-            "ligand_rmsd": best_pred["ligand_rmsd"],
-            "binding_site_rmsd": best_pred["binding_site_rmsd"],
-            "ligand_plddt": best_pred["ligand_plddt"],
-            "binding_site_plddt": best_pred["binding_site_plddt"],
-            "iptm": best_pred["iptm"],
-            "interface_min_pae": best_pred["interface_min_pae"],
-            "ligand_ccd_code": best_pred.get("ligand_ccd_code"),
-        }
-        _copy_optional_docking_metric_fields(best_metrics, best_pred)
-        designed_sample_id_best_docking_metrics[designed_sample_id] = best_metrics
-    return designed_sample_id_best_docking_metrics
-
-
-def _aggregate_best_sc_metrics_per_input_sample(designed_sample_id_best_sc_metrics: dict) -> dict:
-    """
-    Aggregate best self-consistency metrics per input_sample_id (by max avg_ca_plddt across designed samples).
-
-    Returns:
-        dict: {input_sample_id: {"best_designed_sample_id": ..., "avg_ca_plddt": ..., "sc_ca_rmsd": ...}}
-    """
-    # Group by input_sample_id
-    input_sample_id_to_designed_samples = defaultdict(list)
-    for designed_sample_id, metrics in designed_sample_id_best_sc_metrics.items():
-        input_sample_id = metrics["input_sample_id"]
-        input_sample_id_to_designed_samples[input_sample_id].append((designed_sample_id, metrics))
-
-    # Find best designed_sample_id per input_sample_id
-    input_sample_id_best_sc_metrics = {}
-    for input_sample_id, designed_samples in input_sample_id_to_designed_samples.items():
-        best_designed_sample_id, best_metrics = max(designed_samples, key=lambda x: x[1]["avg_ca_plddt"])
-        input_sample_id_best_sc_metrics[input_sample_id] = {
-            "best_designed_sample_id": best_designed_sample_id,
-            "avg_ca_plddt": best_metrics["avg_ca_plddt"],
-            "sc_ca_rmsd": best_metrics["sc_ca_rmsd"]
-        }
-    return input_sample_id_best_sc_metrics
-
-
-def _aggregate_best_docking_metrics_per_input_sample(designed_sample_id_best_docking_metrics: dict) -> dict:
-    """
-    Aggregate best docking metrics per input_sample_id (by max ligand_plddt across designed samples).
-
-    Returns:
-        dict: {input_sample_id: {"best_designed_sample_id": ..., "ligand_rmsd": ..., ...}}
-    """
-    # Group by input_sample_id
-    input_sample_id_to_designed_samples = defaultdict(list)
-    for designed_sample_id, metrics in designed_sample_id_best_docking_metrics.items():
-        input_sample_id = metrics["input_sample_id"]
-        input_sample_id_to_designed_samples[input_sample_id].append((designed_sample_id, metrics))
-
-    # Find best designed_sample_id per input_sample_id
-    input_sample_id_best_docking_metrics = {}
-    for input_sample_id, designed_samples in input_sample_id_to_designed_samples.items():
-        best_designed_sample_id, best_metrics = max(designed_samples, key=lambda x: x[1]["ligand_plddt"])
-        best_input_metrics = {
-            "best_designed_sample_id": best_designed_sample_id,
-            "ligand_rmsd": best_metrics["ligand_rmsd"],
-            "binding_site_rmsd": best_metrics["binding_site_rmsd"],
-            "ligand_plddt": best_metrics["ligand_plddt"],
-            "binding_site_plddt": best_metrics["binding_site_plddt"],
-            "iptm": best_metrics["iptm"],
-            "interface_min_pae": best_metrics["interface_min_pae"],
-            "ligand_ccd_code": best_metrics.get("ligand_ccd_code"),
-        }
-        _copy_optional_docking_metric_fields(best_input_metrics, best_metrics)
-        input_sample_id_best_docking_metrics[input_sample_id] = best_input_metrics
-    return input_sample_id_best_docking_metrics
+def _flatten_per_prediction_metrics(per_designed_sample_metrics: dict) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for designed_sample_id, metrics in per_designed_sample_metrics.items():
+        input_sample_id = metrics.get("input_sample_id")
+        for prediction_id, prediction_metrics in metrics.items():
+            if not str(prediction_id).startswith("diffusion_"):
+                continue
+            if not isinstance(prediction_metrics, dict):
+                continue
+            rows.append({
+                "designed_sample_id": designed_sample_id,
+                "input_sample_id": input_sample_id,
+                "prediction_id": prediction_id,
+                **prediction_metrics,
+            })
+    return rows
 
 
 def _save_metrics_results(out_dir: Path = None,
                           designed_sample_id_to_per_pred_sc_metrics: dict = None,
                           designed_sample_id_to_per_pred_docking_metrics: dict = None,
-                          designed_sample_id_best_sc_metrics: dict = None,
-                          designed_sample_id_best_docking_metrics: dict = None,
-                          input_sample_id_best_sc_metrics: dict = None,
-                          input_sample_id_best_docking_metrics: dict = None,
-                          no_wandb: bool = False,
-                          ckpt_info: dict = None,
                           csv_suffix: str = "",
                           mode_prefix: str = "") -> None:
-    """Save metrics results to CSV and log to wandb.
+    """Save per-designed-sample and per-prediction metrics to CSV.
 
     Args:
         csv_suffix: Optional suffix for CSV filenames (e.g. "_array_0" for array jobs).
-        mode_prefix: Optional prefix for CSV filenames and wandb keys to distinguish
+        mode_prefix: Optional prefix for CSV filenames to distinguish
                      between SS and TC results (e.g. "tc_" for template-conditioned).
     """
 
@@ -630,66 +574,9 @@ def _save_metrics_results(out_dir: Path = None,
     all_docking_metrics_df = pd.DataFrame.from_dict(designed_sample_id_to_per_pred_docking_metrics, orient='index')
     all_docking_metrics_df = all_docking_metrics_df.reset_index().rename(columns={'index': 'designed_sample_id'})
     all_docking_metrics_df.to_csv(Path(out_dir, f"{mode_prefix}all_docking_metrics_per_designed_sample{csv_suffix}.csv"), index=False)
-
-    # Best self-consistency metrics per designed_sample_id (best diffusion sample)
-    best_sc_per_designed_df = pd.DataFrame.from_dict(designed_sample_id_best_sc_metrics, orient='index')
-    best_sc_per_designed_df = best_sc_per_designed_df.reset_index().rename(columns={'index': 'designed_sample_id'})
-    best_sc_per_designed_df.to_csv(Path(out_dir, f"{mode_prefix}best_sc_metrics_per_designed_sample{csv_suffix}.csv"), index=False)
-
-    # Best docking metrics per designed_sample_id (best diffusion sample)
-    best_docking_per_designed_df = pd.DataFrame.from_dict(designed_sample_id_best_docking_metrics, orient='index')
-    best_docking_per_designed_df = best_docking_per_designed_df.reset_index().rename(columns={'index': 'designed_sample_id'})
-    best_docking_per_designed_df.to_csv(Path(out_dir, f"{mode_prefix}best_docking_metrics_per_designed_sample{csv_suffix}.csv"), index=False)
-
-    # Best self-consistency metrics per input_sample_id (best designed sample)
-    best_sc_per_input_df = pd.DataFrame.from_dict(input_sample_id_best_sc_metrics, orient='index')
-    best_sc_per_input_df = best_sc_per_input_df.reset_index().rename(columns={'index': 'input_sample_id'})
-    best_sc_per_input_df.to_csv(Path(out_dir, f"{mode_prefix}best_sc_metrics_per_input_sample{csv_suffix}.csv"), index=False)
-
-    # Best docking metrics per input_sample_id (best designed sample)
-    best_docking_per_input_df = pd.DataFrame.from_dict(input_sample_id_best_docking_metrics, orient='index')
-    best_docking_per_input_df = best_docking_per_input_df.reset_index().rename(columns={'index': 'input_sample_id'})
-    best_docking_per_input_df.to_csv(Path(out_dir, f"{mode_prefix}best_docking_metrics_per_input_sample{csv_suffix}.csv"), index=False)
-
-    # Log summary metrics to wandb (using input_sample_id level for final reporting)
-    if input_sample_id_best_sc_metrics:
-        best_sc_ca_rmsds = [m["sc_ca_rmsd"] for m in input_sample_id_best_sc_metrics.values()]
-        best_avg_ca_plddts = [m["avg_ca_plddt"] for m in input_sample_id_best_sc_metrics.values()]
-
-        wandb_metrics = {
-            f"eval/median/{mode_prefix}sc_ca_rmsd": np.median(best_sc_ca_rmsds),
-            f"eval/median/{mode_prefix}avg_ca_plddt": np.median(best_avg_ca_plddts),
-        }
-
-        if ckpt_info:
-            wandb_metrics["trainer/global_step"] = ckpt_info["global_step"]
-            wandb_metrics["trainer/epoch"] = ckpt_info["epoch"]
-
-        if not no_wandb:
-            wandb.log(wandb_metrics, commit=True)
-            print(f"Logged metrics to wandb: {wandb_metrics}")
-
-    if input_sample_id_best_docking_metrics:
-        best_ligand_rmsd = [m["ligand_rmsd"] for m in input_sample_id_best_docking_metrics.values() if m["ligand_rmsd"] is not None]
-        best_binding_site_rmsd = [m["binding_site_rmsd"] for m in input_sample_id_best_docking_metrics.values() if m["binding_site_rmsd"] is not None]
-        best_ligand_plddt = [m["ligand_plddt"] for m in input_sample_id_best_docking_metrics.values() if m["ligand_plddt"] is not None]
-        best_binding_site_plddt = [m["binding_site_plddt"] for m in input_sample_id_best_docking_metrics.values() if m["binding_site_plddt"] is not None]
-        best_iptm = [m["iptm"] for m in input_sample_id_best_docking_metrics.values() if m["iptm"] is not None]
-        best_interface_min_pae = [m["interface_min_pae"] for m in input_sample_id_best_docking_metrics.values() if m["interface_min_pae"] is not None]
-
-        wandb_metrics = {
-            f"eval/median/{mode_prefix}ligand_rmsd": np.median(best_ligand_rmsd) if best_ligand_rmsd else None,
-            f"eval/median/{mode_prefix}binding_site_rmsd": np.median(best_binding_site_rmsd) if best_binding_site_rmsd else None,
-            f"eval/median/{mode_prefix}ligand_plddt": np.median(best_ligand_plddt) if best_ligand_plddt else None,
-            f"eval/median/{mode_prefix}binding_site_plddt": np.median(best_binding_site_plddt) if best_binding_site_plddt else None,
-            f"eval/median/{mode_prefix}iptm": np.median(best_iptm) if best_iptm else None,
-            f"eval/median/{mode_prefix}interface_min_pae": np.median(best_interface_min_pae) if best_interface_min_pae else None,
-        }
-
-        if ckpt_info:
-            wandb_metrics["trainer/global_step"] = ckpt_info["global_step"]
-            wandb_metrics["trainer/epoch"] = ckpt_info["epoch"]
-
-        if not no_wandb:
-            wandb.log(wandb_metrics, commit=True)
-            print(f"Logged metrics to wandb: {wandb_metrics}")
+    pd.DataFrame(
+        _flatten_per_prediction_metrics(designed_sample_id_to_per_pred_docking_metrics)
+    ).to_csv(
+        Path(out_dir, f"{mode_prefix}all_docking_metrics_per_prediction{csv_suffix}.csv"),
+        index=False,
+    )
