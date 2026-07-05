@@ -143,6 +143,84 @@ def _annotate_sequence_recovery_pocket(
     )
 
 
+def _shared_residue_key_annotation(
+    input_atom_array: AtomArray,
+    designed_atom_array: AtomArray,
+) -> str:
+    input_annotations = set(input_atom_array.get_annotation_categories())
+    designed_annotations = set(designed_atom_array.get_annotation_categories())
+    if "pn_unit_iid" in input_annotations and "pn_unit_iid" in designed_annotations:
+        input_values = np.asarray(input_atom_array.get_annotation("pn_unit_iid")).astype(str)
+        designed_values = np.asarray(designed_atom_array.get_annotation("pn_unit_iid")).astype(str)
+        if np.any(input_values != "") and np.any(designed_values != ""):
+            return "pn_unit_iid"
+    return "chain_id"
+
+
+def _ins_codes(atom_array: AtomArray) -> np.ndarray:
+    if "ins_code" in atom_array.get_annotation_categories():
+        return np.asarray(atom_array.get_annotation("ins_code")).astype(str)
+    return np.full(len(atom_array), "", dtype=object)
+
+
+def _ca_residue_lookup(
+    atom_array: AtomArray,
+    ca_mask: np.ndarray,
+    *,
+    key_annotation: str,
+) -> dict[tuple[str, int, str], str]:
+    lookup: dict[tuple[str, int, str], str] = {}
+    chain_values = np.asarray(atom_array.get_annotation(key_annotation)).astype(str)
+    ins_codes = _ins_codes(atom_array)
+    ca_indices = np.where(ca_mask)[0]
+    for idx in ca_indices:
+        key = (
+            str(chain_values[idx]),
+            int(atom_array.res_id[idx]),
+            str(ins_codes[idx]),
+        )
+        if key in lookup:
+            raise ValueError(
+                "Duplicate CA residue key in sequence recovery atom array: "
+                f"{key_annotation}={key[0]}, res_id={key[1]}, ins_code={key[2]!r}"
+            )
+        lookup[key] = str(atom_array.res_name[idx])
+    return lookup
+
+
+def _ca_residue_keys(
+    atom_array: AtomArray,
+    ca_mask: np.ndarray,
+    *,
+    key_annotation: str,
+) -> list[tuple[str, int, str]]:
+    chain_values = np.asarray(atom_array.get_annotation(key_annotation)).astype(str)
+    ins_codes = _ins_codes(atom_array)
+    return [
+        (
+            str(chain_values[idx]),
+            int(atom_array.res_id[idx]),
+            str(ins_codes[idx]),
+        )
+        for idx in np.where(ca_mask)[0]
+    ]
+
+
+def _recovery_ratio_for_keys(
+    native_lookup: dict[tuple[str, int, str], str],
+    designed_lookup: dict[tuple[str, int, str], str],
+    native_keys: Sequence[tuple[str, int, str]],
+) -> tuple[float, int]:
+    if len(native_keys) == 0:
+        return float("nan"), 0
+    matched = [
+        designed_lookup.get(key) == native_lookup[key]
+        for key in native_keys
+    ]
+    n_missing = sum(key not in designed_lookup for key in native_keys)
+    return float(np.mean(matched)), int(n_missing)
+
+
 def calculate_sequence_recovery(input_atom_array: AtomArray, designed_atom_array: AtomArray,
                                 pocket_distances_for_seq_recovery: Sequence[float] | None = None,
                                 pocket_distance_bins: Sequence[tuple[float, float]] | None = None,
@@ -159,14 +237,32 @@ def calculate_sequence_recovery(input_atom_array: AtomArray, designed_atom_array
     input_valid_residue_mask = get_valid_standard_aa_residue_mask(input_atom_array)
 
     input_seq_mask = input_valid_residue_mask & (input_atom_array.atom_name == "CA")
-    input_res_ids = input_atom_array[input_seq_mask].res_id
-    input_res_names = input_atom_array[input_seq_mask].res_name
-
     designed_valid_residue_mask = get_valid_standard_aa_residue_mask(designed_atom_array)
-    designed_seq_mask = designed_valid_residue_mask & np.isin(designed_atom_array.res_id, input_res_ids) & (designed_atom_array.atom_name == "CA")
-    designed_res_names = designed_atom_array[designed_seq_mask].res_name
+    designed_seq_mask = designed_valid_residue_mask & (designed_atom_array.atom_name == "CA")
 
-    seq_recovery_metrics["seq_recovery_ratio"] = (input_res_names == designed_res_names).mean()
+    key_annotation = _shared_residue_key_annotation(input_atom_array, designed_atom_array)
+    input_lookup = _ca_residue_lookup(
+        input_atom_array,
+        input_seq_mask,
+        key_annotation=key_annotation,
+    )
+    designed_lookup = _ca_residue_lookup(
+        designed_atom_array,
+        designed_seq_mask,
+        key_annotation=key_annotation,
+    )
+    input_keys = list(input_lookup.keys())
+    seq_recovery_ratio, n_missing_designed = _recovery_ratio_for_keys(
+        input_lookup,
+        designed_lookup,
+        input_keys,
+    )
+    seq_recovery_metrics["seq_recovery_ratio"] = seq_recovery_ratio
+    seq_recovery_metrics["seq_recovery_n_residues"] = int(len(input_keys))
+    seq_recovery_metrics["seq_recovery_n_missing_designed"] = n_missing_designed
+    seq_recovery_metrics["seq_recovery_n_extra_designed"] = int(
+        len(set(designed_lookup) - set(input_lookup))
+    )
 
     edge_to_residue_mask: dict[float, np.ndarray] = {}
 
@@ -185,15 +281,20 @@ def calculate_sequence_recovery(input_atom_array: AtomArray, designed_atom_array
         )
         edge_to_residue_mask[float(pocket_distance)] = input_pocket_residue_mask
         input_pocket_seq_mask = input_seq_mask & input_pocket_residue_mask
+        input_pocket_keys = _ca_residue_keys(
+            input_atom_array,
+            input_pocket_seq_mask,
+            key_annotation=key_annotation,
+        )
+        pocket_ratio, pocket_missing = _recovery_ratio_for_keys(
+            input_lookup,
+            designed_lookup,
+            input_pocket_keys,
+        )
 
-        input_pocket_res_ids = input_atom_array[input_pocket_seq_mask].res_id
-        input_pocket_res_names = input_atom_array[input_pocket_seq_mask].res_name
-
-        designed_pocket_seq_mask = np.isin(designed_atom_array.res_id, input_pocket_res_ids) & (designed_atom_array.atom_name == "CA")
-        designed_pocket_res_names = designed_atom_array[designed_pocket_seq_mask].res_name
-
-        seq_recovery_metrics[f"pocket_recovery_ratio_{pocket_distance}"] = (input_pocket_res_names == designed_pocket_res_names).mean()
-        seq_recovery_metrics[f"pocket_n_residues_{pocket_distance}"] = int(len(input_pocket_res_names))
+        seq_recovery_metrics[f"pocket_recovery_ratio_{pocket_distance}"] = pocket_ratio
+        seq_recovery_metrics[f"pocket_n_residues_{pocket_distance}"] = int(len(input_pocket_keys))
+        seq_recovery_metrics[f"pocket_n_missing_designed_{pocket_distance}"] = pocket_missing
 
     if pocket_distance_bins:
         for lo, hi in pocket_distance_bins:
@@ -222,81 +323,36 @@ def calculate_sequence_recovery(input_atom_array: AtomArray, designed_atom_array
                 bin_residue_mask = edge_to_residue_mask[hi_f] & ~edge_to_residue_mask[lo_f]
 
             input_bin_seq_mask = input_seq_mask & bin_residue_mask
-            input_bin_res_ids = input_atom_array[input_bin_seq_mask].res_id
-            input_bin_res_names = input_atom_array[input_bin_seq_mask].res_name
-
-            designed_bin_seq_mask = np.isin(designed_atom_array.res_id, input_bin_res_ids) & (designed_atom_array.atom_name == "CA")
-            designed_bin_res_names = designed_atom_array[designed_bin_seq_mask].res_name
+            input_bin_keys = _ca_residue_keys(
+                input_atom_array,
+                input_bin_seq_mask,
+                key_annotation=key_annotation,
+            )
 
             key = f"pocket_recovery_bin_{lo_f}_to_{hi_f}"
             n_key = f"pocket_n_residues_bin_{lo_f}_to_{hi_f}"
-            if len(input_bin_res_names) == 0:
-                seq_recovery_metrics[key] = float("nan")
-            else:
-                seq_recovery_metrics[key] = float((input_bin_res_names == designed_bin_res_names).mean())
-            seq_recovery_metrics[n_key] = int(len(input_bin_res_names))
+            missing_key = f"pocket_n_missing_designed_bin_{lo_f}_to_{hi_f}"
+            bin_ratio, bin_missing = _recovery_ratio_for_keys(
+                input_lookup,
+                designed_lookup,
+                input_bin_keys,
+            )
+            seq_recovery_metrics[key] = bin_ratio
+            seq_recovery_metrics[n_key] = int(len(input_bin_keys))
+            seq_recovery_metrics[missing_key] = bin_missing
 
     return seq_recovery_metrics
 
 
 def _compute_recovery(native_aa, designed_aa, pocket_distances):
-    """Compute sequence recovery matching by (chain_id, res_id)."""
-    metrics = {}
-
-    # Valid standard AA CA atoms
-    n_mask = get_valid_standard_aa_residue_mask(native_aa) & (native_aa.atom_name == "CA")
-    d_mask = get_valid_standard_aa_residue_mask(designed_aa) & (designed_aa.atom_name == "CA")
-    n_ca = native_aa[n_mask]
-    d_ca = designed_aa[d_mask]
-
-    # Native lookup: (chain_id, res_id) → res_name
-    native_lookup = {
-        (n_ca.chain_id[i], int(n_ca.res_id[i])): n_ca.res_name[i]
-        for i in range(len(n_ca))
-    }
-
-    # Overall sequence recovery
-    matched = []
-    for i in range(len(d_ca)):
-        key = (d_ca.chain_id[i], int(d_ca.res_id[i]))
-        if key in native_lookup:
-            matched.append(native_lookup[key] == d_ca.res_name[i])
-    metrics["seq_recovery_ratio"] = float(np.mean(matched)) if matched else 0.0
-
-    # Pocket recovery at each distance
-    receptor_pn_unit_iids = list(np.unique(designed_aa[designed_aa.is_polymer].pn_unit_iid))
-    ligand_pn_unit_iids = list(np.unique(designed_aa[~designed_aa.is_polymer].pn_unit_iid))
-
-    for pocket_distance in pocket_distances:
-        native_aa = _annotate_sequence_recovery_pocket(
-            native_aa,
-            pocket_distance=pocket_distance,
-            annotation_name=f"is_ligand_pocket_{pocket_distance}",
-            n_min_ligand_atoms=5,
-            pocket_annotation_method="all_atom",
-            receptor_pn_unit_iids=receptor_pn_unit_iids,
-            ligand_pn_unit_iids=ligand_pn_unit_iids,
-        )
-        pocket_residue_mask = apply_and_spread_residue_wise(
-            native_aa, native_aa.get_annotation(f"is_ligand_pocket_{pocket_distance}"), function=np.any,
-        )
-        pocket_ca_mask = n_mask & pocket_residue_mask
-        pocket_ca = native_aa[pocket_ca_mask]
-
-        # Pocket native lookup
-        pocket_lookup = {
-            (pocket_ca.chain_id[i], int(pocket_ca.res_id[i])): pocket_ca.res_name[i]
-            for i in range(len(pocket_ca))
-        }
-
-        pocket_matched = []
-        for i in range(len(d_ca)):
-            key = (d_ca.chain_id[i], int(d_ca.res_id[i]))
-            if key in pocket_lookup:
-                pocket_matched.append(pocket_lookup[key] == d_ca.res_name[i])
-        metrics[f"pocket_recovery_ratio_{pocket_distance}"] = float(np.mean(pocket_matched)) if pocket_matched else float("nan")
-
-    return metrics
+    """Compute sequence recovery with the runtime chain-aware metric contract."""
+    return calculate_sequence_recovery(
+        native_aa,
+        designed_aa,
+        pocket_distances_for_seq_recovery=pocket_distances,
+        n_min_ligand_atoms=5,
+        pocket_annotation_method="all_atom",
+    )
 
 
 def calculate_sequence_recovery_from_folders(
