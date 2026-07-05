@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 from functools import lru_cache
@@ -82,6 +83,33 @@ def _resolve_max_template_date(mode_config: dict | DictConfig | None) -> str:
     if value is None:
         return DEFAULT_AF3_MAX_TEMPLATE_DATE
     return str(value)
+
+
+def _af3_overwrite_enabled(mode_config: dict | DictConfig | None) -> bool:
+    return config_value_as_bool(get_config_value(mode_config, "overwrite", False))
+
+
+def _prepare_af3_sample_dir(
+    *,
+    json_path: str,
+    out_dir: str,
+    mode_config: dict | DictConfig | None,
+) -> bool:
+    """Return True when an existing prediction should be reused."""
+    sample_name = Path(json_path).stem
+    sample_dir = Path(out_dir) / sample_name
+    overwrite = _af3_overwrite_enabled(mode_config)
+
+    sample_cif_files = list(sample_dir.rglob("*.cif")) if sample_dir.exists() else []
+    if sample_cif_files and not overwrite:
+        print(f"AF3 prediction already exists for {sample_name}")
+        return True
+
+    if overwrite and sample_dir.exists():
+        print(f"Overwriting AF3 prediction for {sample_name}: removing {sample_dir}")
+        shutil.rmtree(sample_dir)
+
+    return False
 
 
 def _load_af3_runner(runner_path: str):
@@ -241,10 +269,12 @@ def _run_af3_inprocess(
     import pathlib
     from alphafold3.common import folding_input
 
-    sample_dir = Path(out_dir) / Path(json_path).stem
-    sample_cif_files = list(sample_dir.rglob("*.cif"))
-    if sample_cif_files:
-        print(f"AF3 prediction already exists for {Path(json_path).stem}")
+    mode_config = inference_config.get(mode, {})
+    if _prepare_af3_sample_dir(
+        json_path=json_path,
+        out_dir=out_dir,
+        mode_config=mode_config,
+    ):
         return
 
     runner, model_runner, data_pipeline_config = _get_af3_model_runner_and_config(
@@ -253,7 +283,6 @@ def _run_af3_inprocess(
         mode=mode,
     )
 
-    mode_config = inference_config.get(mode, {})
     fold_inputs = folding_input.load_fold_inputs_from_path(pathlib.Path(json_path))
 
     for fold_input_item in fold_inputs:
@@ -297,14 +326,15 @@ def run_af3_single_sequence(
     use_subprocess: bool = False,
 ) -> None:
     """Run AF3 single-sequence inference."""
+    ss_config = inference_config.ss
     if use_subprocess:
-        sample_dir = out_dir + "/" + Path(json_path).stem
-        sample_cif_files = list(Path(sample_dir).rglob("*.cif"))
-        if sample_cif_files:
-            print(f"AF3 prediction already exists for {Path(json_path).stem}")
+        if _prepare_af3_sample_dir(
+            json_path=json_path,
+            out_dir=out_dir,
+            mode_config=ss_config,
+        ):
             return
 
-        ss_config = inference_config.ss
         cmd = [
             sys.executable,
             runner_path,
@@ -322,6 +352,8 @@ def run_af3_single_sequence(
             f"--ligand_protein_template_conditioning_mode={ss_config.get('ligand_protein_template_conditioning_mode', 0)}",
             f"--template_pair_scale={ss_config.get('template_pair_scale', 1.0)}",
         ]
+        if _af3_overwrite_enabled(ss_config):
+            cmd.append("--force_output_dir=True")
         if _json_needs_fix_standalone_glycans(json_path, ss_config):
             cmd.append("--fix_standalone_glycans=True")
         env = os.environ.copy()
@@ -345,14 +377,15 @@ def run_af3_template_conditioned(
     use_subprocess: bool = False,
 ) -> None:
     """Run AF3 template-conditioned inference."""
+    tc_config = inference_config.tc
     if use_subprocess:
-        sample_dir = out_dir + "/" + Path(json_path).stem
-        sample_cif_files = list(Path(sample_dir).rglob("*.cif"))
-        if sample_cif_files:
-            print(f"AF3 prediction already exists for {Path(json_path).stem}")
+        if _prepare_af3_sample_dir(
+            json_path=json_path,
+            out_dir=out_dir,
+            mode_config=tc_config,
+        ):
             return
 
-        tc_config = inference_config.tc
         cmd = [
             sys.executable,
             runner_path,
@@ -372,6 +405,8 @@ def run_af3_template_conditioned(
             f"--template_pair_scale={tc_config.get('template_pair_scale', 1.0)}",
             f"--max_template_date={_resolve_max_template_date(tc_config)}",
         ]
+        if _af3_overwrite_enabled(tc_config):
+            cmd.append("--force_output_dir=True")
         if _json_needs_fix_standalone_glycans(json_path, tc_config):
             cmd.append("--fix_standalone_glycans=True")
         env = os.environ.copy()
