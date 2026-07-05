@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -75,6 +76,74 @@ def _json_needs_fix_standalone_glycans(json_path: str | Path, mode_config: dict 
         _fold_input_has_glycan_ligand(fold_input)
         for fold_input in folding_input.load_fold_inputs_from_path(Path(json_path))
     )
+
+
+def expected_prediction_count_from_json(
+    json_path: str | Path,
+    inference_config: dict | DictConfig | None,
+    mode: str,
+) -> int:
+    """Return expected AF3 model CIF count for one generated JSON input."""
+    mode_config = get_config_value(inference_config, mode, {})
+    num_diffusion_samples = int(get_config_value(mode_config, "num_diffusion_samples", 5))
+    with open(json_path) as handle:
+        raw_jobs = json.load(handle)
+    if isinstance(raw_jobs, dict):
+        jobs = [raw_jobs]
+    else:
+        jobs = list(raw_jobs)
+    expected = 0
+    for job in jobs:
+        model_seeds = job.get("modelSeeds") or [42]
+        expected += len(model_seeds) * num_diffusion_samples
+    return expected
+
+
+def summarize_af3_prediction_outputs(
+    out_dir: str | Path,
+    job_name: str,
+    expected_count: int | None = None,
+) -> dict[str, object]:
+    """Summarize valid and malformed AF3 prediction outputs for a job."""
+    prediction_dir = Path(out_dir, job_name)
+    sample_dirs: list[Path] = []
+    model_cif_paths: list[Path] = []
+    malformed_sample_dirs: list[Path] = []
+    if prediction_dir.exists():
+        for path in sorted(prediction_dir.iterdir()):
+            if not path.is_dir():
+                continue
+            model_cifs = sorted(p for p in path.glob("*.cif") if p.stem.endswith("model"))
+            if not model_cifs:
+                malformed_sample_dirs.append(path)
+                continue
+            sample_dirs.append(path)
+            model_cif_paths.append(model_cifs[0])
+    n_found = len(model_cif_paths)
+    complete = expected_count is not None and n_found >= expected_count
+    return {
+        "prediction_dir": prediction_dir,
+        "sample_dirs": sample_dirs,
+        "model_cif_paths": model_cif_paths,
+        "malformed_sample_dirs": malformed_sample_dirs,
+        "n_expected": expected_count,
+        "n_found": n_found,
+        "n_malformed": len(malformed_sample_dirs),
+        "complete": complete,
+    }
+
+
+def _af3_prediction_outputs_complete(
+    out_dir: str | Path,
+    job_name: str,
+    expected_count: int,
+) -> bool:
+    summary = summarize_af3_prediction_outputs(
+        out_dir=out_dir,
+        job_name=job_name,
+        expected_count=expected_count,
+    )
+    return bool(summary["complete"])
 
 
 def _resolve_max_template_date(mode_config: dict | DictConfig | None) -> str:
@@ -241,9 +310,8 @@ def _run_af3_inprocess(
     import pathlib
     from alphafold3.common import folding_input
 
-    sample_dir = Path(out_dir) / Path(json_path).stem
-    sample_cif_files = list(sample_dir.rglob("*.cif"))
-    if sample_cif_files:
+    expected_count = expected_prediction_count_from_json(json_path, inference_config, mode)
+    if _af3_prediction_outputs_complete(out_dir, Path(json_path).stem, expected_count):
         print(f"AF3 prediction already exists for {Path(json_path).stem}")
         return
 
@@ -298,9 +366,8 @@ def run_af3_single_sequence(
 ) -> None:
     """Run AF3 single-sequence inference."""
     if use_subprocess:
-        sample_dir = out_dir + "/" + Path(json_path).stem
-        sample_cif_files = list(Path(sample_dir).rglob("*.cif"))
-        if sample_cif_files:
+        expected_count = expected_prediction_count_from_json(json_path, inference_config, "ss")
+        if _af3_prediction_outputs_complete(out_dir, Path(json_path).stem, expected_count):
             print(f"AF3 prediction already exists for {Path(json_path).stem}")
             return
 
@@ -346,9 +413,8 @@ def run_af3_template_conditioned(
 ) -> None:
     """Run AF3 template-conditioned inference."""
     if use_subprocess:
-        sample_dir = out_dir + "/" + Path(json_path).stem
-        sample_cif_files = list(Path(sample_dir).rglob("*.cif"))
-        if sample_cif_files:
+        expected_count = expected_prediction_count_from_json(json_path, inference_config, "tc")
+        if _af3_prediction_outputs_complete(out_dir, Path(json_path).stem, expected_count):
             print(f"AF3 prediction already exists for {Path(json_path).stem}")
             return
 
@@ -397,10 +463,14 @@ def find_pred_sample_path_af3(
     sample_cif_paths = []
     if not prediction_dir.exists():
         return sample_dirs, sample_cif_paths
-    for path in prediction_dir.iterdir():
+    for path in sorted(prediction_dir.iterdir()):
         if path.is_dir():
+            model_cifs = sorted(p for p in path.glob("*.cif") if p.stem.endswith("model"))
+            if not model_cifs:
+                print(f"Warning: AF3 prediction sample directory has no model CIF: {path}")
+                continue
             sample_dirs.append(path)
-            cif_path = [p for p in path.glob("*.cif") if p.stem.endswith("model")][0]
+            cif_path = model_cifs[0]
             sample_cif_paths.append(cif_path)
 
     return sample_dirs, sample_cif_paths

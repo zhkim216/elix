@@ -289,6 +289,7 @@ WANDB__SERVICE_WAIT=300 python3 allatom_design/eval/sampling/run_elix.py \
     struct_pred_cfg.evaluate_self_consistency=true \
     struct_pred_cfg.evaluate_docking_consistency=false \
     struct_pred_cfg.calculate_metrics_only=false \
+    struct_pred_cfg.af3.require_complete_predictions=true \
     struct_pred_cfg.af3.runner_path="${BASE_DIR}/alphafold3/src/alphafold3/run_alphafold.py" \
     struct_pred_cfg.af3.inference_config.base.flash_attention_implementation=${FLASH_ATTN_IMPL} \
     struct_pred_cfg.af3.inference_config.ss.num_recycles=${AF3_RECYCLES} \

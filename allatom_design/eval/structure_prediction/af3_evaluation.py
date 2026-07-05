@@ -8,11 +8,13 @@ import pandas as pd
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
+from allatom_design.eval.config import config_value_as_bool
 from allatom_design.eval.structure_prediction.af3_json import make_af3_json
 from allatom_design.eval.structure_prediction.af3_runner import (
-    find_pred_sample_path_af3,
+    expected_prediction_count_from_json,
     run_af3_single_sequence,
     run_af3_template_conditioned,
+    summarize_af3_prediction_outputs,
 )
 from allatom_design.eval.metrics.sequence_recovery import build_sequence_recovery_metric_config
 
@@ -56,6 +58,100 @@ def _select_indexed_or_scalar(value: Any, idx: int) -> Any:
     if isinstance(value, list):
         return value[idx] if idx < len(value) else None
     return value
+
+
+def _require_complete_af3_predictions(struct_pred_cfg: DictConfig | dict | None) -> bool:
+    if struct_pred_cfg is None:
+        return False
+    selectable_cfg = (
+        struct_pred_cfg
+        if isinstance(struct_pred_cfg, DictConfig)
+        else OmegaConf.create(struct_pred_cfg)
+    )
+    value = OmegaConf.select(
+        selectable_cfg,
+        "af3.require_complete_predictions",
+        default=False,
+    )
+    return config_value_as_bool(value)
+
+
+def _new_prediction_status_row(
+    *,
+    input_sample_id: str,
+    designed_sample_id: str,
+    mode: str,
+    n_expected_predictions: int,
+) -> dict[str, Any]:
+    return {
+        "input_sample_id": input_sample_id,
+        "designed_sample_id": designed_sample_id,
+        "mode": mode,
+        "n_expected_predictions": int(n_expected_predictions),
+        "n_found_predictions": 0,
+        "n_malformed_prediction_dirs": 0,
+        "n_sc_success": 0,
+        "n_docking_success": 0,
+        "af3_status": "pending",
+        "af3_error": "",
+        "sc_errors": "",
+        "docking_errors": "",
+        "malformed_prediction_dirs": "",
+    }
+
+
+def _append_status_error(row: dict[str, Any], key: str, message: str) -> None:
+    if row[key]:
+        row[key] = f"{row[key]} | {message}"
+    else:
+        row[key] = message
+
+
+def _record_prediction_summary(row: dict[str, Any], summary: dict[str, object]) -> None:
+    malformed_dirs = summary.get("malformed_sample_dirs", [])
+    row["n_found_predictions"] = int(summary["n_found"])
+    row["n_malformed_prediction_dirs"] = int(summary["n_malformed"])
+    row["malformed_prediction_dirs"] = ";".join(str(path) for path in malformed_dirs)
+
+
+def _finalize_prediction_status(row: dict[str, Any], *, has_ligand: bool) -> None:
+    if row["af3_status"] == "af3_failed":
+        return
+    n_expected = int(row["n_expected_predictions"])
+    n_found = int(row["n_found_predictions"])
+    n_sc_success = int(row["n_sc_success"])
+    n_docking_success = int(row["n_docking_success"])
+    if n_found == 0:
+        row["af3_status"] = "missing_predictions"
+    elif n_found < n_expected:
+        row["af3_status"] = "incomplete_predictions"
+    elif n_sc_success < n_found:
+        row["af3_status"] = "metric_failed"
+    elif has_ligand and n_docking_success < n_found:
+        row["af3_status"] = "metric_failed"
+    else:
+        row["af3_status"] = "complete"
+
+
+def _raise_if_required_predictions_incomplete(
+    *,
+    status_rows: list[dict[str, Any]],
+    require_complete_predictions: bool,
+    mode_label: str,
+) -> None:
+    if not require_complete_predictions:
+        return
+    failed_rows = [row for row in status_rows if row["af3_status"] != "complete"]
+    if not failed_rows:
+        return
+    examples = ", ".join(
+        f"{row['designed_sample_id']}:{row['af3_status']}"
+        for row in failed_rows[:5]
+    )
+    raise RuntimeError(
+        f"{mode_label} AF3 evaluation had {len(failed_rows)} incomplete/failed "
+        f"designed samples; first examples: {examples}"
+    )
 
 
 @dataclass(frozen=True)
@@ -178,9 +274,11 @@ def evaluate_af3_self_consistency(sample_dict: dict = None,
     # Run AF3 self-consistency and docking evaluation
     af3_runner_path = struct_pred_cfg.af3.runner_path
     af3_inference_config = struct_pred_cfg.af3.inference_config
+    require_complete_predictions = _require_complete_af3_predictions(struct_pred_cfg)
 
     designed_sample_id_to_per_pred_sc_metrics = {}
     designed_sample_id_to_per_pred_docking_metrics = {}
+    prediction_status_rows: list[dict[str, Any]] = []
 
     print("\n" + "="*80)
     print("Running AF3 Self-Consistency Evaluation")
@@ -207,6 +305,18 @@ def evaluate_af3_self_consistency(sample_dict: dict = None,
             )
             pdb_chain_info = subsample_dict['pdb_chain_info']
             ss_json_path = subsample_dict['af3_ss_json_paths'][dsidx]
+            n_expected_predictions = expected_prediction_count_from_json(
+                ss_json_path,
+                af3_inference_config,
+                "ss",
+            )
+            status_row = _new_prediction_status_row(
+                input_sample_id=input_sample_id,
+                designed_sample_id=designed_sample_id,
+                mode="ss",
+                n_expected_predictions=n_expected_predictions,
+            )
+            prediction_status_rows.append(status_row)
 
             # Get protein and ligand chain ids, because AF3 expects chain ids, not chain iids
             protein_pn_unit_iids = pdb_chain_info['protein_pn_unit_iids']
@@ -235,14 +345,22 @@ def evaluate_af3_self_consistency(sample_dict: dict = None,
                                             inference_config=af3_inference_config)
                 except Exception as e:
                     print(f"AF3 single sequence prediction failed for input_sample_id: {input_sample_id}, designed_sample_id: {designed_sample_id}: {e}")
+                    status_row["af3_status"] = "af3_failed"
+                    status_row["af3_error"] = str(e)
                     continue
                 gc.collect()
 
-            _, pred_ss_sample_paths = find_pred_sample_path_af3(out_dir=str(af3_ss_pred_dir),
-                                                                job_name=designed_sample_id)
+            prediction_summary = summarize_af3_prediction_outputs(
+                out_dir=str(af3_ss_pred_dir),
+                job_name=designed_sample_id,
+                expected_count=n_expected_predictions,
+            )
+            _record_prediction_summary(status_row, prediction_summary)
+            pred_ss_sample_paths = prediction_summary["model_cif_paths"]
 
             if len(pred_ss_sample_paths) == 0:
                 print(f"No AF3 predicted structure found for input_sample_id: {input_sample_id}, designed_sample_id: {designed_sample_id}")
+                _finalize_prediction_status(status_row, has_ligand=bool(ligand_pn_unit_iids))
                 continue
 
             for pred_idx, pred_ss_sample_path in enumerate(pred_ss_sample_paths):
@@ -266,9 +384,11 @@ def evaluate_af3_self_consistency(sample_dict: dict = None,
 
                     except Exception as e:
                         print(f"Self-consistency metrics computation failed for input_sample_id: {input_sample_id}, designed_sample_id: {designed_sample_id}, pred_idx: {pred_idx}: {e}")
+                        _append_status_error(status_row, "sc_errors", f"diffusion_{pred_idx}: {e}")
                         continue
                     else:
                         designed_sample_id_to_per_pred_sc_metrics[designed_sample_id][f"diffusion_{pred_idx}"] = per_pred_sc_metrics
+                        status_row["n_sc_success"] += 1
 
                     if ligand_pn_unit_iids:
                         try:
@@ -297,11 +417,14 @@ def evaluate_af3_self_consistency(sample_dict: dict = None,
 
                         except Exception as e:
                             print(f"Docking metrics computation failed for input_sample_id: {input_sample_id}, designed_sample_id: {designed_sample_id}, pred_idx: {pred_idx}: {e}")
+                            _append_status_error(status_row, "docking_errors", f"diffusion_{pred_idx}: {e}")
                             continue
                         else:
                             designed_sample_id_to_per_pred_docking_metrics[designed_sample_id][f"diffusion_{pred_idx}"] = per_pred_docking_metrics
+                            status_row["n_docking_success"] += 1
                 finally:
                     del pred_example, pred_atom_array
+            _finalize_prediction_status(status_row, has_ligand=bool(ligand_pn_unit_iids))
 
         # Free memory after processing each input sample
         if free_atom_arrays_progressively:
@@ -313,7 +436,13 @@ def evaluate_af3_self_consistency(sample_dict: dict = None,
         out_dir=out_dir,
         designed_sample_id_to_per_pred_sc_metrics=designed_sample_id_to_per_pred_sc_metrics,
         designed_sample_id_to_per_pred_docking_metrics=designed_sample_id_to_per_pred_docking_metrics,
-        csv_suffix=csv_suffix
+        prediction_status_rows=prediction_status_rows,
+        csv_suffix=csv_suffix,
+    )
+    _raise_if_required_predictions_incomplete(
+        status_rows=prediction_status_rows,
+        require_complete_predictions=require_complete_predictions,
+        mode_label="SS",
     )
 
     print("\n" + "="*80)
@@ -386,9 +515,11 @@ def evaluate_af3_docking_consistency(sample_dict: dict = None,
     # Run AF3 template-conditioned docking evaluation
     af3_runner_path = struct_pred_cfg.af3.runner_path
     af3_inference_config = struct_pred_cfg.af3.inference_config
+    require_complete_predictions = _require_complete_af3_predictions(struct_pred_cfg)
 
     designed_sample_id_to_per_pred_sc_metrics = {}
     designed_sample_id_to_per_pred_docking_metrics = {}
+    prediction_status_rows: list[dict[str, Any]] = []
 
     print("\n" + "="*80)
     print("Running AF3 Docking Consistency Evaluation (Template-Conditioned)")
@@ -415,6 +546,18 @@ def evaluate_af3_docking_consistency(sample_dict: dict = None,
             )
             pdb_chain_info = subsample_dict['pdb_chain_info']
             tc_json_path = subsample_dict['af3_tc_json_paths'][dsidx]
+            n_expected_predictions = expected_prediction_count_from_json(
+                tc_json_path,
+                af3_inference_config,
+                "tc",
+            )
+            status_row = _new_prediction_status_row(
+                input_sample_id=input_sample_id,
+                designed_sample_id=designed_sample_id,
+                mode="tc",
+                n_expected_predictions=n_expected_predictions,
+            )
+            prediction_status_rows.append(status_row)
 
             # Get protein and ligand chain ids
             protein_pn_unit_iids = pdb_chain_info['protein_pn_unit_iids']
@@ -443,14 +586,22 @@ def evaluate_af3_docking_consistency(sample_dict: dict = None,
                                             inference_config=af3_inference_config)
                 except Exception as e:
                     print(f"AF3 template-conditioned prediction failed for input_sample_id: {input_sample_id}, designed_sample_id: {designed_sample_id}: {e}")
+                    status_row["af3_status"] = "af3_failed"
+                    status_row["af3_error"] = str(e)
                     continue
                 gc.collect()
 
-            _, pred_tc_sample_paths = find_pred_sample_path_af3(out_dir=str(af3_tc_pred_dir),
-                                                                job_name=designed_sample_id)
+            prediction_summary = summarize_af3_prediction_outputs(
+                out_dir=str(af3_tc_pred_dir),
+                job_name=designed_sample_id,
+                expected_count=n_expected_predictions,
+            )
+            _record_prediction_summary(status_row, prediction_summary)
+            pred_tc_sample_paths = prediction_summary["model_cif_paths"]
 
             if len(pred_tc_sample_paths) == 0:
                 print(f"No AF3 TC predicted structure found for input_sample_id: {input_sample_id}, designed_sample_id: {designed_sample_id}")
+                _finalize_prediction_status(status_row, has_ligand=bool(ligand_pn_unit_iids))
                 continue
 
             for pred_idx, pred_tc_sample_path in enumerate(pred_tc_sample_paths):
@@ -474,10 +625,12 @@ def evaluate_af3_docking_consistency(sample_dict: dict = None,
 
                     except Exception as e:
                         print(f"Self-consistency metrics computation failed for input_sample_id: {input_sample_id}, designed_sample_id: {designed_sample_id}, pred_idx: {pred_idx}: {e}")
+                        _append_status_error(status_row, "sc_errors", f"diffusion_{pred_idx}: {e}")
                         continue
                     else:
                         # Store self-consistency metrics
                         designed_sample_id_to_per_pred_sc_metrics[designed_sample_id][f"diffusion_{pred_idx}"] = per_pred_sc_metrics
+                        status_row["n_sc_success"] += 1
 
                     # Only compute docking metrics if ligand exists
                     if ligand_pn_unit_iids:
@@ -507,12 +660,15 @@ def evaluate_af3_docking_consistency(sample_dict: dict = None,
 
                         except Exception as e:
                             print(f"Docking metrics computation failed for input_sample_id: {input_sample_id}, designed_sample_id: {designed_sample_id}, pred_idx: {pred_idx}: {e}")
+                            _append_status_error(status_row, "docking_errors", f"diffusion_{pred_idx}: {e}")
                             continue
                         else:
                             # Store docking metrics
                             designed_sample_id_to_per_pred_docking_metrics[designed_sample_id][f"diffusion_{pred_idx}"] = per_pred_docking_metrics
+                            status_row["n_docking_success"] += 1
                 finally:
                     del pred_example, pred_atom_array
+            _finalize_prediction_status(status_row, has_ligand=bool(ligand_pn_unit_iids))
 
         # Free memory after processing each input sample
         if free_atom_arrays_progressively:
@@ -524,8 +680,14 @@ def evaluate_af3_docking_consistency(sample_dict: dict = None,
         out_dir=out_dir,
         designed_sample_id_to_per_pred_sc_metrics=designed_sample_id_to_per_pred_sc_metrics,
         designed_sample_id_to_per_pred_docking_metrics=designed_sample_id_to_per_pred_docking_metrics,
+        prediction_status_rows=prediction_status_rows,
         csv_suffix=csv_suffix,
         mode_prefix="tc_"
+    )
+    _raise_if_required_predictions_incomplete(
+        status_rows=prediction_status_rows,
+        require_complete_predictions=require_complete_predictions,
+        mode_label="TC",
     )
 
     print("\n" + "="*80)
@@ -555,6 +717,7 @@ def _flatten_per_prediction_metrics(per_designed_sample_metrics: dict) -> list[d
 def _save_metrics_results(out_dir: Path = None,
                           designed_sample_id_to_per_pred_sc_metrics: dict = None,
                           designed_sample_id_to_per_pred_docking_metrics: dict = None,
+                          prediction_status_rows: list[dict[str, Any]] | None = None,
                           csv_suffix: str = "",
                           mode_prefix: str = "") -> None:
     """Save per-designed-sample and per-prediction metrics to CSV.
@@ -580,3 +743,8 @@ def _save_metrics_results(out_dir: Path = None,
         Path(out_dir, f"{mode_prefix}all_docking_metrics_per_prediction{csv_suffix}.csv"),
         index=False,
     )
+    if prediction_status_rows is not None:
+        pd.DataFrame(prediction_status_rows).to_csv(
+            Path(out_dir, f"{mode_prefix}af3_prediction_status{csv_suffix}.csv"),
+            index=False,
+        )

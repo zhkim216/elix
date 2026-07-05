@@ -359,6 +359,63 @@ def parse_pos_restrict_aatype_str(
     return pdb_pos, abs_pos, allowed_aatypes
 
 
+def _format_token_labels(atom_array: AtomArray, token_starts: np.ndarray) -> np.ndarray:
+    chain_ids = np.asarray(atom_array.chain_id[token_starts]).astype(str)
+    res_ids = np.asarray(atom_array.res_id[token_starts]).astype(str)
+    if "ins_code" in atom_array.get_annotation_categories():
+        ins_codes = np.asarray(atom_array.ins_code[token_starts]).astype(str)
+    else:
+        ins_codes = np.full(len(token_starts), "", dtype=object)
+    if "atom_name" in atom_array.get_annotation_categories():
+        atom_names = np.asarray(atom_array.atom_name[token_starts]).astype(str)
+    else:
+        atom_names = np.full(len(token_starts), "", dtype=object)
+
+    labels = [
+        f"{chain_id}{res_id}{ins_code.strip()}"
+        for chain_id, res_id, ins_code in zip(chain_ids, res_ids, ins_codes)
+    ]
+    label_counts: dict[str, int] = {}
+    for label in labels:
+        label_counts[label] = label_counts.get(label, 0) + 1
+
+    disambiguated_labels = []
+    for idx, (label, atom_name) in enumerate(zip(labels, atom_names)):
+        if label_counts[label] > 1:
+            suffix = atom_name.strip() or f"token{idx}"
+            disambiguated_labels.append(f"{label}:{suffix}")
+        else:
+            disambiguated_labels.append(label)
+    return np.asarray(disambiguated_labels, dtype=object)
+
+
+def _format_observed_token_axis_sequence(
+    observed_labels: np.ndarray,
+    observed_symbols: list[str],
+    canonical_len: int,
+    mask_len: int,
+    truncated_note: str | None = None,
+) -> str:
+    widths = [
+        max(len(str(label)), len(str(symbol)))
+        for label, symbol in zip(observed_labels, observed_symbols)
+    ]
+    label_line = " ".join(str(label).ljust(width) for label, width in zip(observed_labels, widths)).rstrip()
+    symbol_line = " ".join(str(symbol).ljust(width) for symbol, width in zip(observed_symbols, widths)).rstrip()
+    lines = [
+        (
+            "observed-token-axis "
+            f"(not canonical residue positions; canonical_len={canonical_len}, "
+            f"token_len={mask_len}; unresolved canonical positions omitted)"
+        ),
+        f"  residue_labels: {label_line}",
+        f"  fixed_tokens:    {symbol_line}",
+    ]
+    if truncated_note is not None:
+        lines.append(f"  note: {truncated_note}")
+    return "\n".join(lines)
+
+
 def visualize_conditioning_sequences(
     atom_array: AtomArray,
     cond_mask: TensorType["n", int],
@@ -371,14 +428,67 @@ def visualize_conditioning_sequences(
     chain_info = non_rcsb.initialize_chain_info_from_atom_array(atom_array)
     sequences = {}
 
+    cond_mask_np = cond_mask.detach().cpu().numpy() if torch.is_tensor(cond_mask) else np.asarray(cond_mask)
+    asym_id_np = asym_id.detach().cpu().numpy() if torch.is_tensor(asym_id) else np.asarray(asym_id)
+    cond_mask_np = cond_mask_np.astype(bool)
+
     chain_names = [x.split("_")[0] for x in asym_names]
     chain_name_to_asym_id = {chain_name: i for i, chain_name in enumerate(chain_names)}
+    token_starts = get_token_starts(atom_array)
+    token_chain_ids = np.asarray(atom_array.chain_id[token_starts]).astype(str)
+    token_res_names = np.asarray(atom_array.res_name[token_starts]).astype(str)
+    token_letters = np.asarray(
+        [const.PROT_TOKEN_TO_LETTER.get(res_name, "X") for res_name in token_res_names],
+        dtype=object,
+    )
+    token_labels = _format_token_labels(atom_array, token_starts)
 
     for chain_name, info in chain_info.items():
-        sequence = info["processed_entity_canonical_sequence"]
-        chain_cond_mask = cond_mask[asym_id == chain_name_to_asym_id[chain_name]]
-        sequence = "".join([x if chain_cond_mask[i] else "-" for i, x in enumerate(sequence)])
-        sequences[chain_name] = sequence
+        if chain_name not in chain_name_to_asym_id:
+            sequences[chain_name] = "<chain not present in asym_name metadata>"
+            continue
+
+        canonical_sequence = info["processed_entity_canonical_sequence"]
+        chain_cond_mask = cond_mask_np[asym_id_np == chain_name_to_asym_id[chain_name]]
+        if len(canonical_sequence) == len(chain_cond_mask):
+            sequences[chain_name] = "".join(
+                aa if chain_cond_mask[i] else "-"
+                for i, aa in enumerate(canonical_sequence)
+            )
+            continue
+
+        chain_token_positions = np.where(asym_id_np == chain_name_to_asym_id[chain_name])[0]
+        if len(token_letters) >= len(cond_mask_np):
+            observed_letters = token_letters[chain_token_positions]
+            observed_labels = token_labels[chain_token_positions]
+        else:
+            chain_token_mask = token_chain_ids == chain_name
+            observed_letters = token_letters[chain_token_mask]
+            observed_labels = token_labels[chain_token_mask]
+        if len(observed_letters) == len(chain_cond_mask):
+            observed_symbols = [
+                aa if chain_cond_mask[i] else "-"
+                for i, aa in enumerate(observed_letters)
+            ]
+            truncated_note = None
+        else:
+            n = min(len(observed_letters), len(chain_cond_mask))
+            observed_symbols = [
+                observed_letters[i] if chain_cond_mask[i] else "-"
+                for i in range(n)
+            ]
+            observed_labels = observed_labels[:n]
+            truncated_note = (
+                f"truncated to {n} tokens; observed_tokens={len(observed_letters)}, "
+                f"mask_tokens={len(chain_cond_mask)}"
+            )
+        sequences[chain_name] = _format_observed_token_axis_sequence(
+            observed_labels=observed_labels,
+            observed_symbols=observed_symbols,
+            canonical_len=len(canonical_sequence),
+            mask_len=len(chain_cond_mask),
+            truncated_note=truncated_note,
+        )
 
     for chain_name, sequence in sequences.items():
         print(f"Chain {chain_name}: {sequence}")
