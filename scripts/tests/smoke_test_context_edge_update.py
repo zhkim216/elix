@@ -6,16 +6,21 @@ Covers:
       context_edge_update = False / True.
   (2) EncLayer forward/backward under is_last_layer = False / True
       (exercises the encoder_edge_update flag path).
+  (3) ContextModule-specific dropout override plus legacy global fallback.
 
 Run from the repo root:
     python scripts/tests/smoke_test_context_edge_update.py
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
+from hydra import compose, initialize_config_dir
 
 from allatom_design.model.seq_denoiser.denoisers.seq_design.elix_mpnn import (
     ContextModule,
+    ElixMPNN,
     EncLayer,
 )
 
@@ -81,6 +86,48 @@ def test_context_module(context_edge_update: bool) -> None:
     print(f"[OK] ContextModule context_edge_update={context_edge_update} out.shape={tuple(out.shape)}")
 
 
+def test_context_module_dropout_override() -> None:
+    config_dir = str(
+        Path(__file__).resolve().parents[2]
+        / "allatom_design"
+        / "configs"
+        / "seq_denoiser"
+    )
+    with initialize_config_dir(config_dir=config_dir, version_base="1.3.2"):
+        inherited_cfg = compose(
+            config_name="elix.yaml",
+            overrides=["denoiser.mpnn.dropout_p=0.4"],
+        )
+        override_cfg = compose(
+            config_name="elix.yaml",
+            overrides=[
+                "denoiser.mpnn.dropout_p=0.4",
+                "denoiser.mpnn.lmpnn_module.dropout_p=0.1",
+            ],
+        )
+    missing_key_cfg = inherited_cfg.copy()
+    del missing_key_cfg.denoiser.mpnn.lmpnn_module.dropout_p
+
+    for cfg, context_dropout_p in (
+        (missing_key_cfg, 0.4),
+        (inherited_cfg, 0.4),
+        (override_cfg, 0.1),
+    ):
+        model = ElixMPNN(cfg.denoiser.mpnn)
+        dropout_ps = {
+            name: module.p
+            for name, module in model.named_modules()
+            if isinstance(module, torch.nn.Dropout)
+        }
+        assert dropout_ps, "ElixMPNN did not construct any dropout modules"
+        for name, dropout_p in dropout_ps.items():
+            expected = context_dropout_p if name.startswith("context_module.") else 0.4
+            assert dropout_p == expected, (
+                f"dropout {name!r} has p={dropout_p}; expected {expected}"
+            )
+    print("[OK] ContextModule dropout=0.1; all other ElixMPNN dropout=0.4")
+
+
 def test_enclayer(is_last_layer: bool) -> None:
     torch.manual_seed(0)
     B, L, K, C = 2, 6, 4, 32
@@ -113,6 +160,7 @@ def test_enclayer(is_last_layer: bool) -> None:
 
 
 def main() -> None:
+    test_context_module_dropout_override()
     test_context_module(context_edge_update=False)
     test_context_module(context_edge_update=True)
     test_enclayer(is_last_layer=False)
