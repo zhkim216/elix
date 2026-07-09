@@ -2,28 +2,28 @@
 # Submit from Sherlock:
 #   PROJECT_ROOT=/home/users/zhkim216/code/elix \
 #     bash scripts/sherlock_scripts/jinho/setup/wrap_sbatch_in_container_elix.sh \
-#     scripts/sherlock_scripts/jinho/train/elix_exp8.sbatch
+#     scripts/sherlock_scripts/jinho/train/elix_exp13.sbatch
 #
 # NOTE: The #SBATCH lines below (job-name / output / error) cannot use shell
 # variables because SLURM parses them before the shell runs. Keep them in sync
 # with EXP_NAME_BASE manually.
-#SBATCH --job-name=elix_exp8
+#SBATCH --job-name=elix_exp15
 #SBATCH -p possu
-#SBATCH --array=0-4
+#SBATCH --array=0-6
 #SBATCH --gres=gpu:2
 #SBATCH --mem=96G
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=16
 #SBATCH --constraint=GPU_SKU:H100_SXM5
 #SBATCH --time=1-12:00:00
-#SBATCH --output=/scratch/users/zhkim216/job_output/train_seq_denoiser/elix_exp8_%A_%a.out
-#SBATCH --error=/scratch/users/zhkim216/job_output/train_seq_denoiser/elix_exp8_%A_%a.err
+#SBATCH --output=/scratch/users/zhkim216/job_output/train_seq_denoiser/elix_exp15_%A_%a.out
+#SBATCH --error=/scratch/users/zhkim216/job_output/train_seq_denoiser/elix_exp15_%A_%a.err
 
 set -euo pipefail
 
 # Single source of truth for the experiment name. HYDRA_DIR and the inductor
 # cache below are derived from it, so changing this propagates automatically.
 # (The #SBATCH lines above still need a manual update.)
-EXP_NAME_BASE="elix_exp8"
+EXP_NAME_BASE="elix_exp15"
 
 BASE_DIR=/home/users/zhkim216/code/elix
 HYDRA_DIR=/scratch/users/zhkim216/hydra_outputs/train_seq_denoiser/${EXP_NAME_BASE}
@@ -34,7 +34,7 @@ mkdir -p "${JOB_OUTPUT_DIR}" "${HYDRA_DIR}" "${OUT_DIR}"
 
 ARRAY_JOB_ID="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-manual}}"
 ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
-CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-8}"
+CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-16}"
 export TORCHINDUCTOR_CACHE_DIR="/scratch/users/zhkim216/cache/inductor_cache_${EXP_NAME_BASE}_${ARRAY_JOB_ID}_${ARRAY_TASK_ID}"
 mkdir -p "${TORCHINDUCTOR_CACHE_DIR}"
 
@@ -55,13 +55,13 @@ COMMON_OVERRIDES=(
 )
 
 CONFIGS=(
-  "no_bml_context|data.query_pn_unit_iids_only=true data.bml_context.enabled=false"
-  "bml_context|data.query_pn_unit_iids_only=true data.bml_context.enabled=true"
-  "bml_context_crop30|data.query_pn_unit_iids_only=true data.bml_context.enabled=true data.featurizer_cfg.crop_center_cutoff_distance=30.0"
-  "bml_context_maxtok768|data.query_pn_unit_iids_only=true data.bml_context.enabled=true data.featurizer_cfg.max_tokens=768"  
-  "bml_context_dropout02|data.query_pn_unit_iids_only=true data.bml_context.enabled=true denoiser.mpnn.dropout_p=0.2"
-  "bml_context_maxtok768|data.query_pn_unit_iids_only=true data.bml_context.enabled=true data.featurizer_cfg.max_tokens=768"  
-  "bml_context_dropout02|data.query_pn_unit_iids_only=true data.bml_context.enabled=true denoiser.mpnn.dropout_p=0.2"
+  "drop02|denoiser.mpnn.dropout_p=0.2"
+  "drop02knn24ctx25|denoiser.mpnn.dropout_p=0.2 denoiser.mpnn.k_neighbors=24 denoiser.mpnn.potts.k_neighbors_potts=24 denoiser.mpnn.token_features.ligand_atom_context_num=25"
+  "drop02knn36ctx25|denoiser.mpnn.dropout_p=0.2 denoiser.mpnn.k_neighbors=36 denoiser.mpnn.potts.k_neighbors_potts=36 denoiser.mpnn.token_features.ligand_atom_context_num=25"
+  "prox_drop02cropdist10|denoiser.mpnn.dropout_p=0.2 data.bml_context.scheme=protein_proximity_context data.featurizer_cfg.crop_center_cutoff_distance=10.0"
+  "prox_drop02cropdist15|denoiser.mpnn.dropout_p=0.2 data.bml_context.scheme=protein_proximity_context data.featurizer_cfg.crop_center_cutoff_distance=15.0"
+  "prox_drop02cropdist20|denoiser.mpnn.dropout_p=0.2 data.bml_context.scheme=protein_proximity_context data.featurizer_cfg.crop_center_cutoff_distance=20.0"
+  "prox_drop02cropdist30|denoiser.mpnn.dropout_p=0.2 data.bml_context.scheme=protein_proximity_context data.featurizer_cfg.crop_center_cutoff_distance=30.0"
 )
 
 IDX=$((ARRAY_TASK_ID))
@@ -72,7 +72,7 @@ fi
 
 CONFIG_ROW="${CONFIGS[$IDX]}"
 IFS='|' read -r CONFIG_NAME OVERRIDES <<< "${CONFIG_ROW}"
-if [[ -z "${CONFIG_NAME}" || -z "${OVERRIDES}" ]]; then
+if [[ -z "${CONFIG_NAME}" ]]; then
   echo "Malformed config row at index ${IDX}: ${CONFIG_ROW}" >&2
   exit 2
 fi
@@ -90,17 +90,20 @@ MONOMER_FILTER_OVERRIDE=("data.train_filters.protein_monomer_chain_filter.0=\"${
 # Dataset paths
 RESIDUE_CACHE_DIR=/scratch/users/zhkim216/datasets/atomworks_cached_residue_data
 PDB_PATH="/scratch/users/zhkim216/datasets/atomworks_pdb_full_v9"
-TRAIN_METADATA_PATH="/scratch/users/zhkim216/datasets/atomworks_pdb_full_v9/metadata_ligval_seq_clustered_external_evidence_ver5.parquet"
-VALIDATION_IDS_FILE="/scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs/nativeval_sm_metal.txt"
-VAL_METADATA_PATH="/scratch/users/zhkim216/datasets/val_cifs/nativeval_cifs/metadata_for_training_nativeval_sm_metal.parquet"
+TRAIN_METADATA_PATH="/scratch/users/zhkim216/datasets/atomworks_pdb_full_v9/metadata_seq_clustered_03_finalized.parquet"
+VALIDATION_IDS_FILE="/scratch/users/zhkim216/datasets/evaluation_datasets/nativeval/nativeval.txt"
+VAL_METADATA_PATH="/scratch/users/zhkim216/datasets/evaluation_datasets/nativeval/metadata_for_training_nativeval.parquet"
 
 echo "Starting ${EXP_NAME}"
 echo "  config_name: ${CONFIG_NAME}"
 echo "  config_row: ${CONFIG_ROW}"
 echo "  common_overrides: ${COMMON_OVERRIDES[*]}"
 echo "  denoiser_type: ${DENOISER_TYPE}"
-echo "  external_evidence_policy: external_evidence"
+echo "  bml_center.metal.external_evidence_policy: [pubmed, medba]"
+echo "  bml_center.small_molecule.external_evidence_policy: [klifs, prd]"
+echo "  train_metadata_path: ${TRAIN_METADATA_PATH}"
 echo "  query_pn_unit_iids_only: true"
+echo "  bml_context.scheme: protein_proximity_context"
 echo "  alpha_protein_protein: 0.0"
 echo "  k_neighbors: 48"
 echo "  interface_filter_override: ${INTERFACE_FILTER_OVERRIDE[*]}"
@@ -109,6 +112,13 @@ echo "  base_dir: ${BASE_DIR}"
 echo "  out_dir: ${OUT_DIR}"
 echo "  hydra_dir: ${HYDRA_DIR}/${EXP_NAME}"
 echo "  torchinductor_cache: ${TORCHINDUCTOR_CACHE_DIR}"
+
+SLURM_JOB_ID_FOR_DDP="${SLURM_JOB_ID:-0}"
+export MASTER_ADDR=127.0.0.1
+export MASTER_PORT=$((20000 + (SLURM_JOB_ID_FOR_DDP % 40000) + ARRAY_TASK_ID))
+export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+echo "[DDP] MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT} (job=${SLURM_JOB_ID:-manual} task=${ARRAY_TASK_ID})"
+echo "[GPU] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset} SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-unset} SLURM_GPUS_ON_NODE=${SLURM_GPUS_ON_NODE:-unset}"
 
 DEBUG= HYDRA_FULL_ERROR=1 WANDB__SERVICE_WAIT=300 \
 python3 allatom_design/train_seq_denoiser.py \
@@ -122,8 +132,6 @@ python3 allatom_design/train_seq_denoiser.py \
     out_dir="${OUT_DIR}" \
     exp_name="${EXP_NAME}" \
     train.debug=false \
-    train.batch_size=16 \
-    trainer.accumulate_grad_batches=1 \
     train.batch_size=8 \
     trainer.accumulate_grad_batches=2 \
     train.compile.compile_model=true \
@@ -144,9 +152,9 @@ python3 allatom_design/train_seq_denoiser.py \
     data.exclude_val_cluster=true \
     data.interface_only_training=false \
     data.samples_per_epoch=50000 \
-    data.bml_center.metal.external_evidence_policy="external_evidence" \
-    data.bml_center.small_molecule.artifact_external_evidence_policy="filter_all_artifacts" \
     data.bml_center.small_molecule.min_contacting_protein_atom_ratio=1.0 \
+    data.bml_context.enabled=true \
+    data.bml_context.scheme=iterative_context_refinement \
     data.query_pn_unit_iids_only=true \
     "${INTERFACE_FILTER_OVERRIDE[@]}" \
     "${MONOMER_FILTER_OVERRIDE[@]}" \
@@ -163,9 +171,9 @@ python3 allatom_design/train_seq_denoiser.py \
     data.featurizer_cfg.is_inference=false \
     data.featurizer_cfg.occupancy_threshold_protein_backbone=0.0 \
     data.featurizer_cfg.remove_unresolved_tokens=true \
-    data.featurizer_cfg.max_tokens=512 \
+    data.featurizer_cfg.max_tokens=768 \
     data.featurizer_cfg.max_atoms=4608 \
-    data.featurizer_cfg.crop_center_cutoff_distance=15.0 \
+    data.featurizer_cfg.crop_center_cutoff_distance=30.0 \
     data.featurizer_cfg.crop_spatial_p_protein_monomer_chain=0.25 \
     data.featurizer_cfg.drop_prob_non_protein_chains=0.0 \
     data.featurizer_cfg.pocket_distance=5.0 \
@@ -184,6 +192,12 @@ python3 allatom_design/train_seq_denoiser.py \
     denoiser.mpnn.expansion_mode=node_concat_context_skip \
     denoiser.mpnn.lmpnn_module.context_edge_update=true \
     denoiser.mpnn.use_context_skip_connection=false \
+    denoiser.mpnn.use_mpnn_decoder=true \
+    denoiser.mpnn.num_encoder_layers=2 \
+    denoiser.mpnn.num_decoder_layers=2 \
+    denoiser.mpnn.lmpnn_module.num_context_feature_processor_layers=4 \
+    denoiser.mpnn.lmpnn_module.num_context_feature_aggregator_layers=4 \
+    denoiser.mpnn.use_potts_encoding=true \
     mask_selector.restype_masking_schedule="uniform_cosine_t" \
     logging.log_every_n_steps=100 \
     logging.wandb_watch_freq=500 \
