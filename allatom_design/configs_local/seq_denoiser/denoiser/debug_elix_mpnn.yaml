@@ -17,6 +17,9 @@ mpnn:
   # ligand conditioning options
   use_context_skip_connection: false
   lmpnn_module:
+    # ContextModule processor, aggregator, and final residual dropout.
+    # Following the global value preserves legacy behavior unless explicitly overridden.
+    dropout_p: ${denoiser.mpnn.dropout_p}
     num_context_feature_processor_layers: 2
     num_context_feature_aggregator_layers: 2
     # Controls edge update inside ContextModule (ligand context branch).

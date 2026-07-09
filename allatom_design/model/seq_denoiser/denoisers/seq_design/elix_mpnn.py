@@ -100,11 +100,14 @@ class ElixMPNN(nn.Module):
             assert self.num_context_feature_aggregator_layers is not None, "num_context_feature_aggregator_layers is required for ligand conditioning"
 
             self.context_edge_update = cfg_lmpnn_module.get("context_edge_update", False)
+            context_module_dropout_p = float(
+                cfg_lmpnn_module.get("dropout_p", cfg.dropout_p)
+            )
 
             # Encapsulate context feature processing into a separate module
             self.context_module = ContextModule(
                 hidden_dim=self.hidden_dim,
-                dropout_p=cfg.dropout_p,
+                dropout_p=context_module_dropout_p,
                 num_processor_layers=self.num_context_feature_processor_layers,
                 num_aggregator_layers=self.num_context_feature_aggregator_layers,
                 context_edge_update=self.context_edge_update,
