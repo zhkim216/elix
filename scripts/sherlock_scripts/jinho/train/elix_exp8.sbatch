@@ -9,7 +9,11 @@
 # with EXP_NAME_BASE manually.
 #SBATCH --job-name=elix_exp8
 #SBATCH -p possu
+<<<<<<< HEAD
 #SBATCH --array=4
+=======
+#SBATCH --array=0-4
+>>>>>>> refs/remotes/origin/main
 #SBATCH --gres=gpu:2
 #SBATCH --mem=96G
 #SBATCH --cpus-per-task=8
@@ -120,8 +124,13 @@ python3 allatom_design/train_seq_denoiser.py \
     out_dir="${OUT_DIR}" \
     exp_name="${EXP_NAME}" \
     train.debug=false \
+<<<<<<< HEAD
     train.batch_size=16 \
     trainer.accumulate_grad_batches=1 \
+=======
+    train.batch_size=8 \
+    trainer.accumulate_grad_batches=2 \
+>>>>>>> refs/remotes/origin/main
     train.compile.compile_model=true \
     trainer.strategy="ddp_find_unused_parameters_true" \
     denoiser.name="${DENOISER_TYPE}" \

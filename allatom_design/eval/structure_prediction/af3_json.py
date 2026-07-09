@@ -15,9 +15,7 @@ from atomworks.io.utils.atom_array_plus import AtomArray
 from atomworks.io.utils.selection import get_residue_starts
 from atomworks.io.utils.sequence import get_1_from_3_letter_code
 
-from allatom_design.data.const import METAL_ELEMENTS
 from allatom_design.eval.config import get_json_config_value
-from allatom_design.eval.chemical_components import normalize_ccd_code
 
 
 def make_af3_protein_sequence_entry(
@@ -40,34 +38,6 @@ def make_af3_protein_sequence_entry(
     }
 
 
-def _resolve_af3_ligand_ccd_code(
-    *,
-    designed_sample_atom_array: AtomArray,
-    ligand_pn_unit_iid: str,
-    ligand_ccd_code: str,
-) -> str:
-    """Use the element symbol for single-atom metal ligands with synthetic names."""
-    raw_ccd_code = str(ligand_ccd_code).strip()
-    normalized_ccd_code = normalize_ccd_code(raw_ccd_code)
-    if normalized_ccd_code in METAL_ELEMENTS:
-        return normalized_ccd_code
-
-    ligand_mask = designed_sample_atom_array.pn_unit_iid == ligand_pn_unit_iid
-    ligand_atom_array = designed_sample_atom_array[ligand_mask]
-    if len(ligand_atom_array) != 1:
-        return raw_ccd_code
-
-    element = normalize_ccd_code(ligand_atom_array.element[0])
-    if element not in METAL_ELEMENTS:
-        return raw_ccd_code
-
-    print(
-        "Using single-atom metal element as AF3 ligand CCD: "
-        f"pn_unit_iid={ligand_pn_unit_iid}, res_name={raw_ccd_code}, element={element}"
-    )
-    return element
-
-
 def _get_user_ccd_path(json_config: dict | DictConfig, pdb_chain_info: dict) -> str | None:
     user_ccd_path = pdb_chain_info.get("af3_user_ccd_path")
     if user_ccd_path is None:
@@ -84,10 +54,10 @@ def _af3_ligand_ccd_codes_for_json(
     pdb_chain_info: dict,
     ligand_pn_unit_iids: list[str],
     ligand_ccd_codes: list[str],
-) -> tuple[list[str], bool]:
+) -> list[str]:
     af3_ligand_ccd_codes = pdb_chain_info.get("af3_ligand_ccd_codes")
     if af3_ligand_ccd_codes is None:
-        return list(ligand_ccd_codes), True
+        return list(ligand_ccd_codes)
 
     codes = [str(code).strip() for code in af3_ligand_ccd_codes]
     if len(codes) != len(ligand_pn_unit_iids):
@@ -98,7 +68,7 @@ def _af3_ligand_ccd_codes_for_json(
         )
     if any(not code for code in codes):
         raise ValueError("af3_ligand_ccd_codes contains an empty component ID")
-    return codes, False
+    return codes
 
 
 def make_af3_json(
@@ -177,7 +147,7 @@ def make_af3_json(
             protein_pn_unit_iids = pdb_chain_info["protein_pn_unit_iids"]
             ligand_pn_unit_iids = pdb_chain_info["ligand_pn_unit_iids"]
             ligand_ccd_codes = pdb_chain_info["ligand_ccd_codes"]
-            af3_ligand_ccd_codes, should_resolve_ligand_ccd = _af3_ligand_ccd_codes_for_json(
+            af3_ligand_ccd_codes = _af3_ligand_ccd_codes_for_json(
                 pdb_chain_info=pdb_chain_info,
                 ligand_pn_unit_iids=ligand_pn_unit_iids,
                 ligand_ccd_codes=ligand_ccd_codes,
@@ -258,12 +228,6 @@ def make_af3_json(
                     )
 
             for ligand_pn_unit_iid, ligand_ccd_code in zip(ligand_pn_unit_iids, af3_ligand_ccd_codes):
-                if should_resolve_ligand_ccd:
-                    ligand_ccd_code = _resolve_af3_ligand_ccd_code(
-                        designed_sample_atom_array=designed_sample_atom_array,
-                        ligand_pn_unit_iid=ligand_pn_unit_iid,
-                        ligand_ccd_code=ligand_ccd_code,
-                    )
                 ss_sequences.append({
                     "ligand": {
                         "id": ligand_pn_unit_iid.split("_")[0],

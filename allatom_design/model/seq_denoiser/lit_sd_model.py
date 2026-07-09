@@ -88,10 +88,10 @@ class LitSeqDenoiser(L.LightningModule):
         outputs = self(batch)
         batch.update(meta_fields)
 
-        loss, aux = self.loss(outputs, batch, return_aux=True)
+        loss, aux, aux_sum_count = self.loss(outputs, batch, return_aux=True)
 
         # Logging
-        self._log(batch, outputs, aux, batch_idx, phase="train")
+        self._log(batch, outputs, aux, batch_idx, phase="train", aux_sum_count=aux_sum_count)
 
         return loss
 
@@ -136,15 +136,16 @@ class LitSeqDenoiser(L.LightningModule):
         meta_fields = self._pop_non_tensor_fields(batch)
 
         outputs = self(batch)
-        _, aux = self.loss(outputs, batch, return_aux=True)
+        _, aux, aux_sum_count = self.loss(outputs, batch, return_aux=True)
 
         # restore non-tensor fields
         batch.update(meta_fields)
-        self._log(batch, outputs, aux, batch_idx, phase="val", phase_suffix=phase_suffix)
+        self._log(batch, outputs, aux, batch_idx, phase="val", phase_suffix=phase_suffix, aux_sum_count=aux_sum_count)
 
         # eval seq design over discrete sequence noise
 
         aux_t = defaultdict(list)
+        aux_sc_list = []
 
         for eval_t in self.cfg.eval.eval_timesteps:
             B = batch["token_pad_mask"].shape[0]
@@ -152,7 +153,7 @@ class LitSeqDenoiser(L.LightningModule):
 
             meta_fields = self._pop_non_tensor_fields(batch)
             outputs = self(batch, t=t_seq)
-            _, aux = self.loss(outputs, batch, eval_total = False, return_aux=True)
+            _, aux, aux_sum_count = self.loss(outputs, batch, eval_total = False, return_aux=True)
             batch.update(meta_fields)
 
             aux = {
@@ -160,15 +161,26 @@ class LitSeqDenoiser(L.LightningModule):
                 for k, v in aux.items()
                 if ("seq" in k) or ("potts" in k) or ("sidechain" in k)
             }
-            self._log(batch, outputs, aux, batch_idx, phase="val", phase_suffix=phase_suffix, key_suffix=f"_t{eval_t}")
+            self._log(batch, outputs, aux, batch_idx, phase="val", phase_suffix=phase_suffix, key_suffix=f"_t{eval_t}", aux_sum_count=aux_sum_count)
 
             # aggregate across timesteps
             for k, v in aux.items():
                 aux_t[k].append(v)
+            aux_sc_list.append(aux_sum_count)
 
-        # average across timesteps and log
+        # average across timesteps and log. The (sum, count) monitor metrics are
+        # accumulated across timesteps so the reduced ratio is a count-weighted
+        # average; the key set is identical every timestep, keeping the all-reduce
+        # in _log rank-aligned.
         aux_t = {k: torch.stack(v).mean().item() for k, v in aux_t.items()}
-        self._log(batch, None, aux_t, batch_idx, phase="val", phase_suffix=phase_suffix, key_suffix="_avg_t")
+        aux_sc_avg = {
+            name: (
+                torch.stack([d[name][0] for d in aux_sc_list]).sum(),
+                torch.stack([d[name][1] for d in aux_sc_list]).sum(),
+            )
+            for name in (aux_sc_list[0] if aux_sc_list else {})
+        }
+        self._log(batch, None, aux_t, batch_idx, phase="val", phase_suffix=phase_suffix, key_suffix="_avg_t", aux_sum_count=aux_sc_avg)
 
 
     def _log(self,
@@ -178,10 +190,15 @@ class LitSeqDenoiser(L.LightningModule):
              batch_idx: int,
              phase: str,
              phase_suffix: str = "",
-             key_suffix: str = ""):
+             key_suffix: str = "",
+             aux_sum_count: dict[str, tuple] | None = None):
         """
         phase_suffix: used to differentiate between different phases of validation (e.g. different fixed sizes), should include a leading "/"
         key_suffix: adds a suffix to the key
+        aux_sum_count: data-dependent monitor metrics as {name: (local_sum, local_count)}.
+            Reduced here via a single fixed-shape all-reduce so the ratio is
+            correct across ranks without the per-key sync_dist that would desync
+            DDP when the key set differs between ranks.
         """
         bs = len(batch["example_id"])
 
@@ -200,6 +217,49 @@ class LitSeqDenoiser(L.LightningModule):
             add_dataloader_idx=False,
             batch_size=bs,
         )
+
+        self._log_sum_count_metrics(aux_sum_count, phase, phase_suffix, key_suffix)
+
+    def _log_sum_count_metrics(self,
+                               aux_sum_count: dict[str, tuple] | None,
+                               phase: str,
+                               phase_suffix: str,
+                               key_suffix: str):
+        """Log data-dependent monitor metrics as an unbiased cross-rank ratio.
+
+        The all-reduce operates on a single fixed-shape tensor and runs on every
+        rank regardless of which samples were present, so it stays lockstep with
+        the other ranks. After reduction the ratio is identical on all ranks, so
+        it is logged with sync_dist=False (no further collective).
+        """
+        if not aux_sum_count:
+            return
+
+        names = sorted(aux_sum_count)
+        stat = torch.stack(
+            [torch.stack(aux_sum_count[name]).float() for name in names]
+        )  # [K, 2] -> (sum, count) per metric
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(stat)
+
+        for i, name in enumerate(names):
+            total_sum, total_count = stat[i, 0], stat[i, 1]
+            if total_count <= 0:
+                # Every rank sees the same reduced count, so this branch is taken
+                # in lockstep; skipping self.log issues no collective.
+                continue
+            metric_phase = self._validation_metric_phase(name) if phase == "val" else phase
+            self.log(
+                f"{metric_phase}{phase_suffix}/{name}{key_suffix}",
+                (total_sum / total_count).item(),
+                on_step=(phase == "train"),
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+                sync_dist=False,
+                add_dataloader_idx=False,
+                batch_size=int(total_count.item()),
+            )
 
 
     def configure_optimizers(self):

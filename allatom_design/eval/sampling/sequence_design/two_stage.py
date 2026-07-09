@@ -14,11 +14,12 @@ from allatom_design.eval.sampling.sequence_design.constraints import (
     RUNTIME_POS_CONSTRAINT_COLUMNS,
 )
 from allatom_design.eval.sampling.sequence_design.config import get_stage2_potts_only_cond
-from allatom_design.eval.sampling.sequence_design.checkpoints import ckpt_label
+from allatom_design.eval.sampling.sequence_design.checkpoints import ckpt_label, get_checkpoints
 from allatom_design.eval.sampling.sequence_design.core import (
     SequenceDesignRunSpec,
     iter_design_sequence_for_run_spec,
 )
+from allatom_design.eval.sampling.sequence_design.outputs import load_sample_dict_bundle
 from allatom_design.eval.utils.sampling_inputs import (
     is_role_sampling_inputs,
     matched_role_sampling_input_row,
@@ -633,3 +634,42 @@ def design_sequence_two_stage(
                 stage2_design_cfg=stage2_design_cfg,
             )
             yield stage2_sample_dict_per_ckpt, stage2_log_dir_per_ckpt, stage2_ckpt_info, manifest_rows
+
+
+def iter_saved_two_stage_design_outputs(
+    *,
+    direction: str,
+    stage1_region: str,
+    stage2_region: str,
+    stage2_constraint_type: str,
+    stage1_model_label: str,
+    stage2_model_label: str,
+    stage1_design_cfg: DictConfig,
+    stage2_design_cfg: DictConfig,
+    log_dir: Path,
+    pocket_distance: float,
+    csv_suffix: str = "",
+) -> Iterator[tuple[dict, Path, dict, list[dict[str, Any]]]]:
+    """Yield saved final-stage sample bundles for AF3/metric-only two-stage retries."""
+    del stage2_constraint_type, pocket_distance
+    stage1_ckpt_infos = get_checkpoints(stage1_design_cfg)
+    stage2_ckpt_infos = get_checkpoints(stage2_design_cfg)
+
+    for stage1_ckpt_info in stage1_ckpt_infos:
+        stage2_base_log_dir = _stage2_base_log_dir(
+            log_dir=log_dir,
+            direction=direction,
+            stage1_region=stage1_region,
+            stage2_region=stage2_region,
+            stage1_model_label=stage1_model_label,
+            stage1_ckpt_info=stage1_ckpt_info,
+            stage2_model_label=stage2_model_label,
+        )
+        for stage2_ckpt_info in stage2_ckpt_infos:
+            stage2_log_dir_per_ckpt = stage2_base_log_dir / ckpt_label(stage2_ckpt_info)
+            sample_dict_per_ckpt = load_sample_dict_bundle(
+                log_dir_per_ckpt=stage2_log_dir_per_ckpt,
+                ckpt_info=stage2_ckpt_info,
+                csv_suffix=csv_suffix,
+            )
+            yield sample_dict_per_ckpt, stage2_log_dir_per_ckpt, stage2_ckpt_info, []

@@ -23,7 +23,9 @@ from allatom_design.eval.sampling.sequence_design.inputs import get_sd_batch
 from allatom_design.eval.sampling.sequence_design.outputs import (
     collect_design_outputs,
     convert_output_tensors_to_python,
+    load_sample_dict_bundle,
     record_sampled_batch_outputs,
+    write_sample_dict_bundle,
     write_sample_metadata,
 )
 from allatom_design.eval.sampling.sequence_design.runtime_plan import (
@@ -409,6 +411,12 @@ def iter_design_sequence_for_run_spec(
             guidance_cfg=run_spec.guidance_cfg,
             sampling_inputs_df=run_spec.sampling_inputs_df,
         )
+        write_sample_dict_bundle(
+            sample_dict_per_ckpt=sample_dict_per_ckpt,
+            log_dir_per_ckpt=log_dir_per_ckpt,
+            ckpt_info=ckpt_info,
+            csv_suffix=run_spec.csv_suffix,
+        )
 
         del seq_des_model
         del outputs
@@ -416,4 +424,21 @@ def iter_design_sequence_for_run_spec(
         if device == "cuda":
             torch.cuda.empty_cache()
 
+        yield sample_dict_per_ckpt, log_dir_per_ckpt, ckpt_info
+
+
+def iter_saved_design_outputs_for_run_spec(
+    run_spec: SequenceDesignRunSpec,
+) -> Iterator[tuple[dict, Path, dict]]:
+    """Yield previously completed sample bundles for AF3/metric-only retries."""
+    run_spec.validate()
+    ckpt_infos = get_checkpoints(run_spec.design_cfg)
+
+    for ckpt_info in tqdm(ckpt_infos, desc="Loading saved sequence-design outputs"):
+        log_dir_per_ckpt = run_spec.log_dir / ckpt_label(ckpt_info)
+        sample_dict_per_ckpt = load_sample_dict_bundle(
+            log_dir_per_ckpt=log_dir_per_ckpt,
+            ckpt_info=ckpt_info,
+            csv_suffix=run_spec.csv_suffix,
+        )
         yield sample_dict_per_ckpt, log_dir_per_ckpt, ckpt_info

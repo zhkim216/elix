@@ -76,6 +76,10 @@ class SDLoss(nn.Module):
         """
         aux = {}  # losses
         aux_monitor = {}  # monitor other metrics that do not contribute to the loss
+        # Data-dependent monitor metrics kept as (local_sum, local_count) so the
+        # logged key set stays identical across ranks. Empty ranks contribute
+        # (0, 0) and never bias the cross-rank average. Reduced in LitSeqDenoiser._log.
+        aux_sum_count = {}
 
         if self.use_seq_pred and eval_seq:
             # compute sequence loss from sequence design module
@@ -118,17 +122,27 @@ class SDLoss(nn.Module):
                 else:
                     ligand_pocket_seq_loss_mask = seq_loss_mask * pocket_mask
                                             
-                # Select only samples that have pocket residues holding ligands
-                has_close_ligands = ligand_pocket_seq_loss_mask.sum(dim=-1) > 0     
-                                                            
-                if has_close_ligands.any():
-                    ligand_pocket_seq_loss = masked_cross_entropy(outputs["seq_logits"], target_restype, ligand_pocket_seq_loss_mask, seq_loss_cfg=self.cfg.seq_loss)
-                    ligand_pocket_seq_loss = ligand_pocket_seq_loss[has_close_ligands]
-                    aux_monitor["ligand_pocket_seq_loss"] = ligand_pocket_seq_loss.mean().detach().clone()
-                         
-                    ligand_pocket_seq_acc = masked_seq_accuracy(outputs["seq_logits"], target_restype, ligand_pocket_seq_loss_mask)
-                    ligand_pocket_seq_acc = ligand_pocket_seq_acc[has_close_ligands]                
-                    aux_monitor["ligand_pocket_seq_acc"] = ligand_pocket_seq_acc.mean().detach().clone()                
+                # Select only samples that have pocket residues holding ligands.
+                # Emit (sum, count) unconditionally rather than gating the key on
+                # ``has_close_ligands.any()``: a per-batch-conditional key breaks
+                # DDP because ranks would issue different numbers of sync_dist
+                # all-reduces and deadlock (NCCL watchdog timeout). Empty batches
+                # contribute (0, 0) so the reduced ratio is unaffected.
+                has_close_ligands = ligand_pocket_seq_loss_mask.sum(dim=-1) > 0
+                has_close_ligands_f = has_close_ligands.to(dtype=seq_loss_mask.dtype)
+                pocket_count = has_close_ligands_f.sum().detach()
+
+                ligand_pocket_seq_loss = masked_cross_entropy(outputs["seq_logits"], target_restype, ligand_pocket_seq_loss_mask, seq_loss_cfg=self.cfg.seq_loss)
+                aux_sum_count["ligand_pocket_seq_loss"] = (
+                    (ligand_pocket_seq_loss * has_close_ligands_f).sum().detach(),
+                    pocket_count,
+                )
+
+                ligand_pocket_seq_acc = masked_seq_accuracy(outputs["seq_logits"], target_restype, ligand_pocket_seq_loss_mask)
+                aux_sum_count["ligand_pocket_seq_acc"] = (
+                    (ligand_pocket_seq_acc * has_close_ligands_f).sum().detach(),
+                    pocket_count,
+                )
 
             else: 
                 ligand_pocket_seq_loss_mask = None
@@ -154,8 +168,11 @@ class SDLoss(nn.Module):
                                                                        ligand_pocket_seq_loss_mask = ligand_pocket_seq_loss_mask,
                                                                        )
                     aux["potts_composite_loss"] = potts_loss
-                    if ligand_pocket_potts_loss is not None:
-                        aux_monitor["ligand_pocket_potts_composite_loss"] = ligand_pocket_potts_loss.mean().detach().clone()
+                    if self.task == "lc_seq_des" and ligand_pocket_potts_loss is not None:
+                        aux_sum_count["ligand_pocket_potts_composite_loss"] = (
+                            (ligand_pocket_potts_loss * has_close_ligands_f).sum().detach(),
+                            pocket_count,
+                        )
 
                 if self.loss_weights.get("potts_pseudolikelihood_loss", 0.0) > 0.0:
                     pl_loss, pl_ligand_pocket_loss = potts_pseudolikelihood_loss(
@@ -168,8 +185,11 @@ class SDLoss(nn.Module):
                         ligand_pocket_seq_loss_mask=ligand_pocket_seq_loss_mask,
                     )
                     aux["potts_pseudolikelihood_loss"] = pl_loss
-                    if pl_ligand_pocket_loss is not None:
-                        aux_monitor["ligand_pocket_potts_pseudolikelihood_loss"] = pl_ligand_pocket_loss.mean().detach().clone()
+                    if self.task == "lc_seq_des" and pl_ligand_pocket_loss is not None:
+                        aux_sum_count["ligand_pocket_potts_pseudolikelihood_loss"] = (
+                            (pl_ligand_pocket_loss * has_close_ligands_f).sum().detach(),
+                            pocket_count,
+                        )
 
         sidechain_prediction_aux = outputs.get("sidechain_prediction_aux")
         sidechain_loss_requested = (
@@ -239,7 +259,7 @@ class SDLoss(nn.Module):
         aux.update(aux_monitor)
 
         if return_aux:
-            return total_loss, aux
+            return total_loss, aux, aux_sum_count
 
         return total_loss
 
@@ -338,12 +358,9 @@ def potts_composite_loss(S: TensorType["b n", int] = None,
     else:
         if ligand_pocket_seq_loss_mask is None:
             return loss, None
+        # Return one value per sample. The caller owns sample-count weighting so
+        # empty-pocket samples do not bias distributed monitor averages.
         ligand_pocket_loss = (-logp_i * ligand_pocket_seq_loss_mask).sum(dim=-1) / ligand_pocket_seq_loss_mask.sum(dim=-1).clamp(min=1e-8)
-        has_close_ligands = ligand_pocket_seq_loss_mask.sum(dim=-1) > 0         
-        if has_close_ligands.any():
-            ligand_pocket_loss = ligand_pocket_loss[has_close_ligands]
-        else:
-            ligand_pocket_loss = torch.tensor(0.0, device=loss.device)
         return loss, ligand_pocket_loss
 
 
@@ -384,11 +401,8 @@ def potts_pseudolikelihood_loss(S: TensorType["b n", int] = None,
     if not compute_ligand_pocket_loss or ligand_pocket_seq_loss_mask is None:
         return loss, None
 
+    # Return one value per sample. The caller owns sample-count weighting so
+    # empty-pocket samples do not bias distributed monitor averages.
     ligand_pocket_loss = -(logp_i * ligand_pocket_seq_loss_mask).sum(dim=-1) \
                          / ligand_pocket_seq_loss_mask.sum(dim=-1).clamp(min=1e-8)
-    has_close_ligands = ligand_pocket_seq_loss_mask.sum(dim=-1) > 0
-    if has_close_ligands.any():
-        ligand_pocket_loss = ligand_pocket_loss[has_close_ligands]
-    else:
-        ligand_pocket_loss = torch.tensor(0.0, device=loss.device)
     return loss, ligand_pocket_loss

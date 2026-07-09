@@ -8,6 +8,7 @@
 #   STEP_FILTER=82500 <submit command above>
 #   PRINT_ARRAY_PLAN=true <submit command above>     # print the combo plan and exit
 #
+<<<<<<< HEAD
 # Runs selected exp12/exp13 pocket models x {2500,22500,...,122500} step sweep,
 # two-stage (ps) on the NEW evaluation_datasets/nativeval set. Stage1 pocket = selected
 # exp12/exp13 model (ensemble OFF);
@@ -25,6 +26,25 @@
 #SBATCH --time=2-0:00:00
 #SBATCH --output=/scratch/users/zhkim216/job_output/eval_ligand_seq_des/eval_exp12_13_native_ts_%A_%a.out
 #SBATCH --error=/scratch/users/zhkim216/job_output/eval_ligand_seq_des/eval_exp12_13_native_ts_%A_%a.err
+=======
+# Runs exp12 cfg0-4/cfg6/cfg8 + exp13 cfg0 pocket x {2500,22500,...,122500}
+# step sweep, two-stage (ps) on the NEW evaluation_datasets/nativeval set. Stage1
+# pocket = cfgN (ensemble OFF);
+# stage2 scaffold = elix_exp1_cfg0 @ 32500 (ensemble ON, protein-only gaussian).
+# No pdb chunking: each array task = one (cfg, step) combo over ALL nativeval structures.
+# Full array layout is 8 cfg x 7 steps = 56 tasks. Each task is long (all structures x AF3
+# recycles=10 diff=5); use STEP_FILTER / POCKET_MODEL_FILTER to submit smaller batches, or
+# raise --time, if tasks approach the wall clock.
+#SBATCH --job-name=eval_exp12_native_ts
+#SBATCH -p possu,bioe
+#SBATCH --array=0-55
+#SBATCH --gpus-per-node=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=16G
+#SBATCH --time=1-12:00:00
+#SBATCH --output=/scratch/users/zhkim216/job_output/eval_ligand_seq_des/eval_exp12_native_ts_%A_%a.out
+#SBATCH --error=/scratch/users/zhkim216/job_output/eval_ligand_seq_des/eval_exp12_native_ts_%A_%a.err
+>>>>>>> refs/remotes/origin/main
 
 set -euo pipefail
 
@@ -34,6 +54,7 @@ PRINT_ARRAY_PLAN="${PRINT_ARRAY_PLAN:-false}"
 TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-8}"
 
+<<<<<<< HEAD
 # Pocket (stage1) models. Steps are swept per model via POCKET_STEPS.
 CONFIGS=(
   elix_exp12_cfg2_token768
@@ -42,6 +63,18 @@ CONFIGS=(
   elix_exp12_cfg6_token768_potts_encoding_exclude_maybe_coval_codesign_chi025_offset0125_node_norm_off
   elix_exp12_cfg8_token768_potts_encoding_exclude_maybe_coval_codesign_chi0125_offset00625_node_norm_off
   elix_exp13_cfg0_token768_potts_encoding_proximity
+=======
+# Pocket (stage1) models: "cfg_filter|model_name". Steps are swept per cfg via POCKET_STEPS.
+CONFIGS=(
+  "0|elix_exp12_cfg0_baseline"
+  "1|elix_exp12_cfg1_baseline_exclude_maybe_coval"
+  "2|elix_exp12_cfg2_token768"
+  "3|elix_exp12_cfg3_token768_potts_encoding"
+  "4|elix_exp12_cfg4_token768_potts_encoding_exclude_maybe_coval_dropout02"
+  "6|elix_exp12_cfg6_token768_potts_encoding_exclude_maybe_coval_codesign_chi025_offset0125_node_norm_off"
+  "8|elix_exp12_cfg8_token768_potts_encoding_exclude_maybe_coval_codesign_chi0125_offset00625_node_norm_off"
+  "exp13_cfg0|elix_exp13_cfg0_token768_potts_encoding_proximity"
+>>>>>>> refs/remotes/origin/main
 )
 POCKET_STEPS=(2500 22500 42500 62500 82500 102500 122500)
 
@@ -62,7 +95,7 @@ POCKET_ANNOTATION_METHOD=all_atom
 BATCH_SIZE=8
 NUM_POCKET_SEQS_PER_PDB=2
 NUM_SCAFFOLD_SEQS_PER_PDB=1
-POCKET_DISTANCE_FOR_DOCKING_METRICS=8.0
+POCKET_DISTANCE_FOR_DOCKING_METRICS=10.0
 POCKET_DISTANCES_FOR_SEQ_RECOVERY="[4.0,6.0,8.0,10.0]"
 POCKET_DISTANCE_BINS="[[0.0,4.0],[4.0,6.0],[6.0,8.0],[8.0,10.0]]"
 AF3_RECYCLES=10
@@ -74,8 +107,14 @@ matches_step_filter() {
 }
 
 matches_model_filter() {
+<<<<<<< HEAD
   local model_name="$1"
   [[ "${POCKET_MODEL_FILTER}" == "all" || "${POCKET_MODEL_FILTER}" == "${model_name}" ]]
+=======
+  local cfg_filter="$1"
+  local model_name="$2"
+  [[ "${POCKET_MODEL_FILTER}" == "all" || "${POCKET_MODEL_FILTER}" == "${cfg_filter}" || "${POCKET_MODEL_FILTER}" == "cfg${cfg_filter}" || "${POCKET_MODEL_FILTER}" == "${model_name}" ]]
+>>>>>>> refs/remotes/origin/main
 }
 
 print_valid_filters() {
@@ -84,6 +123,10 @@ print_valid_filters() {
     echo "  ${FILTER_MODEL_NAME}" >&2
   done
   echo "Valid STEP_FILTER values: all or one of: ${POCKET_STEPS[*]}" >&2
+<<<<<<< HEAD
+=======
+  echo "Valid POCKET_MODEL_FILTER values: all, cfg filters shown above, cfg-prefixed numeric filters, or full model name." >&2
+>>>>>>> refs/remotes/origin/main
 }
 
 # Each combo is "pocket_model|pocket_step" over the model x step grid.
@@ -134,7 +177,7 @@ PDB_NAME_LIST=/scratch/users/zhkim216/datasets/evaluation_datasets/nativeval/nat
 
 POCKET_DENOISER_TRAIN_DIR=/scratch/users/zhkim216/out_dir/ligand_seq_des/${POCKET_MODEL_NAME}
 SCAFFOLD_DENOISER_TRAIN_DIR=/scratch/users/zhkim216/out_dir/ligand_seq_des/${SCAFFOLD_MODEL_NAME}
-EXP_NAME=${POCKET_MODEL_NAME}_pocket_${SCAFFOLD_MODEL_NAME}_scaffold_${VALSET_NAME}_twostage_${DIRECTION}_pocket_noens_scaffold_ens_n${SCAFFOLD_TOTAL_MEMBERS}_protein_noise${SCAFFOLD_PROTEIN_NOISE_LABEL}_pd${POCKET_DISTANCE}_${POCKET_ANNOTATION_METHOD}_ss_recycles${AF3_RECYCLES}_diff${AF3_DIFFUSION_SAMPLES}_pseqs${NUM_POCKET_SEQS_PER_PDB}_sseqs${NUM_SCAFFOLD_SEQS_PER_PDB}
+EXP_NAME=${POCKET_MODEL_NAME}_pocket_${SCAFFOLD_MODEL_NAME}_scaffold_${VALSET_NAME}_twostage_${DIRECTION}_pocket_noens_scaffold_ens_n${SCAFFOLD_TOTAL_MEMBERS}_protein_noise${SCAFFOLD_PROTEIN_NOISE_LABEL}_pd${POCKET_DISTANCE}_${POCKET_ANNOTATION_METHOD}_pseqs${NUM_POCKET_SEQS_PER_PDB}_sseqs${NUM_SCAFFOLD_SEQS_PER_PDB}
 HYDRA_DIR=${HYDRA_ROOT}/${EXP_NAME}/pocket_step${POCKET_STEP}
 
 checkpoint_exists_for_step() {
@@ -196,7 +239,11 @@ WANDB__SERVICE_WAIT=300 python3 allatom_design/eval/sampling/run_elix.py \
     wandb.no_wandb=false \
     wandb.project=${PROJECT} \
     wandb.wandb_id=${WANDB_ID} \
+<<<<<<< HEAD
     wandb.group=${VALSET_NAME}_twostage_exp12_exp13 \
+=======
+    wandb.group=${VALSET_NAME}\
+>>>>>>> refs/remotes/origin/main
     debug=false \
     seed=0 \
     num_workers=${CPUS_PER_TASK} \

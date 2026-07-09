@@ -38,6 +38,9 @@ from atomworks.ml.preprocessing.get_pn_unit_data_from_structure import \
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
+from allatom_design.data.preprocessing.atomworks.metadata_schema import (
+    coerce_nullable_numeric_columns,
+)
 from allatom_design.data.preprocessing.atomworks.sharding_utils import \
     take_shard, use_sharding
 
@@ -433,15 +436,7 @@ def _add_parquet_columns(df: pd.DataFrame, dataset_name: str, pdb_in_dir: str):
     # one of these fields (e.g. a shard with no halide or no metal PN units) gets its
     # object column stringified to ``"None"``, which then fails type inference at merge time
     # against other batches where the same column ended up as float64.
-    numeric_nullable_cols = (
-        "q_pn_unit_n_coordination_partners_metal",
-        "q_pn_unit_n_coordination_partners_halide",
-        "q_pn_unit_n_neighboring_heavy_atoms_small_molecule",
-        "q_pn_unit_avg_occupancy_nonpolymer",
-    )
-    for col in numeric_nullable_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+    coerce_nullable_numeric_columns(df)
 
     # Convert all remaining object columns to string (e.g. JSON-stringified list/dict fields).
     for col in df.columns:
@@ -472,6 +467,7 @@ def _merge_batch_parquets(batch_dir: Path, shard_dir: Path, shard_id: int):
 
     dfs = [pd.read_parquet(f) for f in batch_files]
     df = pd.concat(dfs, ignore_index=True)
+    coerce_nullable_numeric_columns(df)
 
     if df.empty:
         print(f"Shard {shard_id}: produced 0 rows after merging.")
