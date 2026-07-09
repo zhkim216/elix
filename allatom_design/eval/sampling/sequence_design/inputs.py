@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,41 @@ def create_sample_dict(
     return sample_dict
 
 
+def _pdb_cfg_without_array_split(pdb_cfg: DictConfig | dict[str, Any]) -> dict[str, Any]:
+    cfg_dict = (
+        OmegaConf.to_container(pdb_cfg, resolve=True)
+        if isinstance(pdb_cfg, DictConfig)
+        else dict(pdb_cfg)
+    )
+    cfg_dict["array_id"] = None
+    cfg_dict["num_arrays"] = None
+    return cfg_dict
+
+
+def _slice_role_rows_for_array(
+    role_df: pd.DataFrame,
+    *,
+    array_id: int | None,
+    num_arrays: int | None,
+) -> pd.DataFrame:
+    if array_id is None:
+        return role_df
+    if num_arrays is None:
+        raise ValueError("pdb_cfg.num_arrays is required when pdb_cfg.array_id is set")
+
+    array_id = int(array_id)
+    num_arrays = int(num_arrays)
+    if array_id < 0 or array_id >= num_arrays:
+        raise ValueError(f"pdb_cfg.array_id must be in [0, {num_arrays}), got {array_id}")
+
+    chunk_size = math.ceil(len(role_df) / num_arrays) if len(role_df) else 0
+    start_idx = array_id * chunk_size
+    end_idx = min(start_idx + chunk_size, len(role_df))
+    selected = role_df.iloc[start_idx:end_idx].reset_index(drop=True)
+    print(f"Role sampling array {array_id}/{num_arrays}: using {len(selected)} rows")
+    return selected
+
+
 def prepare_sample_dict(
     cfg: DictConfig | None = None,
     sampling_inputs_df: pd.DataFrame | None = None,
@@ -54,12 +90,10 @@ def prepare_sample_dict(
     """Resolve input structure files from ``cfg.pdb_cfg`` into ``sample_dict``."""
     if cfg is None:
         raise ValueError("cfg must be provided")
-    sample_paths = get_pdb_files(**cfg.pdb_cfg)
 
     if sampling_inputs_df is not None:
         role_df = normalize_role_sampling_inputs_df(sampling_inputs_df)
-        if cfg.debug:
-            role_df = role_df.head(cfg.num_debug_samples).copy()
+        sample_paths = get_pdb_files(**_pdb_cfg_without_array_split(cfg.pdb_cfg))
 
         path_by_pdb_key = {Path(sample_path).stem: sample_path for sample_path in sample_paths}
         missing_pdb_keys = sorted(
@@ -71,6 +105,14 @@ def prepare_sample_dict(
                 f"cfg.pdb_cfg inputs: {missing_pdb_keys[:10]}"
             )
 
+        if cfg.debug:
+            role_df = role_df.head(cfg.num_debug_samples).copy()
+
+        role_df = _slice_role_rows_for_array(
+            role_df,
+            array_id=cfg.pdb_cfg.get("array_id", None),
+            num_arrays=cfg.pdb_cfg.get("num_arrays", None),
+        )
         role_sample_paths = [
             path_by_pdb_key[str(row["pdb_key"])]
             for _, row in role_df.iterrows()
@@ -85,6 +127,7 @@ def prepare_sample_dict(
             prefix=prefix,
         )
 
+    sample_paths = get_pdb_files(**cfg.pdb_cfg)
     if cfg.debug:
         sample_paths = sample_paths[:cfg.num_debug_samples]
 

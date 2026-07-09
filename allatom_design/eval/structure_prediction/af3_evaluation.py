@@ -76,6 +76,22 @@ def _require_complete_af3_predictions(struct_pred_cfg: DictConfig | dict | None)
     return config_value_as_bool(value)
 
 
+def _strict_af3_input_fingerprint(struct_pred_cfg: DictConfig | dict | None, mode: str) -> bool:
+    if struct_pred_cfg is None:
+        return False
+    selectable_cfg = (
+        struct_pred_cfg
+        if isinstance(struct_pred_cfg, DictConfig)
+        else OmegaConf.create(struct_pred_cfg)
+    )
+    value = OmegaConf.select(
+        selectable_cfg,
+        f"af3.inference_config.{mode}.strict_input_fingerprint",
+        default=False,
+    )
+    return config_value_as_bool(value)
+
+
 def _new_prediction_status_row(
     *,
     input_sample_id: str,
@@ -90,6 +106,9 @@ def _new_prediction_status_row(
         "n_expected_predictions": int(n_expected_predictions),
         "n_found_predictions": 0,
         "n_malformed_prediction_dirs": 0,
+        "n_surplus_predictions": 0,
+        "af3_input_fingerprint_ok": "",
+        "af3_input_fingerprint_error": "",
         "n_sc_success": 0,
         "n_docking_success": 0,
         "af3_status": "pending",
@@ -111,6 +130,10 @@ def _record_prediction_summary(row: dict[str, Any], summary: dict[str, object]) 
     malformed_dirs = summary.get("malformed_sample_dirs", [])
     row["n_found_predictions"] = int(summary["n_found"])
     row["n_malformed_prediction_dirs"] = int(summary["n_malformed"])
+    row["n_surplus_predictions"] = int(summary.get("n_surplus", 0))
+    fingerprint_ok = summary.get("input_fingerprint_ok")
+    row["af3_input_fingerprint_ok"] = "" if fingerprint_ok is None else bool(fingerprint_ok)
+    row["af3_input_fingerprint_error"] = str(summary.get("input_fingerprint_error", ""))
     row["malformed_prediction_dirs"] = ";".join(str(path) for path in malformed_dirs)
 
 
@@ -125,6 +148,10 @@ def _finalize_prediction_status(row: dict[str, Any], *, has_ligand: bool) -> Non
         row["af3_status"] = "missing_predictions"
     elif n_found < n_expected:
         row["af3_status"] = "incomplete_predictions"
+    elif n_found > n_expected:
+        row["af3_status"] = "surplus_predictions"
+    elif row.get("af3_input_fingerprint_ok") is False:
+        row["af3_status"] = "stale_predictions"
     elif n_sc_success < n_found:
         row["af3_status"] = "metric_failed"
     elif has_ligand and n_docking_success < n_found:
@@ -275,6 +302,7 @@ def evaluate_af3_self_consistency(sample_dict: dict = None,
     af3_runner_path = struct_pred_cfg.af3.runner_path
     af3_inference_config = struct_pred_cfg.af3.inference_config
     require_complete_predictions = _require_complete_af3_predictions(struct_pred_cfg)
+    strict_input_fingerprint = _strict_af3_input_fingerprint(struct_pred_cfg, "ss")
 
     designed_sample_id_to_per_pred_sc_metrics = {}
     designed_sample_id_to_per_pred_docking_metrics = {}
@@ -354,9 +382,21 @@ def evaluate_af3_self_consistency(sample_dict: dict = None,
                 out_dir=str(af3_ss_pred_dir),
                 job_name=designed_sample_id,
                 expected_count=n_expected_predictions,
+                json_path=ss_json_path,
+                inference_config=af3_inference_config,
+                mode="ss",
+                strict_input_fingerprint=strict_input_fingerprint,
             )
             _record_prediction_summary(status_row, prediction_summary)
             pred_ss_sample_paths = prediction_summary["model_cif_paths"]
+            if prediction_summary.get("input_fingerprint_ok") is False:
+                _append_status_error(
+                    status_row,
+                    "af3_error",
+                    str(prediction_summary.get("input_fingerprint_error", "")),
+                )
+                _finalize_prediction_status(status_row, has_ligand=bool(ligand_pn_unit_iids))
+                continue
 
             if len(pred_ss_sample_paths) == 0:
                 print(f"No AF3 predicted structure found for input_sample_id: {input_sample_id}, designed_sample_id: {designed_sample_id}")
@@ -516,6 +556,7 @@ def evaluate_af3_docking_consistency(sample_dict: dict = None,
     af3_runner_path = struct_pred_cfg.af3.runner_path
     af3_inference_config = struct_pred_cfg.af3.inference_config
     require_complete_predictions = _require_complete_af3_predictions(struct_pred_cfg)
+    strict_input_fingerprint = _strict_af3_input_fingerprint(struct_pred_cfg, "tc")
 
     designed_sample_id_to_per_pred_sc_metrics = {}
     designed_sample_id_to_per_pred_docking_metrics = {}
@@ -595,9 +636,21 @@ def evaluate_af3_docking_consistency(sample_dict: dict = None,
                 out_dir=str(af3_tc_pred_dir),
                 job_name=designed_sample_id,
                 expected_count=n_expected_predictions,
+                json_path=tc_json_path,
+                inference_config=af3_inference_config,
+                mode="tc",
+                strict_input_fingerprint=strict_input_fingerprint,
             )
             _record_prediction_summary(status_row, prediction_summary)
             pred_tc_sample_paths = prediction_summary["model_cif_paths"]
+            if prediction_summary.get("input_fingerprint_ok") is False:
+                _append_status_error(
+                    status_row,
+                    "af3_error",
+                    str(prediction_summary.get("input_fingerprint_error", "")),
+                )
+                _finalize_prediction_status(status_row, has_ligand=bool(ligand_pn_unit_iids))
+                continue
 
             if len(pred_tc_sample_paths) == 0:
                 print(f"No AF3 TC predicted structure found for input_sample_id: {input_sample_id}, designed_sample_id: {designed_sample_id}")

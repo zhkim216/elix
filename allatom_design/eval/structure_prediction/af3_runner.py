@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import importlib.util
 import json
 import os
@@ -11,7 +12,7 @@ from functools import lru_cache
 from pathlib import Path
 
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from allatom_design.eval.config import (
     config_value_as_bool,
@@ -30,6 +31,7 @@ _AF3_MAX_TEMPLATE_DATE = None
 _AF3_BUCKETS = None
 
 DEFAULT_AF3_MAX_TEMPLATE_DATE = "2021-09-30"
+AF3_INPUT_FINGERPRINT_FILENAME = ".af3_input_fingerprint.json"
 
 
 @lru_cache(maxsize=1)
@@ -100,10 +102,157 @@ def expected_prediction_count_from_json(
     return expected
 
 
+def _sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _plain_config(value):
+    if isinstance(value, DictConfig):
+        return OmegaConf.to_container(value, resolve=True)
+    if isinstance(value, dict):
+        return {str(key): _plain_config(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_config(item) for item in value]
+    return value
+
+
+def _fingerprinted_mode_config(value: dict | DictConfig | None):
+    mode_config = _plain_config(value) or {}
+    if isinstance(mode_config, dict):
+        mode_config = dict(mode_config)
+        mode_config.pop("overwrite", None)
+        mode_config.pop("strict_input_fingerprint", None)
+    return mode_config
+
+
+def _canonical_json_bytes(payload: dict) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _af3_template_mmcif_paths(json_path: str | Path) -> list[str]:
+    with Path(json_path).open() as handle:
+        raw_jobs = json.load(handle)
+    jobs = [raw_jobs] if isinstance(raw_jobs, dict) else list(raw_jobs)
+    paths: list[str] = []
+    for job in jobs:
+        for sequence_entry in job.get("sequences", []):
+            protein_entry = sequence_entry.get("protein")
+            if not isinstance(protein_entry, dict):
+                continue
+            for template in protein_entry.get("templates", []):
+                if isinstance(template, dict) and template.get("mmcifPath"):
+                    paths.append(str(template["mmcifPath"]))
+    return sorted(set(paths))
+
+
+def _af3_template_file_fingerprints(json_path: str | Path) -> list[dict[str, str]]:
+    fingerprints = []
+    for template_path in _af3_template_mmcif_paths(json_path):
+        path = Path(template_path)
+        fingerprints.append({
+            "path": template_path,
+            "sha256": _sha256_file(path) if path.exists() else "missing",
+        })
+    return fingerprints
+
+
+def af3_input_fingerprint(
+    json_path: str | Path,
+    inference_config: dict | DictConfig | None,
+    mode: str,
+) -> dict[str, object]:
+    """Fingerprint the AF3 input and mode config that must match reusable outputs."""
+    return {
+        "version": 1,
+        "mode": mode,
+        "job_name": Path(json_path).stem,
+        "json_sha256": _sha256_file(json_path),
+        "template_mmcif_files": _af3_template_file_fingerprints(json_path),
+        "expected_count": expected_prediction_count_from_json(json_path, inference_config, mode),
+        "inference_config": {
+            "base": _plain_config(get_config_value(inference_config, "base", {})),
+            mode: _fingerprinted_mode_config(get_config_value(inference_config, mode, {})),
+        },
+    }
+
+
+def af3_input_fingerprint_digest(
+    json_path: str | Path,
+    inference_config: dict | DictConfig | None,
+    mode: str,
+) -> str:
+    return hashlib.sha256(
+        _canonical_json_bytes(af3_input_fingerprint(json_path, inference_config, mode))
+    ).hexdigest()
+
+
+def _af3_input_fingerprint_path(out_dir: str | Path, job_name: str) -> Path:
+    return Path(out_dir) / job_name / AF3_INPUT_FINGERPRINT_FILENAME
+
+
+def _write_af3_input_fingerprint(
+    *,
+    json_path: str | Path,
+    out_dir: str | Path,
+    inference_config: dict | DictConfig | None,
+    mode: str,
+) -> None:
+    job_name = Path(json_path).stem
+    fingerprint = af3_input_fingerprint(json_path, inference_config, mode)
+    fingerprint["fingerprint_sha256"] = af3_input_fingerprint_digest(
+        json_path,
+        inference_config,
+        mode,
+    )
+    fingerprint_path = _af3_input_fingerprint_path(out_dir, job_name)
+    fingerprint_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = fingerprint_path.with_name(f"{fingerprint_path.name}.tmp.{os.getpid()}")
+    with tmp_path.open("w") as handle:
+        json.dump(fingerprint, handle, sort_keys=True, indent=2)
+        handle.write("\n")
+    os.replace(tmp_path, fingerprint_path)
+
+
+def _af3_strict_input_fingerprint_enabled(mode_config: dict | DictConfig | None) -> bool:
+    return config_value_as_bool(get_config_value(mode_config, "strict_input_fingerprint", False))
+
+
+def _af3_input_fingerprint_status(
+    *,
+    out_dir: str | Path,
+    job_name: str,
+    json_path: str | Path,
+    inference_config: dict | DictConfig | None,
+    mode: str,
+) -> tuple[bool, str]:
+    fingerprint_path = _af3_input_fingerprint_path(out_dir, job_name)
+    if not fingerprint_path.exists():
+        return False, f"missing_fingerprint:{fingerprint_path}"
+    try:
+        with fingerprint_path.open() as handle:
+            observed = json.load(handle)
+    except Exception as exc:
+        return False, f"unreadable_fingerprint:{exc}"
+
+    expected_digest = af3_input_fingerprint_digest(json_path, inference_config, mode)
+    observed_digest = observed.get("fingerprint_sha256")
+    if observed_digest != expected_digest:
+        return False, "fingerprint_mismatch"
+    return True, ""
+
+
 def summarize_af3_prediction_outputs(
     out_dir: str | Path,
     job_name: str,
     expected_count: int | None = None,
+    json_path: str | Path | None = None,
+    inference_config: dict | DictConfig | None = None,
+    mode: str | None = None,
+    strict_input_fingerprint: bool = False,
 ) -> dict[str, object]:
     """Summarize valid and malformed AF3 prediction outputs for a job."""
     prediction_dir = Path(out_dir, job_name)
@@ -121,7 +270,26 @@ def summarize_af3_prediction_outputs(
             sample_dirs.append(path)
             model_cif_paths.append(model_cifs[0])
     n_found = len(model_cif_paths)
-    complete = expected_count is not None and n_found >= expected_count
+    count_complete = (
+        expected_count is not None
+        and n_found == expected_count
+        and len(malformed_sample_dirs) == 0
+    )
+    input_fingerprint_ok = None
+    input_fingerprint_error = ""
+    if strict_input_fingerprint:
+        if json_path is None or inference_config is None or mode is None:
+            input_fingerprint_ok = False
+            input_fingerprint_error = "strict_input_fingerprint_requires_json_config_and_mode"
+        else:
+            input_fingerprint_ok, input_fingerprint_error = _af3_input_fingerprint_status(
+                out_dir=out_dir,
+                job_name=job_name,
+                json_path=json_path,
+                inference_config=inference_config,
+                mode=mode,
+            )
+    complete = count_complete and input_fingerprint_ok is not False
     return {
         "prediction_dir": prediction_dir,
         "sample_dirs": sample_dirs,
@@ -130,6 +298,9 @@ def summarize_af3_prediction_outputs(
         "n_expected": expected_count,
         "n_found": n_found,
         "n_malformed": len(malformed_sample_dirs),
+        "n_surplus": max(0, n_found - expected_count) if expected_count is not None else 0,
+        "input_fingerprint_ok": input_fingerprint_ok,
+        "input_fingerprint_error": input_fingerprint_error,
         "complete": complete,
     }
 
@@ -138,11 +309,19 @@ def _af3_prediction_outputs_complete(
     out_dir: str | Path,
     job_name: str,
     expected_count: int,
+    json_path: str | Path | None = None,
+    inference_config: dict | DictConfig | None = None,
+    mode: str | None = None,
+    strict_input_fingerprint: bool = False,
 ) -> bool:
     summary = summarize_af3_prediction_outputs(
         out_dir=out_dir,
         job_name=job_name,
         expected_count=expected_count,
+        json_path=json_path,
+        inference_config=inference_config,
+        mode=mode,
+        strict_input_fingerprint=strict_input_fingerprint,
     )
     return bool(summary["complete"])
 
@@ -178,6 +357,49 @@ def _prepare_af3_sample_dir(
         print(f"Overwriting AF3 prediction for {sample_name}: removing {sample_dir}")
         shutil.rmtree(sample_dir)
 
+    return False
+
+
+def _prepare_af3_prediction_run(
+    *,
+    json_path: str,
+    out_dir: str,
+    inference_config: dict | DictConfig | None,
+    mode: str,
+) -> bool:
+    """Return True when a current complete prediction can be reused."""
+    sample_name = Path(json_path).stem
+    prediction_dir = Path(out_dir) / sample_name
+    mode_config = get_config_value(inference_config, mode, {})
+    overwrite = _af3_overwrite_enabled(mode_config)
+    strict_input_fingerprint = _af3_strict_input_fingerprint_enabled(mode_config)
+
+    if overwrite:
+        if prediction_dir.exists():
+            print(f"Overwriting AF3 prediction for {sample_name}: removing {prediction_dir}")
+            shutil.rmtree(prediction_dir)
+        return False
+
+    expected_count = expected_prediction_count_from_json(json_path, inference_config, mode)
+    summary = summarize_af3_prediction_outputs(
+        out_dir=out_dir,
+        job_name=sample_name,
+        expected_count=expected_count,
+        json_path=json_path,
+        inference_config=inference_config,
+        mode=mode,
+        strict_input_fingerprint=strict_input_fingerprint,
+    )
+    if summary["complete"]:
+        print(f"AF3 prediction already exists for {sample_name}")
+        return True
+
+    if prediction_dir.exists():
+        reason = "incomplete_or_surplus_predictions"
+        if strict_input_fingerprint and summary["input_fingerprint_ok"] is False:
+            reason = f"stale_predictions:{summary['input_fingerprint_error']}"
+        print(f"Removing {reason} for {sample_name}: {prediction_dir}")
+        shutil.rmtree(prediction_dir)
     return False
 
 
@@ -338,9 +560,13 @@ def _run_af3_inprocess(
     import pathlib
     from alphafold3.common import folding_input
 
-    expected_count = expected_prediction_count_from_json(json_path, inference_config, mode)
-    if _af3_prediction_outputs_complete(out_dir, Path(json_path).stem, expected_count):
-        print(f"AF3 prediction already exists for {Path(json_path).stem}")
+    mode_config = get_config_value(inference_config, mode, {})
+    if _prepare_af3_prediction_run(
+        json_path=json_path,
+        out_dir=out_dir,
+        inference_config=inference_config,
+        mode=mode,
+    ):
         return
 
     runner, model_runner, data_pipeline_config = _get_af3_model_runner_and_config(
@@ -382,6 +608,12 @@ def _run_af3_inprocess(
             print(f"AF3 prediction failed for {Path(json_path).stem}: {exc}")
             raise
         gc.collect()
+    _write_af3_input_fingerprint(
+        json_path=json_path,
+        out_dir=out_dir,
+        inference_config=inference_config,
+        mode=mode,
+    )
 
 
 def run_af3_single_sequence(
@@ -394,9 +626,12 @@ def run_af3_single_sequence(
     """Run AF3 single-sequence inference."""
     ss_config = inference_config.ss
     if use_subprocess:
-        expected_count = expected_prediction_count_from_json(json_path, inference_config, "ss")
-        if _af3_prediction_outputs_complete(out_dir, Path(json_path).stem, expected_count):
-            print(f"AF3 prediction already exists for {Path(json_path).stem}")
+        if _prepare_af3_prediction_run(
+            json_path=json_path,
+            out_dir=out_dir,
+            inference_config=inference_config,
+            mode="ss",
+        ):
             return
 
         cmd = [
@@ -422,6 +657,12 @@ def run_af3_single_sequence(
             cmd.append("--fix_standalone_glycans=True")
         env = os.environ.copy()
         subprocess.run(cmd, check=True, env=env)
+        _write_af3_input_fingerprint(
+            json_path=json_path,
+            out_dir=out_dir,
+            inference_config=inference_config,
+            mode="ss",
+        )
         return
 
     _run_af3_inprocess(
@@ -443,9 +684,12 @@ def run_af3_template_conditioned(
     """Run AF3 template-conditioned inference."""
     tc_config = inference_config.tc
     if use_subprocess:
-        expected_count = expected_prediction_count_from_json(json_path, inference_config, "tc")
-        if _af3_prediction_outputs_complete(out_dir, Path(json_path).stem, expected_count):
-            print(f"AF3 prediction already exists for {Path(json_path).stem}")
+        if _prepare_af3_prediction_run(
+            json_path=json_path,
+            out_dir=out_dir,
+            inference_config=inference_config,
+            mode="tc",
+        ):
             return
 
         cmd = [
@@ -473,6 +717,12 @@ def run_af3_template_conditioned(
             cmd.append("--fix_standalone_glycans=True")
         env = os.environ.copy()
         subprocess.run(cmd, check=True, env=env)
+        _write_af3_input_fingerprint(
+            json_path=json_path,
+            out_dir=out_dir,
+            inference_config=inference_config,
+            mode="tc",
+        )
         return
 
     _run_af3_inprocess(

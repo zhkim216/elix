@@ -266,6 +266,7 @@ struct_pred_cfg:
         flash_attention_implementation: "triton"
       ss:  # Single-sequence prediction config
         overwrite: false
+        strict_input_fingerprint: false
         num_recycles: 1
         num_diffusion_samples: 1
         max_templates: 0
@@ -275,6 +276,7 @@ struct_pred_cfg:
         mask_template_sequence: true
       tc:  # Template-conditioned prediction config
         overwrite: false
+        strict_input_fingerprint: false
         num_recycles: 1
         num_diffusion_samples: 1
         max_templates: 1

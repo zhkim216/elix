@@ -1,0 +1,65 @@
+mmcif_dir: /scratch/users/zhkim216/datasets/pdb_mirror
+out_dir: /scratch/users/zhkim216/datasets/atomworks_pdb_full_v8
+
+# Optional: newline-delimited list of mmCIF paths to process (overrides mmcif_dir scan)
+cif_list_path: null
+
+num_workers: 31
+max_file_size: 5000000
+
+# IMPORTANT: Ligand validity scores require RCSB network access (GraphQL).
+# On clusters this is a frequent source of timeouts/hangs, so keep it off for bulk preprocessing
+# and compute it later in a separate, cacheable step.
+fetch_ligand_validity_scores: false
+
+# OOM resilience settings
+processing_timeout: 300       # Per-file timeout in seconds
+batch_size: 256               # Save intermediate results every N files (enables resume)
+max_tasks_per_child: 16       # Restart workers periodically to prevent memory leaks
+
+# Data preprocessor args
+data_preprocessor_cfg:
+  # Keep true to preserve PDB-derived metadata fields (pdb_id, deposition_date, etc).
+  # Network calls for ligand validity are controlled by `fetch_ligand_validity_scores`.
+  from_rcsb: true
+  build_assembly: "first"
+
+  # Cutoff distances
+  close_distance: 30.0
+  contact_distance: 8
+  clash_distance: 1.0
+  # Misc
+  ignore_residues: ["UNL", "UNX"] #! unknown ligands, and atoms
+  # Metal coordination partner counting (3.2A donor/metal atoms; occupancy>0 already enforced upstream)
+  metal_coordination_cfg:
+    coordination_distance: 3.2
+    donor_elements: ["N", "O", "F", "P", "S", "Cl", "As", "Se", "Br", "I"]
+  # Halide coordination partner counting (5A non-C atoms around F/CL/BR/IOD ions)
+  halide_coordination_cfg:
+    coordination_distance: 5.0
+    halide_res_names: ["F", "CL", "BR", "IOD"]
+  # Small molecule neighboring heavy atom counting distance
+  small_molecule_neighboring_distance: 5.0
+  # Efficiency
+  polymer_pn_unit_limit: 500
+
+# CIF parser args
+cif_parser_args:
+  add_missing_atoms: true
+  remove_waters: true
+  remove_ccds: ["UNL", "UNX"] #! unknown ligands, and atoms
+  fix_ligands_at_symmetry_centers: true
+  fix_arginines: true
+  convert_mse_to_met: true
+  hydrogen_policy: "remove"
+  add_bond_types_from_struct_conn: ["covale"]
+
+# --- sharding for multi-node runs ---
+num_shards: 1000     # total number of shards
+shard_id: 0   # per-job shard id
+
+# --- resume behavior ---
+# If true, batches previously recorded in `attempted_empty_batches` (all files
+# failed/timed out on the prior run) will be retried. Default is false because
+# the same file set is likely to fail again and it wastes wall-time.
+retry_empty_batches: false

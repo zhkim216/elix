@@ -124,6 +124,7 @@ struct_pred_cfg:
         db_dir: /scratch/users/zhkim216/af3_databases
         flash_attention_implementation: "triton"
       ss:  # Single-sequence prediction config
+        overwrite: false
         num_recycles: 1
         num_diffusion_samples: 1
         max_templates: 0
@@ -132,6 +133,7 @@ struct_pred_cfg:
         mask_template_sidechains: true
         mask_template_sequence: true
       tc:  # Template-conditioned prediction config
+        overwrite: false
         num_recycles: 1
         num_diffusion_samples: 1
         max_templates: 1

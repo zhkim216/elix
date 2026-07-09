@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
+import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -32,6 +35,129 @@ from allatom_design.eval.utils.sampling_inputs import (
     resolve_query_pn_unit_iids_from_sampling_row,
     sampling_ligand_ccd_by_iid as ligand_ccd_by_iid_from_sampling_row,
 )
+
+SAMPLE_BUNDLE_VERSION = 1
+
+
+def sample_bundle_paths(*, log_dir_per_ckpt: Path, csv_suffix: str) -> tuple[Path, Path]:
+    return (
+        log_dir_per_ckpt / f"sample_dict_per_ckpt{csv_suffix}.pt",
+        log_dir_per_ckpt / f"sample_resume_state{csv_suffix}.json",
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    with tmp_path.open("w") as handle:
+        json.dump(payload, handle, sort_keys=True, indent=2)
+        handle.write("\n")
+    os.replace(tmp_path, path)
+
+
+def _torch_load(path: Path) -> Any:
+    try:
+        return torch.load(path, weights_only=False)
+    except TypeError:
+        return torch.load(path)
+
+
+def _designed_sample_ids_by_input(sample_dict_per_ckpt: dict) -> dict[str, list[str]]:
+    return {
+        str(input_sample_id): [str(sample_id) for sample_id in entry.get("designed_sample_id", [])]
+        for input_sample_id, entry in sample_dict_per_ckpt.items()
+    }
+
+
+def write_sample_dict_bundle(
+    *,
+    sample_dict_per_ckpt: dict,
+    log_dir_per_ckpt: Path,
+    ckpt_info: dict[str, Any],
+    csv_suffix: str,
+) -> Path:
+    """Persist the complete sample_dict needed to rerun AF3/metrics without design."""
+    bundle_path, marker_path = sample_bundle_paths(
+        log_dir_per_ckpt=log_dir_per_ckpt,
+        csv_suffix=csv_suffix,
+    )
+    log_dir_per_ckpt.mkdir(parents=True, exist_ok=True)
+    tmp_bundle_path = bundle_path.with_name(f"{bundle_path.name}.tmp.{os.getpid()}")
+    torch.save(sample_dict_per_ckpt, tmp_bundle_path)
+    os.replace(tmp_bundle_path, bundle_path)
+
+    designed_ids_by_input = _designed_sample_ids_by_input(sample_dict_per_ckpt)
+    n_designed_samples = sum(len(sample_ids) for sample_ids in designed_ids_by_input.values())
+    marker = {
+        "version": SAMPLE_BUNDLE_VERSION,
+        "status": "complete",
+        "bundle_path": bundle_path.name,
+        "bundle_sha256": _sha256_file(bundle_path),
+        "csv_suffix": csv_suffix,
+        "ckpt_info": {
+            "ckpt_path": str(ckpt_info.get("ckpt_path", "")),
+            "global_step": int(ckpt_info["global_step"]),
+            "epoch": int(ckpt_info["epoch"]),
+        },
+        "n_input_samples": len(sample_dict_per_ckpt),
+        "n_designed_samples": n_designed_samples,
+        "designed_sample_ids_by_input": designed_ids_by_input,
+    }
+    _atomic_write_json(marker_path, marker)
+    print(
+        f"Saved sample_dict_per_ckpt{csv_suffix}.pt with "
+        f"{n_designed_samples} designed samples to {bundle_path}"
+    )
+    return bundle_path
+
+
+def load_sample_dict_bundle(
+    *,
+    log_dir_per_ckpt: Path,
+    ckpt_info: dict[str, Any],
+    csv_suffix: str,
+) -> dict:
+    bundle_path, marker_path = sample_bundle_paths(
+        log_dir_per_ckpt=log_dir_per_ckpt,
+        csv_suffix=csv_suffix,
+    )
+    if not marker_path.exists():
+        raise FileNotFoundError(f"Missing sample completion marker: {marker_path}")
+    with marker_path.open() as handle:
+        marker = json.load(handle)
+    if marker.get("status") != "complete":
+        raise ValueError(f"Sample marker is not complete: {marker_path}")
+    if marker.get("version") != SAMPLE_BUNDLE_VERSION:
+        raise ValueError(
+            f"Unsupported sample marker version in {marker_path}: {marker.get('version')}"
+        )
+    if marker.get("bundle_path") != bundle_path.name:
+        raise ValueError(f"Sample marker points at unexpected bundle: {marker_path}")
+    marker_ckpt = marker.get("ckpt_info", {})
+    if (
+        int(marker_ckpt.get("global_step", -1)) != int(ckpt_info["global_step"])
+        or int(marker_ckpt.get("epoch", -1)) != int(ckpt_info["epoch"])
+    ):
+        raise ValueError(f"Sample marker checkpoint does not match requested ckpt: {marker_path}")
+    if not bundle_path.exists():
+        raise FileNotFoundError(f"Missing sample bundle: {bundle_path}")
+    actual_sha256 = _sha256_file(bundle_path)
+    if actual_sha256 != marker.get("bundle_sha256"):
+        raise ValueError(f"Sample bundle sha256 mismatch: {bundle_path}")
+
+    sample_dict_per_ckpt = _torch_load(bundle_path)
+    designed_ids_by_input = _designed_sample_ids_by_input(sample_dict_per_ckpt)
+    n_designed_samples = sum(len(sample_ids) for sample_ids in designed_ids_by_input.values())
+    if n_designed_samples != int(marker.get("n_designed_samples", -1)):
+        raise ValueError(f"Sample bundle designed-sample count mismatch: {bundle_path}")
+    return sample_dict_per_ckpt
 
 
 def _format_designed_sample_id(

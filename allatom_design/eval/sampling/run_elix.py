@@ -22,10 +22,12 @@ from allatom_design.eval.sampling.sequence_design.evaluation import (
 from allatom_design.eval.sampling.sequence_design.core import (
     build_sequence_design_run_spec_from_cfg,
     iter_design_sequence_for_run_spec,
+    iter_saved_design_outputs_for_run_spec,
 )
 from allatom_design.eval.sampling.sequence_design.two_stage import (
     build_two_stage_design_context,
     design_sequence_two_stage,
+    iter_saved_two_stage_design_outputs,
 )
 from allatom_design.eval.metrics.sequence_recovery import build_sequence_recovery_metric_config
 
@@ -75,8 +77,12 @@ def _run_single_stage_elix(
         csv_suffix=csv_suffix,
     )
 
-    print_phase("Phase 2: Redesigning sequence")
-    ckpt_iter = iter_design_sequence_for_run_spec(run_spec)
+    if cfg.get("run_seq_des", True):
+        print_phase("Phase 2: Redesigning sequence")
+        ckpt_iter = iter_design_sequence_for_run_spec(run_spec)
+    else:
+        print_phase("Phase 2: Loading saved sequence-design outputs")
+        ckpt_iter = iter_saved_design_outputs_for_run_spec(run_spec)
 
     both_evals = (
         cfg.struct_pred_cfg.evaluate_self_consistency
@@ -107,40 +113,56 @@ def _run_two_stage_elix(
     two_stage_context = build_two_stage_design_context(cfg)
     stage1_cif_parse_cfg, stage1_preprocess_cfg = resolve_input_cfgs(cfg)
 
-    print_phase("Phase 2: Two-stage sequence design")
-    ckpt_iter = design_sequence_two_stage(
-        seed=cfg.seed,
-        direction=two_stage_context.direction,
-        input_sample_is_designed=cfg.input_sample_is_designed,
-        sample_dict=sample_dict,
-        stage1_design_cfg=two_stage_context.stage1_design_cfg,
-        stage2_design_cfg=two_stage_context.stage2_design_cfg,
-        stage1_region=two_stage_context.stage1_region,
-        stage2_region=two_stage_context.stage2_region,
-        stage2_constraint_type=two_stage_context.stage2_constraint_type,
-        stage1_model_label=two_stage_context.stage1_model_label,
-        stage2_model_label=two_stage_context.stage2_model_label,
-        stage1_cif_parse_cfg=stage1_cif_parse_cfg,
-        stage1_preprocess_cfg=stage1_preprocess_cfg,
-        stage2_cif_parse_cfg=cfg.cif_cfg.parse.designed_samples,
-        stage2_preprocess_cfg=cfg.preprocess_cfg.designed_samples,
-        featurizer_cfg=cfg.featurizer_cfg.design,
-        cif_save_cfg=cfg.cif_cfg.save,
-        stage1_sampling_inputs_df=sampling_inputs_df,
-        log_dir=log_dir,
-        protein_only=cfg.get("protein_only", False),
-        sequence_recovery_metric_config=build_sequence_recovery_metric_config(
-            pocket_cfg=cfg.pocket_cfg,
+    if cfg.get("run_seq_des", True):
+        print_phase("Phase 2: Two-stage sequence design")
+        ckpt_iter = design_sequence_two_stage(
+            seed=cfg.seed,
+            direction=two_stage_context.direction,
             input_sample_is_designed=cfg.input_sample_is_designed,
-            pocket_distance_bins=pocket_distance_bins(cfg),
-        ),
-        csv_suffix=csv_suffix,
-        stage1_guidance_cfg=two_stage_context.stage1_guidance_cfg,
-        stage2_guidance_cfg=two_stage_context.stage2_guidance_cfg,
-        pocket_distance=two_stage_context.pocket_distance,
-        pocket_annotation_method=two_stage_context.pocket_annotation_method,
-        use_calpha_for_pocket_annotation=two_stage_context.use_calpha_for_pocket_annotation,
-    )
+            sample_dict=sample_dict,
+            stage1_design_cfg=two_stage_context.stage1_design_cfg,
+            stage2_design_cfg=two_stage_context.stage2_design_cfg,
+            stage1_region=two_stage_context.stage1_region,
+            stage2_region=two_stage_context.stage2_region,
+            stage2_constraint_type=two_stage_context.stage2_constraint_type,
+            stage1_model_label=two_stage_context.stage1_model_label,
+            stage2_model_label=two_stage_context.stage2_model_label,
+            stage1_cif_parse_cfg=stage1_cif_parse_cfg,
+            stage1_preprocess_cfg=stage1_preprocess_cfg,
+            stage2_cif_parse_cfg=cfg.cif_cfg.parse.designed_samples,
+            stage2_preprocess_cfg=cfg.preprocess_cfg.designed_samples,
+            featurizer_cfg=cfg.featurizer_cfg.design,
+            cif_save_cfg=cfg.cif_cfg.save,
+            stage1_sampling_inputs_df=sampling_inputs_df,
+            log_dir=log_dir,
+            protein_only=cfg.get("protein_only", False),
+            sequence_recovery_metric_config=build_sequence_recovery_metric_config(
+                pocket_cfg=cfg.pocket_cfg,
+                input_sample_is_designed=cfg.input_sample_is_designed,
+                pocket_distance_bins=pocket_distance_bins(cfg),
+            ),
+            csv_suffix=csv_suffix,
+            stage1_guidance_cfg=two_stage_context.stage1_guidance_cfg,
+            stage2_guidance_cfg=two_stage_context.stage2_guidance_cfg,
+            pocket_distance=two_stage_context.pocket_distance,
+            pocket_annotation_method=two_stage_context.pocket_annotation_method,
+            use_calpha_for_pocket_annotation=two_stage_context.use_calpha_for_pocket_annotation,
+        )
+    else:
+        print_phase("Phase 2: Loading saved two-stage sequence-design outputs")
+        ckpt_iter = iter_saved_two_stage_design_outputs(
+            direction=two_stage_context.direction,
+            stage1_region=two_stage_context.stage1_region,
+            stage2_region=two_stage_context.stage2_region,
+            stage2_constraint_type=two_stage_context.stage2_constraint_type,
+            stage1_model_label=two_stage_context.stage1_model_label,
+            stage2_model_label=two_stage_context.stage2_model_label,
+            stage1_design_cfg=two_stage_context.stage1_design_cfg,
+            stage2_design_cfg=two_stage_context.stage2_design_cfg,
+            log_dir=log_dir,
+            pocket_distance=two_stage_context.pocket_distance,
+            csv_suffix=csv_suffix,
+        )
 
     both_evals = (
         cfg.struct_pred_cfg.evaluate_self_consistency

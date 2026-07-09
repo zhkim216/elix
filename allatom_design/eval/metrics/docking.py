@@ -930,6 +930,7 @@ def _compute_small_molecule_docking_metrics_atomarray(
         receptor_pn_unit_iids=receptor_pn_unit_iids,
         ligand_pn_unit_iids=reference_ligand_pn_unit_iids,
         method=reference_pocket_annotation_method,
+        n_min_ligand_atoms=binding_site_plddt_n_min_ligand_atoms,
     )
 
     # Get binding site CA atoms for superposition

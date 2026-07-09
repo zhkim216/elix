@@ -1,0 +1,111 @@
+# Generic two-stage ensemble-conditioning sampling config.
+# Experiment-specific model, checkpoint, dataset, noise, and AF3 values should
+# be supplied by CLI/sbatch overrides.
+defaults:
+  - run_elix_two_stage
+  - _self_
+
+model_cfg:
+  model_name: elix_mpnn
+  denoiser_train_dir: null
+  ckpt_cfg:
+    start_step: null
+    end_step: null
+    eval_every_n_ckpts: 1
+    eval_last_ckpt: false
+    use_ema: true
+
+sampling_cfg:
+  overrides:
+    use_potts_sampling: true
+    potts_sampling_cfg:
+      lcp_expand_edge_idx_fix: true
+      rejection_step: false
+      # Generic fallback. Override each stage's noise_std when pocket and
+      # scaffold use different ensemble noise levels.
+      ensemble_conditioning:
+        enabled: true
+        num_ensembles: 16
+        reduce: "mean"
+        noise_seed: null
+        save_noisy_inputs_dir: null
+        noise_std:
+          protein: 0.0
+          metal: 0.0
+          small_molecule: 0.0
+
+two_stage:
+  enabled: true
+  direction: ps
+  pocket:
+    label: pocket
+    model_cfg:
+      model_name: elix_mpnn
+      denoiser_train_dir: null
+      ckpt_cfg:
+        start_step: null
+        end_step: null
+        eval_every_n_ckpts: 1
+        eval_last_ckpt: false
+        use_ema: true
+    sampling_cfg:
+      base_cfg_path: ${sampling_cfg.base_cfg_path}
+      overrides:
+        batch_size: ${sampling_cfg.overrides.batch_size}
+        num_seqs_per_pdb: ${sampling_cfg.overrides.num_seqs_per_pdb}
+        omit_aas: ${sampling_cfg.overrides.omit_aas}
+        noise_labels: ${sampling_cfg.overrides.noise_labels}
+        num_workers: ${sampling_cfg.overrides.num_workers}
+        use_potts_sampling: true
+        potts_sampling_cfg:
+          potts_sweeps: ${sampling_cfg.overrides.potts_sampling_cfg.potts_sweeps}
+          lcp_expand_edge_idx_fix: true
+          rejection_step: false
+          potts_only_cond: false
+          ensemble_conditioning:
+            enabled: true
+            num_ensembles: ${sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.num_ensembles}
+            reduce: ${sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.reduce}
+            noise_seed: ${sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.noise_seed}
+            save_noisy_inputs_dir: ${sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.save_noisy_inputs_dir}
+            noise_std:
+              protein: ${sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.noise_std.protein}
+              metal: ${sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.noise_std.metal}
+              small_molecule: ${sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.noise_std.small_molecule}
+      guidance: ${sampling_cfg.guidance}
+  scaffold:
+    label: scaffold
+    model_cfg:
+      model_name: elix_mpnn
+      denoiser_train_dir: null
+      ckpt_cfg:
+        start_step: null
+        end_step: null
+        eval_every_n_ckpts: 1
+        eval_last_ckpt: false
+        use_ema: true
+    sampling_cfg:
+      base_cfg_path: ${sampling_cfg.base_cfg_path}
+      overrides:
+        batch_size: ${sampling_cfg.overrides.batch_size}
+        num_seqs_per_pdb: ${sampling_cfg.overrides.num_seqs_per_pdb}
+        omit_aas: ${sampling_cfg.overrides.omit_aas}
+        noise_labels: ${sampling_cfg.overrides.noise_labels}
+        num_workers: ${sampling_cfg.overrides.num_workers}
+        use_potts_sampling: true
+        potts_sampling_cfg:
+          potts_sweeps: ${sampling_cfg.overrides.potts_sampling_cfg.potts_sweeps}
+          lcp_expand_edge_idx_fix: true
+          rejection_step: false
+          potts_only_cond: true
+          ensemble_conditioning:
+            enabled: true
+            num_ensembles: ${sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.num_ensembles}
+            reduce: ${sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.reduce}
+            noise_seed: ${sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.noise_seed}
+            save_noisy_inputs_dir: ${sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.save_noisy_inputs_dir}
+            noise_std:
+              protein: ${sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.noise_std.protein}
+              metal: ${sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.noise_std.metal}
+              small_molecule: ${sampling_cfg.overrides.potts_sampling_cfg.ensemble_conditioning.noise_std.small_molecule}
+      guidance: ${sampling_cfg.guidance}
