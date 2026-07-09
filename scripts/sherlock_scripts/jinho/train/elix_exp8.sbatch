@@ -9,7 +9,7 @@
 # with EXP_NAME_BASE manually.
 #SBATCH --job-name=elix_exp8
 #SBATCH -p possu
-#SBATCH --array=0-4
+#SBATCH --array=4
 #SBATCH --gres=gpu:2
 #SBATCH --mem=96G
 #SBATCH --cpus-per-task=8
@@ -58,8 +58,8 @@ CONFIGS=(
   "no_bml_context|data.query_pn_unit_iids_only=true data.bml_context.enabled=false"
   "bml_context|data.query_pn_unit_iids_only=true data.bml_context.enabled=true"
   "bml_context_crop30|data.query_pn_unit_iids_only=true data.bml_context.enabled=true data.featurizer_cfg.crop_center_cutoff_distance=30.0"
-  "bml_context_ligctx36|data.query_pn_unit_iids_only=true data.bml_context.enabled=true denoiser.mpnn.token_features.ligand_atom_context_num=36"
-  "bml_context_maxtok768|data.query_pn_unit_iids_only=true data.bml_context.enabled=true data.featurizer_cfg.max_tokens=768"
+  "bml_context_maxtok768|data.query_pn_unit_iids_only=true data.bml_context.enabled=true data.featurizer_cfg.max_tokens=768"  
+  "bml_context_dropout02|data.query_pn_unit_iids_only=true data.bml_context.enabled=true denoiser.mpnn.dropout_p=0.2"
 )
 
 IDX=$((ARRAY_TASK_ID))
@@ -120,8 +120,8 @@ python3 allatom_design/train_seq_denoiser.py \
     out_dir="${OUT_DIR}" \
     exp_name="${EXP_NAME}" \
     train.debug=false \
-    train.batch_size=8 \
-    trainer.accumulate_grad_batches=2 \
+    train.batch_size=16 \
+    trainer.accumulate_grad_batches=1 \
     train.compile.compile_model=true \
     trainer.strategy="ddp_find_unused_parameters_true" \
     denoiser.name="${DENOISER_TYPE}" \
@@ -179,7 +179,7 @@ python3 allatom_design/train_seq_denoiser.py \
     denoiser.mpnn.dropout_p=0.1 \
     denoiser.mpnn.expansion_mode=node_concat_context_skip \
     denoiser.mpnn.lmpnn_module.context_edge_update=true \
-    denoiser.mpnn.use_context_skip_connection=true \
+    denoiser.mpnn.use_context_skip_connection=false \
     mask_selector.restype_masking_schedule="uniform_cosine_t" \
     logging.log_every_n_steps=100 \
     logging.wandb_watch_freq=500 \
