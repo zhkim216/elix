@@ -1,0 +1,9 @@
+# @package data
+
+clustering:
+  name: iterative_context_refinement
+  interface_grouping_scheme: per_center
+  sampling_scheme: legacy
+
+bml_context:
+  scheme: iterative_context_refinement

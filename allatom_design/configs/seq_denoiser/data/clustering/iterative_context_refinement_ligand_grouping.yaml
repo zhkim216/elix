@@ -1,0 +1,21 @@
+# @package data
+
+clustering:
+  name: iterative_context_refinement_ligand_grouping
+  interface_grouping_scheme: maximal_center_clique
+  sampling_scheme: ligand_grouped_protein_equalized
+  center_clique_distance_cutoff: ${data.bml_context.contact_distance_cutoff}
+  max_cliques_per_assembly: 100000
+
+  ligand_grouped_sampling_weights:
+    beta_monomer: 1.0
+    beta_interface: 1.0
+    alpha_protein: 1.0
+    alpha_small_molecule: 1.0
+    alpha_metal: 1.0
+    alpha_peptide: 1.0
+    alpha_nuc_ligand: 1.0
+    alpha_nuc_polymer: 1.0
+
+bml_context:
+  scheme: iterative_context_refinement

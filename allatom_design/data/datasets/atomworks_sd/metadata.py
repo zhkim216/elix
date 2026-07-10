@@ -31,7 +31,10 @@ from allatom_design.data.datasets.atomworks_sd.bml_context import (
     annotate_bml_context,
     ensure_bml_context_annotations,
 )
-from allatom_design.data.datasets.atomworks_sd.interface import build_interface_df
+from allatom_design.data.datasets.atomworks_sd.clustering import (
+    GROUPING_MAXIMAL_CENTER_CLIQUE,
+    build_interface_df_for_clustering,
+)
 from allatom_design.data.datasets.atomworks_sd.selectors import (
     nucleic_acid_ligand_center_mask,
     peptide_center_mask,
@@ -147,16 +150,25 @@ def add_chain_counts_info(df: pd.DataFrame) -> pd.DataFrame:
     if "protein_cluster_multiset" in df.columns:
         df["n_prot"] = df["protein_cluster_multiset"].apply(lambda clusters: len(clusters))
         interface_type = df.get("interface_type", pd.Series("", index=df.index)).fillna("")
-        df["n_nuc"] = (interface_type == "nuc_lig_protein").astype(int)
-        df["n_nuc_ligand"] = (interface_type == "nuc_lig_protein").astype(int)
-        df["n_peptide"] = (interface_type == "peptide_protein").astype(int)
-        df["n_small_molecule"] = (interface_type == "bmsm_protein").astype(int)
-        df["n_metal"] = (interface_type == "bmm_protein").astype(int)
+        legacy_counts = {
+            "n_nuc_ligand": (interface_type == "nuc_lig_protein").astype(int),
+            "n_nuc_polymer": pd.Series(0, index=df.index, dtype=int),
+            "n_peptide": (interface_type == "peptide_protein").astype(int),
+            "n_small_molecule": (interface_type == "bmsm_protein").astype(int),
+            "n_metal": (interface_type == "bmm_protein").astype(int),
+        }
+        for column, fallback in legacy_counts.items():
+            if column in df.columns:
+                df[column] = pd.to_numeric(df[column], errors="coerce").fillna(fallback).astype(int)
+            else:
+                df[column] = fallback
+        df["n_nuc"] = df["n_nuc_ligand"] + df["n_nuc_polymer"]
         return df
 
     df["n_prot"] = df["q_pn_unit_is_protein"].fillna(False).astype(bool).astype(int)
     df["n_nuc"] = df.get("q_pn_unit_is_nuc", pd.Series(False, index=df.index)).fillna(False).astype(bool).astype(int)
     df["n_nuc_ligand"] = df.get("q_pn_unit_is_nuc_ligand", pd.Series(False, index=df.index)).fillna(False).astype(bool).astype(int)
+    df["n_nuc_polymer"] = df.get("q_pn_unit_is_nuc_polymer", pd.Series(False, index=df.index)).fillna(False).astype(bool).astype(int)
     df["n_peptide"] = df.get("q_pn_unit_is_peptide", pd.Series(False, index=df.index)).fillna(False).astype(bool).astype(int)
     df["n_small_molecule"] = df.get("q_pn_unit_is_small_molecule", pd.Series(False, index=df.index)).fillna(False).astype(bool).astype(int)
     df["n_metal"] = df["q_pn_unit_is_metal"].fillna(False).astype(bool).astype(int)
@@ -309,11 +321,23 @@ def filter_metadata_to_query_pn_unit_iids_only(
     cfg: DictConfig,
 ) -> pd.DataFrame:
     metadata_df = ensure_bml_context_annotations(metadata_df, cfg)
-    protein_df = apply_filters(
+    designable_protein_df = apply_filters(
         cfg.train_filters.protein_monomer_chain_filter,
         metadata_df.copy(),
     )
-    protein_mask = pd.Series(metadata_df.index.isin(protein_df.index), index=metadata_df.index)
+    designable_protein_mask = pd.Series(
+        metadata_df.index.isin(designable_protein_df.index),
+        index=metadata_df.index,
+    )
+    grouping_scheme = str(
+        (cfg.get("clustering", {}) or {}).get("interface_grouping_scheme", "per_center")
+    )
+    if grouping_scheme == GROUPING_MAXIMAL_CENTER_CLIQUE:
+        # Grouped n_prot counts every protein contacting the center clique,
+        # including chains that cannot themselves be a training target.
+        protein_mask = metadata_df["q_pn_unit_is_protein"].fillna(False).astype(bool)
+    else:
+        protein_mask = designable_protein_mask
     metal_mask = metadata_df[BML_CENTER_METAL_COL].fillna(False).astype(bool)
     small_molecule_mask = metadata_df[BML_CENTER_SMALL_MOLECULE_COL].fillna(False).astype(bool)
     peptide_mask = peptide_center_mask(metadata_df, cfg)
@@ -336,12 +360,14 @@ def filter_metadata_to_query_pn_unit_iids_only(
         raise ValueError("Metadata scope filter removed all rows.")
     logger.info(
         "Filtered train metadata to scope: %d -> %d rows "
-        "(protein_monomer_candidates=%d, metal_center_candidates=%d, "
+        "(protein_scope_candidates=%d, designable_protein_candidates=%d, "
+        "metal_center_candidates=%d, "
         "small_molecule_center_candidates=%d, peptide_center_candidates=%d, "
         "nuc_ligand_center_candidates=%d, context_candidates=%d).",
         len(metadata_df),
         len(out),
         int(protein_mask.sum()),
+        int(designable_protein_mask.sum()),
         int(metal_mask.sum()),
         int(small_molecule_mask.sum()),
         int(peptide_mask.sum()),
@@ -366,7 +392,7 @@ def build_train_interface_df(
         cfg.train_filters.protein_monomer_chain_filter,
         interface_metadata_df.copy(),
     )
-    interface_df = build_interface_df(
+    interface_df = build_interface_df_for_clustering(
         metadata_df=interface_metadata_df,
         protein_df=protein_df,
         dataset_name=dataset_name,
@@ -384,6 +410,11 @@ def build_train_interface_df(
 
     interface_df = add_chain_counts_info(interface_df)
     interface_df = apply_filters(interface_filters.get("2", []), interface_df)
+    if "n_designable_prot" in interface_df.columns:
+        interface_df = apply_filters(
+            ["n_designable_prot == 1"],
+            interface_df,
+        )
     return interface_df
 
 

@@ -9,12 +9,12 @@
 # with EXP_NAME_BASE manually.
 #SBATCH --job-name=elix_exp17
 #SBATCH -p possu
-#SBATCH --array=0-2
-#SBATCH --gres=gpu:1
+#SBATCH --array=0-5
+#SBATCH --gres=gpu:2
 #SBATCH --mem=96G
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=16
 #SBATCH --constraint=GPU_SKU:H100_SXM5
-#SBATCH --time=04:00:00
+#SBATCH --time=1-12:00:00
 #SBATCH --output=/scratch/users/zhkim216/job_output/train_seq_denoiser/elix_exp17_%A_%a.out
 #SBATCH --error=/scratch/users/zhkim216/job_output/train_seq_denoiser/elix_exp17_%A_%a.err
 
@@ -34,7 +34,7 @@ mkdir -p "${JOB_OUTPUT_DIR}" "${HYDRA_DIR}" "${OUT_DIR}"
 
 ARRAY_JOB_ID="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-manual}}"
 ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
-CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-8}"
+CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-16}"
 export TORCHINDUCTOR_CACHE_DIR="/scratch/users/zhkim216/cache/inductor_cache_${EXP_NAME_BASE}_${ARRAY_JOB_ID}_${ARRAY_TASK_ID}"
 mkdir -p "${TORCHINDUCTOR_CACHE_DIR}"
 
@@ -49,18 +49,18 @@ DENOISER_TYPE="elix_mpnn"
 COMMON_OVERRIDES=(
   "data.cluster_id_col=q_pn_unit_cluster_03_id"
   "data.val_exclusion_cluster_id_col=q_pn_unit_cluster_03_id"
-  "data.featurizer_cfg.asymmetric_noise=true"
-  "data.featurizer_cfg.protein_noise_scale=0.3"
-  "data.featurizer_cfg.context_noise_scale=0.1"
-  "denoiser.mpnn.lmpnn_module.dropout_p=0.1"
+  "data.featurizer_cfg.training_structure_noise=0.1"
   "denoiser.mpnn.potts.parameterization=factor"
   "denoiser.mpnn.potts.norm_potts_inputs=false"
 )
 
 CONFIGS=(
-  "fill100_drop01|denoiser.mpnn.token_features.masked_distance_fill=100.0 denoiser.mpnn.dropout_p=0.1"
-  "fill400_drop01|denoiser.mpnn.token_features.masked_distance_fill=400.0 denoiser.mpnn.dropout_p=0.1"
-  "fill1000_drop01|denoiser.mpnn.token_features.masked_distance_fill=1000.0 denoiser.mpnn.dropout_p=0.1"
+  "bm05_bi10_a111111|0.5|1.0|1.0"
+  "bm05_bi10_a131111|0.5|1.0|3.0"
+  "bm10_bi10_a111111|1.0|1.0|1.0"
+  "bm10_bi10_a131111|1.0|1.0|3.0"
+  "bm10_bi05_a111111|1.0|0.5|1.0"
+  "bm10_bi05_a131111|1.0|0.5|3.0"
 )
 
 IDX=$((ARRAY_TASK_ID))
@@ -70,28 +70,15 @@ if (( IDX < 0 || IDX >= ${#CONFIGS[@]} )); then
 fi
 
 CONFIG_ROW="${CONFIGS[$IDX]}"
-IFS='|' read -r CONFIG_NAME OVERRIDES <<< "${CONFIG_ROW}"
-if [[ -z "${CONFIG_NAME}" ]]; then
+IFS='|' read -r CONFIG_NAME BETA_MONOMER BETA_INTERFACE ALPHA_SMALL_MOLECULE <<< "${CONFIG_ROW}"
+if [[ -z "${CONFIG_NAME}" || -z "${BETA_MONOMER}" || -z "${BETA_INTERFACE}" || -z "${ALPHA_SMALL_MOLECULE}" ]]; then
   echo "Malformed config row at index ${IDX}: ${CONFIG_ROW}" >&2
   exit 2
 fi
 EXP_NAME="${EXP_NAME_BASE}_cfg${IDX}_${CONFIG_NAME}"
 
-RESUME_CKPT="null"
-RESUME_USE_CURRENT_CFG="true"
-WANDB_RUN_ID="null"
-WANDB_RESUME="never"
-case "${ELIX_AUTO_RESUME:-0}" in
-  1|true|TRUE|yes|YES)
-    RESUME_CKPT="auto"
-    RESUME_USE_CURRENT_CFG="false"
-    WANDB_RUN_ID="${EXP_NAME}_1gpu"
-    WANDB_RESUME="allow"
-    ;;
-esac
-
-INTERFACE_TYPE_FILTER="n_prot == 1"
-INTERFACE_FILTER_OVERRIDE=("data.train_filters.interface_filter.2=[\"${INTERFACE_TYPE_FILTER}\"]")
+N_PROT_FILTER="n_prot == 1"
+INTERFACE_FILTER_OVERRIDE=("data.train_filters.interface_filter.2=[\"${N_PROT_FILTER}\"]")
 
 # Expand the protein monomer-chain filter resolution cutoff from 3.5 to 9.0.
 # Value must be passed as a quoted hydra string because it contains spaces,
@@ -115,12 +102,10 @@ echo "  bml_center.metal.external_evidence_policy: [pubmed, medba]"
 echo "  bml_center.small_molecule.external_evidence_policy: [klifs, prd]"
 echo "  train_metadata_path: ${TRAIN_METADATA_PATH}"
 echo "  query_pn_unit_iids_only: true"
-echo "  bml_context.scheme: iterative_context_refinement"
-echo "  alpha_protein_protein: 0.0"
-echo "  asymmetric_noise: true"
-echo "  protein_noise_scale: 0.3"
-echo "  context_noise_scale: 0.1"
-echo "  lmpnn_module.dropout_p: 0.1"
+echo "  clustering_profile: iterative_context_refinement_ligand_grouping"
+echo "  beta_monomer: ${BETA_MONOMER}"
+echo "  beta_interface: ${BETA_INTERFACE}"
+echo "  alphas: protein=1.0 small_molecule=${ALPHA_SMALL_MOLECULE} metal=1.0 peptide=1.0 nuc_ligand=1.0 nuc_polymer=1.0"
 echo "  k_neighbors: 48"
 echo "  interface_filter_override: ${INTERFACE_FILTER_OVERRIDE[*]}"
 echo "  monomer_filter_override: ${MONOMER_FILTER_OVERRIDE[*]}"
@@ -128,10 +113,6 @@ echo "  base_dir: ${BASE_DIR}"
 echo "  out_dir: ${OUT_DIR}"
 echo "  hydra_dir: ${HYDRA_DIR}/${EXP_NAME}"
 echo "  torchinductor_cache: ${TORCHINDUCTOR_CACHE_DIR}"
-echo "  resume_ckpt_path: ${RESUME_CKPT}"
-echo "  resume_use_current_cfg: ${RESUME_USE_CURRENT_CFG}"
-echo "  wandb_run_id: ${WANDB_RUN_ID}"
-echo "  wandb_resume: ${WANDB_RESUME}"
 
 SLURM_JOB_ID_FOR_DDP="${SLURM_JOB_ID:-0}"
 export MASTER_ADDR=127.0.0.1
@@ -144,23 +125,22 @@ DEBUG= HYDRA_FULL_ERROR=1 WANDB__SERVICE_WAIT=300 \
 python3 allatom_design/train_seq_denoiser.py \
     --config-path configs/seq_denoiser \
     --config-name elix.yaml \
+    data/clustering=iterative_context_refinement_ligand_grouping \
     wandb.wandb_id="${WANDB_ID}" \
     wandb.project="${PROJECT}" \
     wandb.group="${GROUP}" \
     wandb.no_wandb=false \
-    wandb.run_id="${WANDB_RUN_ID}" \
-    wandb.resume="${WANDB_RESUME}" \
     num_workers="${CPUS_PER_TASK}" \
     out_dir="${OUT_DIR}" \
     exp_name="${EXP_NAME}" \
     train.debug=false \
     train.batch_size=8 \
-    trainer.accumulate_grad_batches=4 \
+    trainer.accumulate_grad_batches=2 \
     train.compile.compile_model=true \
     trainer.strategy="ddp_find_unused_parameters_true" \
     denoiser.name="${DENOISER_TYPE}" \
-    resume.use_current_cfg="${RESUME_USE_CURRENT_CFG}" \
-    resume.ckpt_path="${RESUME_CKPT}" \
+    resume.use_current_cfg=true \
+    resume.ckpt_path=null \
     loss.loss_weights.seq_loss=1.0 \
     loss.main_seq_loss_pocket_only=false \
     loss.main_potts_loss_pocket_only=false \
@@ -176,20 +156,17 @@ python3 allatom_design/train_seq_denoiser.py \
     data.samples_per_epoch=50000 \
     data.bml_center.small_molecule.min_contacting_protein_atom_ratio=1.0 \
     data.bml_context.enabled=true \
-    data.bml_context.scheme=iterative_context_refinement \
     data.query_pn_unit_iids_only=true \
     "${INTERFACE_FILTER_OVERRIDE[@]}" \
     "${MONOMER_FILTER_OVERRIDE[@]}" \
-    data.sampling_weights.alphas_interface.alpha_protein_protein=0.0 \
-    data.sampling_weights.alphas_interface.alpha_protein_small_molecule=1.0 \
-    data.sampling_weights.alphas_interface.alpha_protein_metal=1.0 \
-    data.sampling_weights.alphas_interface.alpha_protein_nuc=0.0 \
-    data.sampling_weights.alphas_interface.alpha_protein_nuc_lig=1.0 \
-    data.sampling_weights.alphas_interface.alpha_protein_peptide=1.0 \
-    data.sampling_weights.single_protein_context_weight=1.0 \
-    data.sampling_weights.multi_protein_context_weight=0.0 \
-    data.sampling_weights.k_percentile=90.0 \
-    data.sampling_weights.ligand_cluster_col=null \
+    data.clustering.ligand_grouped_sampling_weights.beta_monomer="${BETA_MONOMER}" \
+    data.clustering.ligand_grouped_sampling_weights.beta_interface="${BETA_INTERFACE}" \
+    data.clustering.ligand_grouped_sampling_weights.alpha_protein=1.0 \
+    data.clustering.ligand_grouped_sampling_weights.alpha_small_molecule="${ALPHA_SMALL_MOLECULE}" \
+    data.clustering.ligand_grouped_sampling_weights.alpha_metal=1.0 \
+    data.clustering.ligand_grouped_sampling_weights.alpha_peptide=1.0 \
+    data.clustering.ligand_grouped_sampling_weights.alpha_nuc_ligand=1.0 \
+    data.clustering.ligand_grouped_sampling_weights.alpha_nuc_polymer=1.0 \
     data.featurizer_cfg.is_inference=false \
     data.featurizer_cfg.occupancy_threshold_protein_backbone=0.0 \
     data.featurizer_cfg.remove_unresolved_tokens=true \
@@ -200,6 +177,7 @@ python3 allatom_design/train_seq_denoiser.py \
     data.featurizer_cfg.drop_prob_non_protein_chains=0.0 \
     data.featurizer_cfg.pocket_distance=5.0 \
     data.featurizer_cfg.pocket_n_min_ligand_atoms=1 \
+    data.featurizer_cfg.asymmetric_noise=false \
     denoiser.mpnn.hidden_dim=128 \
     denoiser.mpnn.k_neighbors=48 \
     denoiser.mpnn.ligand_conditioning=true \
@@ -209,6 +187,7 @@ python3 allatom_design/train_seq_denoiser.py \
     denoiser.mpnn.potts.multi_head.dim_multi_head=128 \
     denoiser.mpnn.potts.multi_head.num_heads=1 \
     denoiser.mpnn.potts.multi_head.reduce=mean \
+    denoiser.mpnn.dropout_p=0.2 \
     denoiser.mpnn.expansion_mode=node_concat_context_skip \
     denoiser.mpnn.lmpnn_module.context_edge_update=true \
     denoiser.mpnn.use_context_skip_connection=false \
@@ -221,9 +200,8 @@ python3 allatom_design/train_seq_denoiser.py \
     mask_selector.restype_masking_schedule="uniform_cosine_t" \
     logging.log_every_n_steps=100 \
     logging.wandb_watch_freq=500 \
-    checkpointing.save_latest_every_n_steps=625 \
+    checkpointing.save_latest_every_n_steps=2500 \
     trainer.check_val_every_n_epoch=2 \
     trainer.max_steps=200000 \
     "${COMMON_OVERRIDES[@]}" \
-    ${OVERRIDES} \
     hydra.run.dir="${HYDRA_DIR}/${EXP_NAME}"
