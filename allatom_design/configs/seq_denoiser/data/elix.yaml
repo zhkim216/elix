@@ -1,3 +1,7 @@
+defaults:
+  - _self_
+  - clustering: iterative_context_refinement
+
 task: ${model.task}
 dataset_impl: atomworks_sd
 pdb_path: /scratch/users/zhkim216/datasets/atomworks_pdb_full_v9
@@ -75,7 +79,7 @@ train_filters:
     "1":
       - "resolution < 3.5"
     "2":
-      - "interface_type in ['bmm_protein', 'bmsm_protein', 'nuc_lig_protein', 'peptide_protein']"
+      - "interface_type in ['bmm_protein', 'bmsm_protein', 'nuc_lig_protein', 'peptide_protein', 'ligand_group_protein']"
       - "n_prot == 1"
 
 val_filters:

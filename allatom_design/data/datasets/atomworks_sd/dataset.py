@@ -76,6 +76,7 @@ class AtomworksSDDataset(MolecularDataset):
             k_percentile=self.cfg.sampling_weights["k_percentile"],
             single_protein_context_weight=self.cfg.sampling_weights.get("single_protein_context_weight", 1.0),
             multi_protein_context_weight=self.cfg.sampling_weights.get("multi_protein_context_weight", 1.0),
+            clustering_cfg=self.cfg.get("clustering", {}),
         )
         validate_sampling_weights(self.protein_monomer_chain_df, self.interface_df)
         self.parsed_df = md.parse_train_dfs(

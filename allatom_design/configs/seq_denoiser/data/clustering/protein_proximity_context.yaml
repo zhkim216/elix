@@ -1,0 +1,9 @@
+# @package data
+
+clustering:
+  name: protein_proximity_context
+  interface_grouping_scheme: per_center
+  sampling_scheme: legacy
+
+bml_context:
+  scheme: protein_proximity_context
