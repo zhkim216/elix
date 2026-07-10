@@ -23,6 +23,7 @@ from allatom_design.eval.chemical_components import normalize_ccd_code
 
 # Global caches for AF3 runner module, ModelRunner, and DataPipelineConfig.
 _AF3_RUNNER_MOD = None
+_AF3_RUNNER_PATH = None
 _AF3_MODEL_RUNNER = None
 _AF3_DATA_PIPELINE_CONFIG = None
 _AF3_MODEL_RUNNER_CACHE_KEY = None
@@ -404,15 +405,19 @@ def _prepare_af3_prediction_run(
 
 
 def _load_af3_runner(runner_path: str):
-    """Load run_alphafold.py as a module dynamically. Cached after first load."""
-    global _AF3_RUNNER_MOD
-    if _AF3_RUNNER_MOD is not None:
+    """Load run_alphafold.py, caching only for the same resolved path."""
+    global _AF3_RUNNER_MOD, _AF3_RUNNER_PATH
+    resolved_runner_path = str(Path(runner_path).expanduser().resolve())
+    if _AF3_RUNNER_MOD is not None and _AF3_RUNNER_PATH == resolved_runner_path:
         return _AF3_RUNNER_MOD
 
-    spec = importlib.util.spec_from_file_location("af3_runner", runner_path)
+    spec = importlib.util.spec_from_file_location("af3_runner", resolved_runner_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load AF3 runner from {resolved_runner_path}")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     _AF3_RUNNER_MOD = mod
+    _AF3_RUNNER_PATH = resolved_runner_path
     return mod
 
 
@@ -463,6 +468,13 @@ def _get_af3_model_runner_and_config(
         _AF3_MODEL_RUNNER is None
         or _AF3_MODEL_RUNNER_CACHE_KEY != model_runner_cache_key
     ):
+        if _AF3_MODEL_RUNNER is not None:
+            # SS and TC use different model configs. Drop the previous runner
+            # before constructing the next one so mixed-mode batches do not
+            # transiently retain two complete parameter trees on the GPU.
+            _AF3_MODEL_RUNNER = None
+            _AF3_MODEL_RUNNER_CACHE_KEY = None
+            gc.collect()
         torch.cuda.empty_cache()
 
         devices = jax.local_devices(backend="gpu")

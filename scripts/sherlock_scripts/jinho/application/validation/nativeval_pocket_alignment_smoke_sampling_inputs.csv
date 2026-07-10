@@ -1,0 +1,3 @@
+pdb_key,binder_pn_unit_iids,context_pn_unit_iids,frame_pn_unit_iids,template_pn_unit_iids,fixed_pos_seq,fixed_pos_scn,fixed_pos_override_seq,pos_restrict_aatype
+9bks,"[""A_1""]","[""B_1""]","[""A_1""]",[],,,,
+8tnb,"[""A_1"", ""C_1""]","[""D_1""]","[""A_1"", ""C_1""]",[],,,,

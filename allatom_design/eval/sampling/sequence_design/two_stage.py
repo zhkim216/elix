@@ -247,6 +247,10 @@ def _build_stage2_inputs_and_constraints(
                 stage2_sample_dict[stage1_sample_id]["pdb_chain_info"] = copy.deepcopy(
                     stage1_entry["pdb_chain_info"]
                 )
+            if "pn_unit_roles" in stage1_entry:
+                stage2_sample_dict[stage1_sample_id]["pn_unit_roles"] = copy.deepcopy(
+                    stage1_entry["pn_unit_roles"]
+                )
             lineage_by_stage1_sample_id[stage1_sample_id] = {
                 "stage1_region": stage1_region,
                 "stage2_region": stage2_region,

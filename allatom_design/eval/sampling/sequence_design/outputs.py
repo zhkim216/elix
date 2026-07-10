@@ -31,7 +31,9 @@ from allatom_design.eval.metrics.sequence_recovery import (
     calculate_sequence_recovery,
 )
 from allatom_design.eval.utils.sampling_inputs import (
+    is_role_sampling_inputs,
     matched_sampling_input_row,
+    role_pn_unit_roles_from_sampling_row,
     resolve_query_pn_unit_iids_from_sampling_row,
     sampling_ligand_ccd_by_iid as ligand_ccd_by_iid_from_sampling_row,
 )
@@ -468,6 +470,34 @@ def _previous_ligand_ccd_by_iid(previous_chain_info: dict) -> dict[str, str]:
     }
 
 
+def _previous_ligand_values_by_iid(
+    previous_chain_info: dict,
+    keys: tuple[str, ...],
+) -> dict[str, str]:
+    previous_iids = [
+        str(pn_unit_iid)
+        for pn_unit_iid in previous_chain_info.get("ligand_pn_unit_iids", [])
+    ]
+    for key in keys:
+        values = previous_chain_info.get(key)
+        if values is None:
+            continue
+        if isinstance(values, dict):
+            return {
+                str(pn_unit_iid): str(value)
+                for pn_unit_iid, value in values.items()
+                if value is not None and str(value).strip()
+            }
+        if isinstance(values, str):
+            return {previous_iids[0]: values} if len(previous_iids) == 1 else {}
+        return {
+            pn_unit_iid: str(value)
+            for pn_unit_iid, value in zip(previous_iids, values)
+            if value is not None and str(value).strip()
+        }
+    return {}
+
+
 def _filter_query_pn_unit_iids(
     *,
     protein_pn_unit_iids: list[str],
@@ -488,32 +518,20 @@ def _filter_query_pn_unit_iids(
         for pn_unit_iid in ligand_pn_unit_iids
         if pn_unit_iid in query_pn_unit_iid_set
     ]
-    if query_protein_pn_unit_iids:
-        protein_pn_unit_iids = query_protein_pn_unit_iids
-    if query_ligand_pn_unit_iids:
-        ligand_pn_unit_iids = query_ligand_pn_unit_iids
-    return protein_pn_unit_iids, ligand_pn_unit_iids
+    return query_protein_pn_unit_iids, query_ligand_pn_unit_iids
 
 
 def _build_designed_sample_pdb_chain_info(
     *,
     designed_sample_atom_array,
     previous_chain_info: dict,
-    input_sample_id: str,
-    sampling_inputs_df: pd.DataFrame | None,
+    sampling_row: pd.Series | None,
 ) -> dict:
     pdb_chain_info = defaultdict(list)
     protein_pn_unit_iids, ligand_pn_unit_iids, ligand_ccd_code_by_iid = (
         _designed_sample_chain_components(designed_sample_atom_array)
     )
 
-    pdb_id = str(input_sample_id).split("_")[0]
-    sampling_row = matched_sampling_input_row(
-        sampling_inputs_df,
-        pdb_id,
-        pdb_key=input_sample_id,
-        sample_id=input_sample_id,
-    )
     query_pn_unit_iids = resolve_query_pn_unit_iids_from_sampling_row(sampling_row)
     if len(query_pn_unit_iids) == 0 and previous_chain_info:
         query_pn_unit_iids = [
@@ -557,6 +575,36 @@ def _build_designed_sample_pdb_chain_info(
             pdb_chain_info["af3_ligand_ccd_codes"].extend(af3_ligand_ccd_codes)
     if "af3_user_ccd_path" in previous_chain_info:
         pdb_chain_info["af3_user_ccd_path"] = previous_chain_info["af3_user_ccd_path"]
+
+    ligand_smiles_by_iid = _previous_ligand_values_by_iid(
+        previous_chain_info,
+        ("ligand_smiles_by_iid", "ligand_smiles"),
+    )
+    selected_ligand_smiles = {
+        pn_unit_iid: ligand_smiles_by_iid[pn_unit_iid]
+        for pn_unit_iid in ligand_pn_unit_iids
+        if pn_unit_iid in ligand_smiles_by_iid
+    }
+    if selected_ligand_smiles:
+        pdb_chain_info["ligand_smiles_by_iid"] = selected_ligand_smiles
+
+    reference_ligand_by_iid = _previous_ligand_values_by_iid(
+        previous_chain_info,
+        (
+            "reference_ligand_pn_unit_iids_by_iid",
+            "reference_ligand_pn_unit_iids",
+            "original_ligand_pn_unit_iids",
+        ),
+    )
+    selected_reference_ligands = {
+        pn_unit_iid: reference_ligand_by_iid[pn_unit_iid]
+        for pn_unit_iid in ligand_pn_unit_iids
+        if pn_unit_iid in reference_ligand_by_iid
+    }
+    if selected_reference_ligands:
+        pdb_chain_info["reference_ligand_pn_unit_iids_by_iid"] = (
+            selected_reference_ligands
+        )
 
     return pdb_chain_info
 
@@ -664,12 +712,36 @@ def _attach_designed_sample_chain_info(
         previous_chain_info = sample_entry.get("pdb_chain_info", {})
         designed_sample_atom_array = sample_entry["designed_sample_atom_array"][0]
         input_sample_id = sample_entry.get("input_sample_id", example_id)
+        sampling_row = matched_sampling_input_row(
+            sampling_inputs_df,
+            str(input_sample_id).split("_")[0],
+            pdb_key=input_sample_id,
+            sample_id=input_sample_id,
+        )
         sample_entry["pdb_chain_info"] = _build_designed_sample_pdb_chain_info(
             designed_sample_atom_array=designed_sample_atom_array,
             previous_chain_info=previous_chain_info,
-            input_sample_id=input_sample_id,
-            sampling_inputs_df=sampling_inputs_df,
+            sampling_row=sampling_row,
         )
+        if sampling_row is not None and is_role_sampling_inputs(sampling_row):
+            roles = role_pn_unit_roles_from_sampling_row(sampling_row)
+            protein_iids = set(sample_entry["pdb_chain_info"]["protein_pn_unit_iids"])
+            for role_name in (
+                "binder_pn_unit_iids",
+                "frame_pn_unit_iids",
+                "template_pn_unit_iids",
+            ):
+                nonprotein_iids = [
+                    pn_unit_iid
+                    for pn_unit_iid in roles[role_name]
+                    if pn_unit_iid not in protein_iids
+                ]
+                if nonprotein_iids:
+                    raise ValueError(
+                        f"{role_name} must contain only protein PN units; "
+                        f"got {nonprotein_iids}"
+                    )
+            sample_entry["pn_unit_roles"] = roles
 
 
 def collect_design_outputs(

@@ -85,8 +85,8 @@ def _run_single_stage_elix(
         ckpt_iter = iter_saved_design_outputs_for_run_spec(run_spec)
 
     both_evals = (
-        cfg.struct_pred_cfg.evaluate_self_consistency
-        and cfg.struct_pred_cfg.evaluate_docking_consistency
+        bool(cfg.struct_pred_cfg.get("evaluate_self_consistency", False))
+        and bool(cfg.struct_pred_cfg.get("evaluate_docking_consistency", False))
     )
     for sample_dict_per_ckpt, log_dir_per_ckpt, ckpt_info in ckpt_iter:
         evaluate_af3_for_checkpoint(
@@ -165,13 +165,20 @@ def _run_two_stage_elix(
         )
 
     both_evals = (
-        cfg.struct_pred_cfg.evaluate_self_consistency
-        and cfg.struct_pred_cfg.evaluate_docking_consistency
+        bool(cfg.struct_pred_cfg.get("evaluate_self_consistency", False))
+        and bool(cfg.struct_pred_cfg.get("evaluate_docking_consistency", False))
     )
     for sample_dict_per_ckpt, log_dir_per_ckpt, ckpt_info, manifest_rows in ckpt_iter:
         for row in manifest_rows:
-            row["af3_self_consistency_enabled"] = cfg.struct_pred_cfg.evaluate_self_consistency
-            row["af3_docking_consistency_enabled"] = cfg.struct_pred_cfg.evaluate_docking_consistency
+            row["af3_structure_prediction_enabled"] = bool(
+                cfg.struct_pred_cfg.get("evaluate_structure_prediction", False)
+            )
+            row["af3_self_consistency_enabled"] = bool(
+                cfg.struct_pred_cfg.get("evaluate_self_consistency", False)
+            )
+            row["af3_docking_consistency_enabled"] = bool(
+                cfg.struct_pred_cfg.get("evaluate_docking_consistency", False)
+            )
         if manifest_rows:
             log_dir_per_ckpt.mkdir(parents=True, exist_ok=True)
             manifest_path = log_dir_per_ckpt / f"twostage_manifest{csv_suffix}.csv"
