@@ -20,7 +20,7 @@ from allatom_design.utils.feature_utils import slice_feats
 from allatom_design.utils.tensor_utils import to
 from allatom_design.model.seq_denoiser.denoisers.denoiser import \
     BaseSeqDenoiser
-from allatom_design.model.seq_denoiser.denoisers.seq_design import complexity
+from allatom_design.model.seq_denoiser.denoisers.seq_design import complexity, frustration
 
 logger = logging.getLogger(__name__)
 
@@ -643,6 +643,13 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
         potts_sampling_cfg = sampling_inputs["potts_sampling_cfg"]
         guidance_cfg = potts_sampling_cfg.get("guidance_cfg", None)
         use_guidance = bool(guidance_cfg) and bool(guidance_cfg.get("enabled", False))
+        frustration_cfg = potts_sampling_cfg.get("frustration", {}) or {}
+        use_frustration = bool(frustration_cfg.get("enabled", False))
+        if use_frustration and use_guidance:
+            raise NotImplementedError(
+                "Pairwise frustration sampling cannot yet be combined with Potts guidance "
+                "or selectivity guidance."
+            )
         if potts_aux_provider is not None and use_guidance:
             raise NotImplementedError(
                 "A custom Potts aux provider cannot be combined with Potts guidance."
@@ -691,6 +698,17 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
             )
         self._validate_potts_aux_alphabet(potts_decoder_aux)
         self._validate_restype_alphabet(batch)
+
+        # Apply the sampling-only transform after any tied/ensemble aggregation
+        # has produced the final sparse Potts coupling tensor. The Potts head,
+        # training losses, and standalone scoring path continue to use raw J.
+        if use_frustration:
+            potts_decoder_aux["J"] = frustration.mix_pairwise_couplings(
+                potts_decoder_aux["J"],
+                potts_decoder_aux["mask_ij"],
+                alpha=float(frustration_cfg["alpha"]),
+                beta=float(frustration_cfg["beta"]),
+            )
 
         # Compute negative branch Potts parameters if guidance is on.
         potts_decoder_aux_negative = None
