@@ -22,6 +22,15 @@ potts_sampling_cfg:
   rejection_step: false
   potts_only_cond: false  # only condition on sequence in the potts model
 
+  # Sampling-only pairwise coupling transform. Statistics are computed over
+  # every edge's full Q x Q state matrix with no variance floor:
+  #   F_ij = (J_ij - mu_ij) / sigma_ij
+  #   J'_ij = alpha * J_ij + beta * F_ij
+  frustration:
+    enabled: false
+    alpha: 1.0
+    beta: 0.0
+
   # add gaussian noise to inputs
   noise_std: 0.0
 
