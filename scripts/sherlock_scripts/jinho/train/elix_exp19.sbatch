@@ -2,12 +2,12 @@
 # Submit from Sherlock:
 #   PROJECT_ROOT=/home/users/zhkim216/code/elix \
 #     bash scripts/sherlock_scripts/jinho/setup/wrap_sbatch_in_container_elix.sh \
-#     scripts/sherlock_scripts/jinho/train/elix_exp18.sbatch
+#     scripts/sherlock_scripts/jinho/train/elix_exp19.sbatch
 #
 # NOTE: The #SBATCH lines below (job-name / output / error) cannot use shell
 # variables because SLURM parses them before the shell runs. Keep them in sync
 # with EXP_NAME_BASE manually.
-#SBATCH --job-name=elix_exp18
+#SBATCH --job-name=elix_exp19
 #SBATCH -p possu
 #SBATCH --array=0-5
 #SBATCH --gres=gpu:2
@@ -15,15 +15,15 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --constraint=GPU_SKU:H100_SXM5
 #SBATCH --time=1-12:00:00
-#SBATCH --output=/scratch/users/zhkim216/job_output/train_seq_denoiser/elix_exp18_%A_%a.out
-#SBATCH --error=/scratch/users/zhkim216/job_output/train_seq_denoiser/elix_exp18_%A_%a.err
+#SBATCH --output=/scratch/users/zhkim216/job_output/train_seq_denoiser/elix_exp19_%A_%a.out
+#SBATCH --error=/scratch/users/zhkim216/job_output/train_seq_denoiser/elix_exp19_%A_%a.err
 
 set -euo pipefail
 
 # Single source of truth for the experiment name. HYDRA_DIR and the inductor
 # cache below are derived from it, so changing this propagates automatically.
 # (The #SBATCH lines above still need a manual update.)
-EXP_NAME_BASE="elix_exp18"
+EXP_NAME_BASE="elix_exp19"
 
 BASE_DIR=/home/users/zhkim216/code/elix
 HYDRA_DIR=/scratch/users/zhkim216/hydra_outputs/train_seq_denoiser/${EXP_NAME_BASE}
