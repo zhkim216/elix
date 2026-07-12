@@ -3,7 +3,9 @@
 clustering:
   name: protein_proximity_context
   interface_grouping_scheme: per_center
-  sampling_scheme: legacy
+  sampling_scheme: percentile
+  interface_fraction_sampling_weights:
+    target_fraction_of_max: null
 
 bml_context:
   scheme: protein_proximity_context
