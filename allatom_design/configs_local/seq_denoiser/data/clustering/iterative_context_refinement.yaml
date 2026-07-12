@@ -3,7 +3,9 @@
 clustering:
   name: iterative_context_refinement
   interface_grouping_scheme: per_center
-  sampling_scheme: legacy
+  sampling_scheme: percentile
+  interface_fraction_sampling_weights:
+    target_fraction_of_max: null
 
 bml_context:
   scheme: iterative_context_refinement
