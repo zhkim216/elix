@@ -50,27 +50,27 @@ class AtomworksSDDataset(MolecularDataset):
     # ------------------------------------------------------------------ #
     def _build_train_index(self) -> None:
         self.metadata_path = self.cfg.train_metadata_path
-        self.metadata_df, self.val_cluster_ids = md.process_train_metadata_df(
+        metadata_df, self.val_cluster_ids = md.process_train_metadata_df(
             self.metadata_path,
             cfg=self.cfg,
             phase=self.phase,
         )
         dataset_name = self.cfg.get("dataset_name", Path(self.metadata_path).parent.name)
-        self.protein_monomer_chain_df = md.build_monomer_chain_df(
-            self.metadata_df,
+        monomer_df = md.build_monomer_chain_df(
+            metadata_df,
             self.cfg,
             dataset_name,
             self.val_cluster_ids,
         )
-        self.interface_df = md.build_train_interface_df(
-            self.metadata_df,
+        interface_df = md.build_train_interface_df(
+            metadata_df,
             self.cfg,
             dataset_name,
             self.val_cluster_ids,
         )
-        self.protein_monomer_chain_df, self.interface_df = add_sampling_weights(
-            monomer_df=self.protein_monomer_chain_df,
-            interface_df=self.interface_df,
+        monomer_df, interface_df = add_sampling_weights(
+            monomer_df=monomer_df,
+            interface_df=interface_df,
             alphas_interface=self.cfg.sampling_weights["alphas_interface"],
             cluster_col="q_pn_unit_cluster_id",
             k_percentile=self.cfg.sampling_weights["k_percentile"],
@@ -78,10 +78,10 @@ class AtomworksSDDataset(MolecularDataset):
             multi_protein_context_weight=self.cfg.sampling_weights.get("multi_protein_context_weight", 1.0),
             clustering_cfg=self.cfg.get("clustering", {}),
         )
-        validate_sampling_weights(self.protein_monomer_chain_df, self.interface_df)
+        validate_sampling_weights(monomer_df, interface_df)
         self.parsed_df = md.parse_train_dfs(
-            self.protein_monomer_chain_df,
-            self.interface_df,
+            monomer_df,
+            interface_df,
             self.cfg,
         )
         self._sampler = Sampler(self.get_sampling_weights())
@@ -89,8 +89,8 @@ class AtomworksSDDataset(MolecularDataset):
 
     def _build_val_index(self) -> None:
         self.metadata_path = self.cfg.val_metadata_path
-        self.metadata_df = md.process_val_metadata_df(self.metadata_path)
-        self.parsed_df = md.parse_val_df(self.metadata_df)
+        metadata_df = md.process_val_metadata_df(self.metadata_path)
+        self.parsed_df = md.parse_val_df(metadata_df)
 
     # ------------------------------------------------------------------ #
     # MolecularDataset interface
