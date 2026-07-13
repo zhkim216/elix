@@ -73,7 +73,7 @@ class AtomworksSDDataset(MolecularDataset):
             interface_df=self.interface_df,
             alphas_interface=self.cfg.sampling_weights["alphas_interface"],
             cluster_col="q_pn_unit_cluster_id",
-            k_percentile=self.cfg.sampling_weights["k_percentile"],
+            fixed_k=self.cfg.sampling_weights.get("fixed_k"),
             single_protein_context_weight=self.cfg.sampling_weights.get("single_protein_context_weight", 1.0),
             multi_protein_context_weight=self.cfg.sampling_weights.get("multi_protein_context_weight", 1.0),
             clustering_cfg=self.cfg.get("clustering", {}),

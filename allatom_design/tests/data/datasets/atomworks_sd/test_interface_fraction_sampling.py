@@ -92,34 +92,6 @@ def _interface_mass_for_cluster(interface_df: pd.DataFrame, cluster_id: str) -> 
     return interface_df.loc[mask, "sampling_weight"].sum()
 
 
-def test_absent_legacy_and_percentile_profiles_are_exactly_equal():
-    monomer_df, interface_df = _frames()
-    kwargs = {
-        "alphas_interface": _alphas(),
-        "k_percentile": 80.0,
-        "single_protein_context_weight": 0.7,
-        "multi_protein_context_weight": 1.3,
-    }
-
-    absent = add_sampling_weights(monomer_df, interface_df, **kwargs)
-    legacy = add_sampling_weights(
-        monomer_df,
-        interface_df,
-        clustering_cfg={"sampling_scheme": "legacy"},
-        **kwargs,
-    )
-    percentile = add_sampling_weights(
-        monomer_df,
-        interface_df,
-        clustering_cfg={"sampling_scheme": "percentile"},
-        **kwargs,
-    )
-
-    for expected, actual in ((absent, legacy), (absent, percentile)):
-        pd.testing.assert_frame_equal(expected[0], actual[0])
-        pd.testing.assert_frame_equal(expected[1], actual[1])
-
-
 def test_interface_fraction_hits_derived_target_and_equalizes_combined_mass():
     target_fraction_of_max = 0.6
     maximum_feasible_fraction = 2.0 / 3.0

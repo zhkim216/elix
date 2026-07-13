@@ -95,7 +95,7 @@ sampling_weights:
     alpha_protein_peptide:        1.0
   single_protein_context_weight: 1.0
   multi_protein_context_weight: 1.0
-  k_percentile: 90.0
+  fixed_k: 8.0
   ligand_cluster_col: null
 
 cif_parser_args:

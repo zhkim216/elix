@@ -1,4 +1,4 @@
-"""Existing percentile-capped per-center sampling weights."""
+"""Fixed-K capped per-center sampling weights."""
 
 import logging
 
@@ -14,21 +14,24 @@ from allatom_design.data.datasets.atomworks_sd.sampling_schemes._per_center impo
 logger = logging.getLogger("allatom_design.data.datasets.atomworks_sd.sampling")
 
 
-def _add_percentile_sampling_weights(
+def _add_fixed_k_sampling_weights(
     *,
     monomer_df: pd.DataFrame,
     interface_df: pd.DataFrame,
     alphas_interface: dict[str, float],
     cluster_col: str,
-    k_percentile: float,
+    fixed_k: float,
     single_protein_context_weight: float,
     multi_protein_context_weight: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     monomer_df = monomer_df.copy()
     interface_df = interface_df.copy()
+    fixed_k = float(fixed_k)
     single_protein_context_weight = float(single_protein_context_weight)
     multi_protein_context_weight = float(multi_protein_context_weight)
 
+    if not np.isfinite(fixed_k) or fixed_k <= 0:
+        raise ValueError(f"`fixed_k` must be finite and positive; got {fixed_k!r}.")
     if "protein_cluster_multiset" not in interface_df.columns:
         raise ValueError("interface_df must contain `protein_cluster_multiset`.")
 
@@ -47,7 +50,6 @@ def _add_percentile_sampling_weights(
         interface_df["context_weight"] = []
         interface_df["sampling_weight"] = []
         interface_contrib = {}
-        k_value = 1.0
     else:
         interface_df["context_weight"] = interface_df.apply(
             _context_weight,
@@ -60,17 +62,10 @@ def _add_percentile_sampling_weights(
         )
         interface_contrib = _compute_interface_contrib(interface_df)
 
-        if interface_contrib and max(interface_contrib.values()) > 0:
-            k_value = float(
-                np.percentile(list(interface_contrib.values()), k_percentile)
-            )
-        else:
-            k_value = 1.0
-
         scaling = {
-            cluster_id: k_value / contrib
+            cluster_id: fixed_k / contrib
             for cluster_id, contrib in interface_contrib.items()
-            if contrib > k_value and contrib > 0
+            if contrib > fixed_k and contrib > 0
         }
         if scaling:
             interface_df["sampling_weight"] = interface_df.apply(
@@ -91,7 +86,7 @@ def _add_percentile_sampling_weights(
 
     def _monomer_weight(row):
         cluster_id = row[cluster_col]
-        target = k_value - interface_contrib.get(cluster_id, 0.0)
+        target = fixed_k - interface_contrib.get(cluster_id, 0.0)
         return max(target, 0.0) / monomer_counts.get(cluster_id, 1)
 
     monomer_df["sampling_weight"] = monomer_df.apply(_monomer_weight, axis=1)
@@ -102,7 +97,7 @@ def _add_percentile_sampling_weights(
         "single_protein_context_weight=%.4f, multi_protein_context_weight=%.4f",
         len(monomer_df),
         len(interface_df),
-        k_value,
+        fixed_k,
         alpha_by_interface_type["bmm_protein"],
         alpha_by_interface_type["bmsm_protein"],
         alpha_by_interface_type["nuc_lig_protein"],

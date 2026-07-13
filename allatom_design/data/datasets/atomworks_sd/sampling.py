@@ -9,19 +9,17 @@ from allatom_design.data.datasets.atomworks_sd.sampling_schemes.interface_fracti
 from allatom_design.data.datasets.atomworks_sd.sampling_schemes.ligand_grouped import (
     _add_ligand_grouped_protein_equalized_weights,
 )
-from allatom_design.data.datasets.atomworks_sd.sampling_schemes.percentile import (
-    _add_percentile_sampling_weights,
+from allatom_design.data.datasets.atomworks_sd.sampling_schemes.fixed_k import (
+    _add_fixed_k_sampling_weights,
 )
 
-SAMPLING_PERCENTILE = "percentile"
+SAMPLING_FIXED_K = "fixed_k"
 SAMPLING_INTERFACE_FRACTION = "interface_fraction"
 SAMPLING_LIGAND_GROUPED_PROTEIN_EQUALIZED = "ligand_grouped_protein_equalized"
-SAMPLING_LEGACY = "legacy"
 VALID_SAMPLING_SCHEMES = (
-    SAMPLING_PERCENTILE,
+    SAMPLING_FIXED_K,
     SAMPLING_INTERFACE_FRACTION,
     SAMPLING_LIGAND_GROUPED_PROTEIN_EQUALIZED,
-    SAMPLING_LEGACY,
 )
 
 
@@ -31,8 +29,6 @@ def _canonicalize_sampling_scheme(sampling_scheme: str) -> str:
             f"Unknown `clustering.sampling_scheme`: {sampling_scheme!r}. "
             f"Expected one of {VALID_SAMPLING_SCHEMES}."
         )
-    if sampling_scheme == SAMPLING_LEGACY:
-        return SAMPLING_PERCENTILE
     return sampling_scheme
 
 
@@ -41,7 +37,7 @@ def add_sampling_weights(
     interface_df: pd.DataFrame,
     alphas_interface: dict[str, float],
     cluster_col: str = "q_pn_unit_cluster_id",
-    k_percentile: float = 100.0,
+    fixed_k: float | None = None,
     single_protein_context_weight: float = 1.0,
     multi_protein_context_weight: float = 1.0,
     clustering_cfg: dict | None = None,
@@ -50,15 +46,17 @@ def add_sampling_weights(
 
     clustering_cfg = clustering_cfg or {}
     sampling_scheme = _canonicalize_sampling_scheme(
-        str(clustering_cfg.get("sampling_scheme", SAMPLING_PERCENTILE))
+        str(clustering_cfg.get("sampling_scheme", SAMPLING_FIXED_K))
     )
-    if sampling_scheme == SAMPLING_PERCENTILE:
-        return _add_percentile_sampling_weights(
+    if sampling_scheme == SAMPLING_FIXED_K:
+        if fixed_k is None:
+            raise ValueError("`fixed_k` is required for the fixed-K sampling scheme.")
+        return _add_fixed_k_sampling_weights(
             monomer_df=monomer_df,
             interface_df=interface_df,
             alphas_interface=alphas_interface,
             cluster_col=cluster_col,
-            k_percentile=k_percentile,
+            fixed_k=fixed_k,
             single_protein_context_weight=single_protein_context_weight,
             multi_protein_context_weight=multi_protein_context_weight,
         )
