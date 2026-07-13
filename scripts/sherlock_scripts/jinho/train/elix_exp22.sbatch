@@ -9,7 +9,7 @@
 # with EXP_NAME_BASE manually.
 #SBATCH --job-name=elix_exp22
 #SBATCH -p possu
-#SBATCH --array=0-7
+#SBATCH --array=0-11
 #SBATCH --gres=gpu:1
 #SBATCH --mem=96G
 #SBATCH --cpus-per-task=8
@@ -55,10 +55,18 @@ COMMON_OVERRIDES=(
 )
 
 CONFIGS=(
-  "k3_sm1|3.0|1.0"
-  "k3_sm2|3.0|2.0"
-  "k3_sm4|3.0|4.0"
-  "k3_sm8|3.0|8.0"
+  "k2_sm1|2.0|1.0|1.0|1.0|1.0"
+  "k2_sm2|2.0|2.0|1.0|1.0|1.0"
+  "k2_sm4|2.0|4.0|1.0|1.0|1.0"
+  "k2_sm8|2.0|8.0|1.0|1.0|1.0"
+  "k16_sm1|16.0|1.0|1.0|1.0|1.0"
+  "k16_sm2|16.0|2.0|1.0|1.0|1.0"
+  "k16_sm4|16.0|4.0|1.0|1.0|1.0"
+  "k16_sm8|16.0|8.0|1.0|1.0|1.0"
+  "k2_optimal|2.0|52.0768096208106|2.0|2.0798772931081|47.6608086390952"
+  "k3_optimal|3.0|78.1152144312159|3.0|3.11981593966215|71.4912129586428"
+  "k8_optimal|8.0|208.307238483242|8.0|8.3195091724324|190.643234556381"
+  "k16_optimal|16.0|416.614476966484|16.0|16.6390183448648|381.286469112762"
 )
 
 IDX=$((ARRAY_TASK_ID))
@@ -68,27 +76,20 @@ if (( IDX < 0 || IDX >= ${#CONFIGS[@]} )); then
 fi
 
 CONFIG_ROW="${CONFIGS[$IDX]}"
-IFS='|' read -r CONFIG_NAME FIXED_K ALPHA_SMALL_MOLECULE <<< "${CONFIG_ROW}"
-if [[ -z "${CONFIG_NAME}" || -z "${FIXED_K}" || -z "${ALPHA_SMALL_MOLECULE}" ]]; then
+IFS='|' read -r CONFIG_NAME FIXED_K ALPHA_SMALL_MOLECULE ALPHA_METAL ALPHA_NUC_LIG ALPHA_PEPTIDE EXTRA_FIELD <<< "${CONFIG_ROW}"
+if [[ -z "${CONFIG_NAME}" || -z "${FIXED_K}" || -z "${ALPHA_SMALL_MOLECULE}" || \
+      -z "${ALPHA_METAL}" || -z "${ALPHA_NUC_LIG}" || -z "${ALPHA_PEPTIDE}" || \
+      -n "${EXTRA_FIELD}" ]]; then
   echo "Malformed config row at index ${IDX}: ${CONFIG_ROW}" >&2
   exit 2
 fi
 EXP_NAME="${EXP_NAME_BASE}_cfg${IDX}_${CONFIG_NAME}"
-RESUME_CKPT="null"
-RESUME_USE_CURRENT_CFG="true"
-WANDB_RUN_ID="null"
-WANDB_RESUME="never"
-case "${ELIX_AUTO_RESUME:-0}" in
-  1|true|TRUE|yes|YES)
-    RESUME_CKPT="auto"
-    RESUME_USE_CURRENT_CFG="false"
-    WANDB_RUN_ID="${EXP_NAME}"
-    WANDB_RESUME="allow"
-    ;;
-esac
 SAMPLING_OVERRIDES=(
   "data.sampling_weights.fixed_k=${FIXED_K}"
   "data.sampling_weights.alphas_interface.alpha_protein_small_molecule=${ALPHA_SMALL_MOLECULE}"
+  "data.sampling_weights.alphas_interface.alpha_protein_metal=${ALPHA_METAL}"
+  "data.sampling_weights.alphas_interface.alpha_protein_nuc_lig=${ALPHA_NUC_LIG}"
+  "data.sampling_weights.alphas_interface.alpha_protein_peptide=${ALPHA_PEPTIDE}"
 )
 
 INTERFACE_TYPE_FILTER="n_prot == 1"
@@ -112,6 +113,9 @@ echo "  config_name: ${CONFIG_NAME}"
 echo "  config_row: ${CONFIG_ROW}"
 echo "  fixed_k: ${FIXED_K}"
 echo "  alpha_protein_small_molecule: ${ALPHA_SMALL_MOLECULE}"
+echo "  alpha_protein_metal: ${ALPHA_METAL}"
+echo "  alpha_protein_nuc_lig: ${ALPHA_NUC_LIG}"
+echo "  alpha_protein_peptide: ${ALPHA_PEPTIDE}"
 echo "  common_overrides: ${COMMON_OVERRIDES[*]}"
 echo "  denoiser_type: ${DENOISER_TYPE}"
 echo "  bml_center.metal.external_evidence_policy: [pubmed, medba]"
@@ -130,10 +134,8 @@ echo "  base_dir: ${BASE_DIR}"
 echo "  out_dir: ${OUT_DIR}"
 echo "  hydra_dir: ${HYDRA_DIR}/${EXP_NAME}"
 echo "  torchinductor_cache: ${TORCHINDUCTOR_CACHE_DIR}"
-echo "  resume.ckpt_path: ${RESUME_CKPT}"
-echo "  resume.use_current_cfg: ${RESUME_USE_CURRENT_CFG}"
-echo "  wandb.run_id: ${WANDB_RUN_ID}"
-echo "  wandb.resume: ${WANDB_RESUME}"
+echo "  resume.ckpt_path: null"
+echo "  resume.use_current_cfg: true"
 
 SLURM_JOB_ID_FOR_DDP="${SLURM_JOB_ID:-0}"
 export MASTER_ADDR=127.0.0.1
@@ -150,8 +152,6 @@ python3 allatom_design/train_seq_denoiser.py \
     wandb.project="${PROJECT}" \
     wandb.group="${GROUP}" \
     wandb.no_wandb=false \
-    wandb.run_id="${WANDB_RUN_ID}" \
-    wandb.resume="${WANDB_RESUME}" \
     num_workers="${CPUS_PER_TASK}" \
     out_dir="${OUT_DIR}" \
     exp_name="${EXP_NAME}" \
@@ -161,8 +161,8 @@ python3 allatom_design/train_seq_denoiser.py \
     train.compile.compile_model=true \
     trainer.strategy="ddp_find_unused_parameters_true" \
     denoiser.name="${DENOISER_TYPE}" \
-    resume.use_current_cfg="${RESUME_USE_CURRENT_CFG}" \
-    resume.ckpt_path="${RESUME_CKPT}" \
+    resume.use_current_cfg=true \
+    resume.ckpt_path=null \
     loss.loss_weights.seq_loss=1.0 \
     loss.main_seq_loss_pocket_only=false \
     loss.main_potts_loss_pocket_only=false \
@@ -185,10 +185,7 @@ python3 allatom_design/train_seq_denoiser.py \
     "${INTERFACE_FILTER_OVERRIDE[@]}" \
     "${MONOMER_FILTER_OVERRIDE[@]}" \
     data.sampling_weights.alphas_interface.alpha_protein_protein=0.0 \
-    data.sampling_weights.alphas_interface.alpha_protein_metal=1.0 \
     data.sampling_weights.alphas_interface.alpha_protein_nuc=0.0 \
-    data.sampling_weights.alphas_interface.alpha_protein_nuc_lig=1.0 \
-    data.sampling_weights.alphas_interface.alpha_protein_peptide=1.0 \
     data.sampling_weights.single_protein_context_weight=1.0 \
     data.sampling_weights.multi_protein_context_weight=0.0 \
     data.sampling_weights.ligand_cluster_col=null \
