@@ -12,13 +12,18 @@ from allatom_design.data.datasets.atomworks_sd.sampling_schemes.ligand_grouped i
 from allatom_design.data.datasets.atomworks_sd.sampling_schemes.fixed_k import (
     _add_fixed_k_sampling_weights,
 )
+from allatom_design.data.datasets.atomworks_sd.sampling_schemes.pair_cluster import (
+    _add_pair_cluster_balanced_sampling_weights,
+)
 
 SAMPLING_FIXED_K = "fixed_k"
 SAMPLING_INTERFACE_FRACTION = "interface_fraction"
+SAMPLING_PAIR_CLUSTER_BALANCED = "pair_cluster_balanced"
 SAMPLING_LIGAND_GROUPED_PROTEIN_EQUALIZED = "ligand_grouped_protein_equalized"
 VALID_SAMPLING_SCHEMES = (
     SAMPLING_FIXED_K,
     SAMPLING_INTERFACE_FRACTION,
+    SAMPLING_PAIR_CLUSTER_BALANCED,
     SAMPLING_LIGAND_GROUPED_PROTEIN_EQUALIZED,
 )
 
@@ -59,6 +64,12 @@ def add_sampling_weights(
             fixed_k=fixed_k,
             single_protein_context_weight=single_protein_context_weight,
             multi_protein_context_weight=multi_protein_context_weight,
+        )
+    if sampling_scheme == SAMPLING_PAIR_CLUSTER_BALANCED:
+        return _add_pair_cluster_balanced_sampling_weights(
+            monomer_df=monomer_df,
+            interface_df=interface_df,
+            alphas_interface=alphas_interface,
         )
     if sampling_scheme == SAMPLING_INTERFACE_FRACTION:
         interface_grouping_scheme = str(
