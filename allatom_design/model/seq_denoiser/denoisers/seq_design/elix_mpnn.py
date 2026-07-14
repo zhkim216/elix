@@ -314,12 +314,19 @@ class ElixMPNN(nn.Module):
                 protein_residue_node_mask_2d = protein_residue_node_mask_2d[:, :, :self.k_neighbors_potts]
 
             h, J = self.decoder_S_potts(h_V_potts, h_E, E_idx, protein_residue_node_mask, protein_residue_node_mask_2d)
+            coupling_mask = potts.build_coupling_mask(
+                E_idx,
+                protein_residue_node_mask,
+                protein_residue_node_mask_2d,
+                require_reciprocal=self.decoder_S_potts.symmetric_J,
+            )
             potts_decoder_aux = {
                 "h": h,
                 "J": J,
                 "edge_idx": E_idx,
                 "mask_i": protein_residue_node_mask,
                 "mask_ij": protein_residue_node_mask_2d,
+                "coupling_mask": coupling_mask,
             }
 
         logits = self.W_out(h_V)
