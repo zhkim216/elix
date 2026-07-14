@@ -39,11 +39,16 @@ mpnn:
     ligand_conditioning: ${denoiser.mpnn.ligand_conditioning}
     use_ligand_context: true
     ligand_atom_context_num: 25
-    # Ligand atom/context feature ablations. Defaults preserve existing checkpoint shapes.
-    use_ligand_formal_charge: false
+    # Ligand atom/context features; omitted optional flags stay disabled in saved legacy configs.
     use_ligand_aromatic_atom_feature: false
     use_ligand_aromatic_edge_feature: false
     use_ligand_chirality_tag: false
+    use_ligand_f_block_features: false
+    use_ligand_asinh_formal_charge: true
+    use_ligand_cached_rdkit_chirality: false
+    use_ligand_bond_order: false
+    use_token_bonds: false
+    add_hydrogenbond_feature: false
 
     masked_distance_fill: 1000.0
 

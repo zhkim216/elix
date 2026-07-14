@@ -124,6 +124,9 @@ featurizer_cfg:
   pocket_n_min_ligand_atoms: 1
   residue_cache_dir: ${data.residue_cache_dir}
   max_conformers_per_residue: 50
+  use_ligand_cached_rdkit_chirality: ${oc.select:denoiser.mpnn.token_features.use_ligand_cached_rdkit_chirality,false}
+  add_hydrogenbond_feature: ${oc.select:denoiser.mpnn.token_features.add_hydrogenbond_feature,false}
+  use_ligand_bond_order: ${oc.select:denoiser.mpnn.token_features.use_ligand_bond_order,false}
   apply_random_augmentation: true
   translation_scale: 1.0
   asymmetric_noise: false
