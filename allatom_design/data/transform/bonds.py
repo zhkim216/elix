@@ -24,6 +24,20 @@ RF2AA_AROMATIC_BOND = 4
 RF2AA_RESIDUE_BB_BOND = 5
 RF2AA_RESIDUE_ATOM_BOND = 6
 
+LIGAND_NO_BOND = 0
+LIGAND_SINGLE_BOND = 1
+LIGAND_DOUBLE_BOND = 2
+LIGAND_TRIPLE_BOND = 3
+LIGAND_AROMATIC_BOND = 4
+LIGAND_OTHER_BOND = 5
+
+_BIOTITE_AROMATIC_BOND_TYPES = frozenset({5, 6, 7, 9})
+_BIOTITE_TO_LIGAND_BASIC_BOND_TYPE = {
+    1: LIGAND_SINGLE_BOND,
+    2: LIGAND_DOUBLE_BOND,
+    3: LIGAND_TRIPLE_BOND,
+}
+
 
 def _atom_adjacency_to_token_adjacency(atom_adjacency: np.ndarray, token_start_end_idxs: np.ndarray) -> np.ndarray:
     """Helper function to compute the token bond adjacency matrix from the atom bond adjacency matrix."""
@@ -288,7 +302,8 @@ def get_af3_token_bond_features(atom_array: AtomArray, distance_cutoff: float = 
     np.fill_diagonal(token_bonds, False)
 
     # remove poly-poly bonds
-    is_poly_poly_bond = np.outer(~atom_array.atomize[token_starts], ~atom_array.atomize[token_starts])
+    token_is_polymer = atom_array.is_polymer[token_starts]
+    is_poly_poly_bond = np.outer(token_is_polymer, token_is_polymer)
     token_bonds[is_poly_poly_bond] = False
     return token_bonds
 
@@ -320,7 +335,7 @@ class AddAF3TokenBondFeatures(Transform):
         check_is_instance(data, "atom_array", AtomArray)
         check_nonzero_length(data, "atom_array")
         check_atom_array_has_bonds(data)
-        check_atom_array_annotation(data, ["is_polymer", "atomize"])
+        check_atom_array_annotation(data, ["is_polymer"])
 
     def forward(self, data: dict) -> dict:
         atom_array = data["atom_array"]
@@ -331,6 +346,53 @@ class AddAF3TokenBondFeatures(Transform):
 
         data["feats"]["token_bonds"] = af3_token_bond_features
 
+        return data
+
+
+def get_ligand_bond_order_features(atom_array: AtomArray) -> np.ndarray:
+    """Return the ligand bond-order vocabulary for every atom pair.
+
+    This intentionally builds from the bond list rather than Biotite's dense
+    bond-type matrix: an explicit ``ANY`` bond has type 0, while an absent edge
+    must remain 0 in the output vocabulary.
+    """
+    bond_order = np.full(
+        (len(atom_array), len(atom_array)),
+        fill_value=LIGAND_NO_BOND,
+        dtype=np.int8,
+    )
+    bonds = np.asarray(atom_array.bonds.as_array()).reshape(-1, 3)
+
+    for atom_i, atom_j, biotite_type in bonds:
+        biotite_type = int(biotite_type)
+        if biotite_type in _BIOTITE_TO_LIGAND_BASIC_BOND_TYPE:
+            encoded_type = _BIOTITE_TO_LIGAND_BASIC_BOND_TYPE[biotite_type]
+        elif biotite_type in _BIOTITE_AROMATIC_BOND_TYPES:
+            encoded_type = LIGAND_AROMATIC_BOND
+        else:
+            encoded_type = LIGAND_OTHER_BOND
+
+        atom_i = int(atom_i)
+        atom_j = int(atom_j)
+        bond_order[atom_i, atom_j] = encoded_type
+        bond_order[atom_j, atom_i] = encoded_type
+
+    return bond_order
+
+
+class AddLigandBondOrderFeatures(Transform):
+    """Add the compact atom-pair ligand bond-order vocabulary to ``feats``."""
+
+    def check_input(self, data: dict) -> None:
+        check_contains_keys(data, ["atom_array"])
+        check_is_instance(data, "atom_array", AtomArray)
+        check_nonzero_length(data, "atom_array")
+        check_atom_array_has_bonds(data)
+
+    def forward(self, data: dict) -> dict:
+        if "feats" not in data:
+            data["feats"] = {}
+        data["feats"]["atom_ligand_bond_order"] = get_ligand_bond_order_features(data["atom_array"])
         return data
 
 

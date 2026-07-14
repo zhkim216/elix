@@ -18,20 +18,21 @@ _ELIX_MPNN_CONFIG_RENAMES = (
     ("atom_mpnn", "elix_mpnn"),
 )
 
-_STEP_TRAINING_CHECKPOINT_PATTERN = re.compile(
-    r"^sd-step(?P<step>\d+)-epoch(?P<epoch>\d+)(?:-v(?P<version>\d+))?\.ckpt$"
+_NEW_ELIX_FEATURE_PROJECTION_KEYS = frozenset(
+    {
+        "model.denoiser.elix_mpnn.token_features.ligand_f_block_node_linear.weight",
+        "model.denoiser.elix_mpnn.token_features.ligand_f_block_interaction_linear.weight",
+        "model.denoiser.elix_mpnn.token_features.ligand_asinh_formal_charge_linear.weight",
+        "model.denoiser.elix_mpnn.token_features.ligand_asinh_formal_charge_interaction_linear.weight",
+        "model.denoiser.elix_mpnn.token_features.ligand_cached_rdkit_chirality_v2_node_linear.weight",
+        "model.denoiser.elix_mpnn.token_features.ligand_cached_rdkit_chirality_v2_interaction_linear.weight",
+        "model.denoiser.elix_mpnn.token_features.ligand_bond_order_linear.weight",
+        "model.denoiser.elix_mpnn.token_features.token_bond_edge_linear.weight",
+        "model.denoiser.elix_mpnn.token_features.token_bond_interaction_linear.weight",
+        "model.denoiser.elix_mpnn.token_features.ligand_hydrogenbond_node_linear.weight",
+        "model.denoiser.elix_mpnn.token_features.ligand_hydrogenbond_interaction_linear.weight",
+    }
 )
-_EPOCH_TRAINING_CHECKPOINT_PATTERN = re.compile(
-    r"^sd-epoch(?P<epoch>\d+)(?:-v(?P<version>\d+))?\.ckpt$"
-)
-_FULL_TRAINING_CHECKPOINT_KEYS = {
-    "epoch",
-    "global_step",
-    "loops",
-    "lr_schedulers",
-    "optimizer_states",
-    "state_dict",
-}
 
 
 def _elix_mpnn_config_value(value: Any) -> Any:
@@ -193,3 +194,82 @@ def repair_state_dict(state_dict: dict[str, Any]) -> dict[str, Any]:
         for src_key, value in state_dict.items()
     }
     return elix_mpnn_state_dict(repaired_state_dict)
+
+
+def migrate_elix_feature_projection_state_dict(
+    module: torch.nn.Module,
+    state_dict: dict[str, Any],
+) -> dict[str, Any]:
+    """Fill only newly enabled ELIX feature projections from current initialization.
+
+    The returned mapping uses the current module's actual keys, including a
+    possible ``_orig_mod`` segment introduced by ``torch.compile``. All other
+    missing or unexpected state keys remain strict errors.
+    """
+
+    def normalized_key(key: str) -> str:
+        return key.replace("_orig_mod.", "")
+
+    def index_by_normalized_key(keys) -> dict[str, str]:
+        indexed = {}
+        for key in keys:
+            normalized = normalized_key(key)
+            if normalized in indexed:
+                raise RuntimeError(
+                    "State dict has duplicate keys after torch.compile normalization: "
+                    f"{indexed[normalized]!r} and {key!r}"
+                )
+            indexed[normalized] = key
+        return indexed
+
+    state_dict = elix_mpnn_state_dict(state_dict)
+    current_state = module.state_dict()
+    current_keys = index_by_normalized_key(current_state)
+    incoming_keys = index_by_normalized_key(state_dict)
+
+    missing_keys = set(current_keys) - set(incoming_keys)
+    unexpected_keys = set(incoming_keys) - set(current_keys)
+    allowed_missing_keys = _NEW_ELIX_FEATURE_PROJECTION_KEYS & set(current_keys)
+    disallowed_missing_keys = missing_keys - allowed_missing_keys
+    shape_mismatches = {
+        key: (
+            tuple(state_dict[incoming_keys[key]].shape),
+            tuple(current_state[current_keys[key]].shape),
+        )
+        for key in set(current_keys) & set(incoming_keys)
+        if state_dict[incoming_keys[key]].shape
+        != current_state[current_keys[key]].shape
+    }
+
+    if disallowed_missing_keys or unexpected_keys or shape_mismatches:
+        error_parts = []
+        if disallowed_missing_keys:
+            error_parts.append(
+                f"missing keys: {sorted(disallowed_missing_keys)}"
+            )
+        if unexpected_keys:
+            error_parts.append(
+                f"unexpected keys: {sorted(unexpected_keys)}"
+            )
+        if shape_mismatches:
+            error_parts.append(
+                "shape mismatches: "
+                + ", ".join(
+                    f"{key} incoming={incoming_shape} current={current_shape}"
+                    for key, (incoming_shape, current_shape) in sorted(
+                        shape_mismatches.items()
+                    )
+                )
+            )
+        raise RuntimeError(
+            "ELIX feature checkpoint migration rejected incompatible state dict; "
+            + "; ".join(error_parts)
+        )
+
+    migrated_state = {}
+    for normalized, current_key in current_keys.items():
+        if normalized in incoming_keys:
+            migrated_state[current_key] = state_dict[incoming_keys[normalized]]
+        else:
+            migrated_state[current_key] = current_state[current_key]
+    return migrated_state

@@ -12,6 +12,71 @@ from allatom_design.model.seq_denoiser.denoisers.seq_design.mpnn_utils import (
 )
 
 
+def build_f_block_features(atomic_numbers: torch.Tensor) -> torch.Tensor:
+    """Return PLACER-style lanthanide/actinide features for atomic numbers."""
+    atomic_numbers = atomic_numbers.long()
+    is_lanthanide = (atomic_numbers >= 57) & (atomic_numbers <= 71)
+    is_actinide = (atomic_numbers >= 89) & (atomic_numbers <= 103)
+    lanthanide_group = F.one_hot(
+        (atomic_numbers - 57).clamp(min=0, max=14),
+        num_classes=15,
+    ) * is_lanthanide.unsqueeze(-1)
+    actinide_group = F.one_hot(
+        (atomic_numbers - 89).clamp(min=0, max=14),
+        num_classes=15,
+    ) * is_actinide.unsqueeze(-1)
+    return torch.cat(
+        (
+            is_lanthanide.unsqueeze(-1),
+            is_actinide.unsqueeze(-1),
+            lanthanide_group,
+            actinide_group,
+        ),
+        dim=-1,
+    ).float()
+
+
+def gather_dense_pair_features(
+    pair_features: torch.Tensor,
+    row_indices: torch.Tensor,
+    col_indices: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Gather a dense batched pair tensor at per-token context indices."""
+    if pair_features.dim() not in (3, 4):
+        raise ValueError(
+            "pair_features must have shape [B, L, L] or [B, L, L, C], "
+            f"got {tuple(pair_features.shape)}"
+        )
+    if row_indices.dim() != 3:
+        raise ValueError(
+            f"row_indices must have shape [B, N, M], got {tuple(row_indices.shape)}"
+        )
+    if col_indices is None:
+        col_indices = row_indices
+    if col_indices.shape != row_indices.shape:
+        raise ValueError(
+            "row_indices and col_indices must have the same shape, got "
+            f"{tuple(row_indices.shape)} and {tuple(col_indices.shape)}"
+        )
+    if pair_features.shape[0] != row_indices.shape[0]:
+        raise ValueError(
+            "pair feature and index batch dimensions must match, got "
+            f"{pair_features.shape[0]} and {row_indices.shape[0]}"
+        )
+    if pair_features.shape[1] != pair_features.shape[2]:
+        raise ValueError(f"pair_features must be square, got {tuple(pair_features.shape)}")
+
+    batch_indices = torch.arange(
+        pair_features.shape[0],
+        device=pair_features.device,
+    )[:, None, None, None]
+    return pair_features[
+        batch_indices,
+        row_indices[:, :, :, None],
+        col_indices[:, :, None, :],
+    ]
+
+
 class TokenFeatures(nn.Module):
     def __init__(self, cfg: DictConfig):
         """
@@ -50,13 +115,21 @@ class TokenFeatures(nn.Module):
 
         # Ligand conditioning-related layers
         if self.ligand_conditioning:
-            self.use_ligand_formal_charge = cfg.get("use_ligand_formal_charge", False)
             self.use_ligand_aromatic_atom_feature = cfg.get("use_ligand_aromatic_atom_feature", False)
             self.use_ligand_aromatic_edge_feature = cfg.get("use_ligand_aromatic_edge_feature", False)
             self.use_ligand_chirality_tag = cfg.get("use_ligand_chirality_tag", False)
+            self.use_ligand_f_block_features = cfg.get("use_ligand_f_block_features", False)
+            self.use_ligand_asinh_formal_charge = cfg.get("use_ligand_asinh_formal_charge", False)
+            self.use_ligand_cached_rdkit_chirality = cfg.get("use_ligand_cached_rdkit_chirality", False)
+            self.use_ligand_bond_order = cfg.get("use_ligand_bond_order", False)
+            self.use_token_bonds = cfg.get("use_token_bonds", False)
+            self.add_hydrogenbond_feature = cfg.get("add_hydrogenbond_feature", False)
 
             self.ligand_atom_base_feature_dim = 147
             self.ligand_chirality_feature_dim = 3
+            self.ligand_cached_rdkit_chirality_feature_dim = 4
+            self.ligand_f_block_feature_dim = 32
+            self.ligand_bond_order_feature_dim = 5
 
             self.protein_ligand_interaction_rbf_type = cfg.get("protein_ligand_interaction_rbf_type", "ncacocb")
             if self.protein_ligand_interaction_rbf_type == "cb":
@@ -66,6 +139,34 @@ class TokenFeatures(nn.Module):
 
             # Linear layer for atom type information embedding
             self.type_linear = torch.nn.Linear(self.ligand_atom_base_feature_dim, 64)
+            self.ligand_f_block_interaction_linear = None
+            if self.use_ligand_f_block_features:
+                self.ligand_f_block_interaction_linear = torch.nn.Linear(
+                    self.ligand_f_block_feature_dim,
+                    64,
+                    bias=False,
+                )
+            self.ligand_asinh_formal_charge_interaction_linear = None
+            if self.use_ligand_asinh_formal_charge:
+                self.ligand_asinh_formal_charge_interaction_linear = torch.nn.Linear(
+                    1,
+                    64,
+                    bias=False,
+                )
+            self.ligand_cached_rdkit_chirality_v2_interaction_linear = None
+            if self.use_ligand_cached_rdkit_chirality:
+                self.ligand_cached_rdkit_chirality_v2_interaction_linear = torch.nn.Linear(
+                    self.ligand_cached_rdkit_chirality_feature_dim,
+                    64,
+                    bias=False,
+                )
+            self.ligand_hydrogenbond_interaction_linear = None
+            if self.add_hydrogenbond_feature:
+                self.ligand_hydrogenbond_interaction_linear = torch.nn.Linear(
+                    3,
+                    64,
+                    bias=False,
+                )
 
             # Parameters for Ligand-protein interaction layers
             self.add_angle_features = cfg.get("add_angle_features", True)
@@ -76,14 +177,17 @@ class TokenFeatures(nn.Module):
                 self.hidden_dim,
                 bias=True,
             )
+            self.token_bond_interaction_linear = None
+            if self.use_token_bonds:
+                self.token_bond_interaction_linear = torch.nn.Linear(1, self.hidden_dim, bias=False)
             self.norm_nodes = torch.nn.LayerNorm(self.hidden_dim)
 
             # Parameters for Ligand subgraph
             # ligand subgraph nodes
             self.y_nodes = torch.nn.Linear(self.ligand_atom_base_feature_dim, self.hidden_dim, bias=False)
-            self.ligand_formal_charge_linear = None
-            if self.use_ligand_formal_charge:
-                self.ligand_formal_charge_linear = torch.nn.Linear(1, self.hidden_dim, bias=False)
+            self.ligand_asinh_formal_charge_linear = None
+            if self.use_ligand_asinh_formal_charge:
+                self.ligand_asinh_formal_charge_linear = torch.nn.Linear(1, self.hidden_dim, bias=False)
             self.ligand_aromatic_atom_linear = None
             if self.use_ligand_aromatic_atom_feature:
                 self.ligand_aromatic_atom_linear = torch.nn.Linear(1, self.hidden_dim, bias=False)
@@ -94,6 +198,27 @@ class TokenFeatures(nn.Module):
                     self.hidden_dim,
                     bias=False,
                 )
+            self.ligand_cached_rdkit_chirality_v2_node_linear = None
+            if self.use_ligand_cached_rdkit_chirality:
+                self.ligand_cached_rdkit_chirality_v2_node_linear = torch.nn.Linear(
+                    self.ligand_cached_rdkit_chirality_feature_dim,
+                    self.hidden_dim,
+                    bias=False,
+                )
+            self.ligand_f_block_node_linear = None
+            if self.use_ligand_f_block_features:
+                self.ligand_f_block_node_linear = torch.nn.Linear(
+                    self.ligand_f_block_feature_dim,
+                    self.hidden_dim,
+                    bias=False,
+                )
+            self.ligand_hydrogenbond_node_linear = None
+            if self.add_hydrogenbond_feature:
+                self.ligand_hydrogenbond_node_linear = torch.nn.Linear(
+                    3,
+                    self.hidden_dim,
+                    bias=False,
+                )
             self.norm_y_nodes = torch.nn.LayerNorm(self.hidden_dim)
 
             # ligand subgraph edges
@@ -101,25 +226,17 @@ class TokenFeatures(nn.Module):
             self.ligand_aromatic_edge_linear = None
             if self.use_ligand_aromatic_edge_feature:
                 self.ligand_aromatic_edge_linear = torch.nn.Linear(1, self.hidden_dim, bias=False)
+            self.ligand_bond_order_linear = None
+            if self.use_ligand_bond_order:
+                self.ligand_bond_order_linear = torch.nn.Linear(
+                    self.ligand_bond_order_feature_dim,
+                    self.hidden_dim,
+                    bias=False,
+                )
+            self.token_bond_edge_linear = None
+            if self.use_token_bonds:
+                self.token_bond_edge_linear = torch.nn.Linear(1, self.hidden_dim, bias=False)
             self.norm_y_edges = torch.nn.LayerNorm(self.hidden_dim)
-
-
-    def zero_init_ligand_feature_projections(self):
-        if not self.ligand_conditioning:
-            return
-        projections = (
-            self.ligand_formal_charge_linear,
-            self.ligand_aromatic_atom_linear,
-            self.ligand_chirality_tag_linear,
-            self.ligand_aromatic_edge_linear,
-        )
-        for projection in projections:
-            if projection is not None:
-                nn.init.zeros_(projection.weight)
-                if projection.bias is not None:
-                    nn.init.zeros_(projection.bias)
-
-
     def forward(self, batch: dict[str, TensorType["b ..."]]):
         """
         Extract token-level edge features and build KNN graph.
@@ -219,18 +336,31 @@ class TokenFeatures(nn.Module):
             N=N,
             device=device,
         )
-        Y_t_features, Y_t_embedded = self._embed_ligand_atom_types(Y_t)
+        Y_t_features, Y_t_embedded, Y_f_block_features = self._embed_ligand_atom_types(Y_t)
+        Y_bond_order = self._build_ligand_bond_order_features(batch, Y_idx, Y_m)
+        Y_token_bond_edges, Y_token_bond_interactions = self._build_token_bond_features(
+            batch=batch,
+            Y_idx=Y_idx,
+            Y_m=Y_m,
+            protein_residue_node_mask=protein_residue_node_mask,
+        )
         V = self._embed_ligand_interaction_features(
             Y=Y,
             Y_t_embedded=Y_t_embedded,
+            Y_f_block_features=Y_f_block_features,
+            Y_atom_features=Y_atom_features,
+            Y_token_bond_interactions=Y_token_bond_interactions,
             noised_backbone_pseudo_cb_coords=noised_backbone_pseudo_cb_coords,
         )
         Y_nodes, Y_edges = self._embed_ligand_subgraph_features(
             Y=Y,
             Y_m=Y_m,
             Y_t_features=Y_t_features,
+            Y_f_block_features=Y_f_block_features,
             Y_atom_features=Y_atom_features,
             Y_aromatic=Y_aromatic,
+            Y_bond_order=Y_bond_order,
+            Y_token_bond_edges=Y_token_bond_edges,
         )
         return V, Y_nodes, Y_edges, Y_m
 
@@ -267,9 +397,15 @@ class TokenFeatures(nn.Module):
     def _build_ligand_atom_features(self, batch, ligand_mask):
         ligand_atom_features = {}
         ligand_aromatic = None
-        if self.use_ligand_formal_charge:
-            ligand_formal_charge = batch["atom_formal_charge"].float()
-            ligand_atom_features["formal_charge"] = (ligand_formal_charge * ligand_mask).unsqueeze(-1)
+        if self.use_ligand_asinh_formal_charge:
+            ligand_formal_charge = self._require_batch_feature(
+                batch,
+                "atom_formal_charge",
+                "use_ligand_asinh_formal_charge",
+            ).float()
+            ligand_atom_features["asinh_formal_charge"] = (
+                ligand_formal_charge * ligand_mask
+            ).unsqueeze(-1)
         if self.use_ligand_aromatic_atom_feature or self.use_ligand_aromatic_edge_feature:
             ligand_aromatic = batch["atom_is_aromatic"].float() * ligand_mask
             if self.use_ligand_aromatic_atom_feature:
@@ -278,14 +414,65 @@ class TokenFeatures(nn.Module):
             ligand_chirality = batch["atom_chirality_tag"].long().clamp(min=0, max=2)
             ligand_chirality = F.one_hot(ligand_chirality, num_classes=3).float()
             ligand_atom_features["chirality_tag"] = ligand_chirality * ligand_mask.unsqueeze(-1)
+        if self.use_ligand_cached_rdkit_chirality:
+            ligand_chirality_tag = self._require_batch_feature(
+                batch,
+                "atom_cached_rdkit_chirality_tag",
+                "use_ligand_cached_rdkit_chirality",
+            ).long()
+            ligand_chirality = F.one_hot(
+                ligand_chirality_tag.clamp(min=0, max=2),
+                num_classes=3,
+            ).float()
+            ligand_chirality_mask = self._require_batch_feature(
+                batch,
+                "atom_cached_rdkit_chirality_mask",
+                "use_ligand_cached_rdkit_chirality",
+            ).float().clamp(min=0.0, max=1.0)
+            ligand_atom_features["cached_rdkit_chirality"] = (
+                torch.cat(
+                    (ligand_chirality, ligand_chirality_mask.unsqueeze(-1)),
+                    dim=-1,
+                )
+                * ligand_mask.unsqueeze(-1)
+            )
+        if self.add_hydrogenbond_feature:
+            ligand_hba = self._require_batch_feature(
+                batch,
+                "atom_is_HBA",
+                "add_hydrogenbond_feature",
+            ).float()
+            ligand_hbd = self._require_batch_feature(
+                batch,
+                "atom_is_HBD",
+                "add_hydrogenbond_feature",
+            ).float()
+            ligand_hydrogenbond_mask = self._require_batch_feature(
+                batch,
+                "atom_hydrogenbond_feature_mask",
+                "add_hydrogenbond_feature",
+            ).float().clamp(min=0.0, max=1.0)
+            ligand_atom_features["hydrogenbond"] = (
+                torch.stack(
+                    (ligand_hba, ligand_hbd, ligand_hydrogenbond_mask),
+                    dim=-1,
+                )
+                * ligand_mask.unsqueeze(-1)
+            )
         return ligand_atom_features, ligand_aromatic
 
     def _gather_ligand_atom_features(self, ligand_atom_features, Y_idx, B, N, device):
         gathered_features = {}
         feature_specs = (
-            ("formal_charge", self.ligand_formal_charge_linear, 1),
+            ("asinh_formal_charge", self.ligand_asinh_formal_charge_linear, 1),
             ("aromatic_atom", self.ligand_aromatic_atom_linear, 1),
             ("chirality_tag", self.ligand_chirality_tag_linear, self.ligand_chirality_feature_dim),
+            (
+                "cached_rdkit_chirality",
+                self.ligand_cached_rdkit_chirality_v2_node_linear,
+                self.ligand_cached_rdkit_chirality_feature_dim,
+            ),
+            ("hydrogenbond", self.ligand_hydrogenbond_node_linear, 3),
         )
         for feature_name, projection, feature_dim in feature_specs:
             if projection is None:
@@ -329,7 +516,7 @@ class TokenFeatures(nn.Module):
         return torch.zeros(B, N, self.ligand_atom_context_num, device=device)
 
     def _embed_ligand_atom_types(self, Y_t):
-        # Atom type information for context atoms  # Todo: handle Lanthanide metals properly
+        # Keep the legacy Z/group/period feature tensor checkpoint-compatible.
         Y_t = Y_t.long()
         Y_t_g = torch.tensor(PERIODIC_TABLE_FEATURES[1], device=Y_t.device)[Y_t]
         Y_t_p = torch.tensor(PERIODIC_TABLE_FEATURES[2], device=Y_t.device)[Y_t]
@@ -338,9 +525,18 @@ class TokenFeatures(nn.Module):
         Y_t_1hot_ = torch.nn.functional.one_hot(Y_t, 120)
         Y_t_features = torch.cat([Y_t_1hot_, Y_t_g_1hot_, Y_t_p_1hot_], -1).float()
         Y_t_embedded = self.type_linear(Y_t_features)
-        return Y_t_features, Y_t_embedded
+        Y_f_block_features = build_f_block_features(Y_t)
+        return Y_t_features, Y_t_embedded, Y_f_block_features
 
-    def _embed_ligand_interaction_features(self, Y, Y_t_embedded, noised_backbone_pseudo_cb_coords):
+    def _embed_ligand_interaction_features(
+        self,
+        Y,
+        Y_t_embedded,
+        Y_f_block_features,
+        Y_atom_features,
+        Y_token_bond_interactions,
+        noised_backbone_pseudo_cb_coords,
+    ):
         if self.protein_ligand_interaction_rbf_type == "cb":
             protein_anchor_coords = noised_backbone_pseudo_cb_coords[:, :, 4:, :]
         else:
@@ -358,6 +554,30 @@ class TokenFeatures(nn.Module):
             -1,
         )
 
+        if self.ligand_f_block_interaction_linear is not None:
+            Y_t_embedded = Y_t_embedded + self.ligand_f_block_interaction_linear(
+                Y_f_block_features
+            )
+        if self.ligand_asinh_formal_charge_interaction_linear is not None:
+            Y_t_embedded = Y_t_embedded + self.ligand_asinh_formal_charge_interaction_linear(
+                torch.asinh(Y_atom_features["asinh_formal_charge"].float())
+            )
+        if self.ligand_cached_rdkit_chirality_v2_interaction_linear is not None:
+            chirality_features = Y_atom_features["cached_rdkit_chirality"].float()
+            Y_t_embedded = Y_t_embedded + (
+                self.ligand_cached_rdkit_chirality_v2_interaction_linear(
+                    chirality_features
+                )
+                * chirality_features[..., -1:]
+            )
+        if self.ligand_hydrogenbond_interaction_linear is not None:
+            hydrogenbond_features = Y_atom_features["hydrogenbond"].float()
+            Y_t_embedded = Y_t_embedded + (
+                self.ligand_hydrogenbond_interaction_linear(
+                    hydrogenbond_features
+                )
+                * hydrogenbond_features[..., -1:]
+            )
         interaction_features = [RBF_ligand_to_backbone_or_pseudocb, Y_t_embedded]
         if self.add_angle_features:
             angle_features = self._make_angle_features(
@@ -368,16 +588,46 @@ class TokenFeatures(nn.Module):
             )
             interaction_features.append(angle_features)
         V = self.node_project_down(torch.cat(interaction_features, dim=-1))
+        if self.token_bond_interaction_linear is not None:
+            V = V + self.token_bond_interaction_linear(Y_token_bond_interactions)
         return self.norm_nodes(V)
 
-    def _embed_ligand_subgraph_features(self, Y, Y_m, Y_t_features, Y_atom_features, Y_aromatic):
+    def _embed_ligand_subgraph_features(
+        self,
+        Y,
+        Y_m,
+        Y_t_features,
+        Y_f_block_features,
+        Y_atom_features,
+        Y_aromatic,
+        Y_bond_order,
+        Y_token_bond_edges,
+    ):
         Y_nodes = self.y_nodes(Y_t_features)
-        if self.ligand_formal_charge_linear is not None:
-            Y_nodes = Y_nodes + self.ligand_formal_charge_linear(Y_atom_features["formal_charge"].float())
+        if self.ligand_f_block_node_linear is not None:
+            Y_nodes = Y_nodes + self.ligand_f_block_node_linear(Y_f_block_features)
+        if self.ligand_asinh_formal_charge_linear is not None:
+            Y_nodes = Y_nodes + self.ligand_asinh_formal_charge_linear(
+                torch.asinh(Y_atom_features["asinh_formal_charge"].float())
+            )
         if self.ligand_aromatic_atom_linear is not None:
             Y_nodes = Y_nodes + self.ligand_aromatic_atom_linear(Y_atom_features["aromatic_atom"].float())
         if self.ligand_chirality_tag_linear is not None:
             Y_nodes = Y_nodes + self.ligand_chirality_tag_linear(Y_atom_features["chirality_tag"].float())
+        if self.ligand_cached_rdkit_chirality_v2_node_linear is not None:
+            chirality_features = Y_atom_features["cached_rdkit_chirality"].float()
+            Y_nodes = Y_nodes + (
+                self.ligand_cached_rdkit_chirality_v2_node_linear(
+                    chirality_features
+                )
+                * chirality_features[..., -1:]
+            )
+        if self.ligand_hydrogenbond_node_linear is not None:
+            hydrogenbond_features = Y_atom_features["hydrogenbond"].float()
+            Y_nodes = Y_nodes + (
+                self.ligand_hydrogenbond_node_linear(hydrogenbond_features)
+                * hydrogenbond_features[..., -1:]
+            )
         Y_nodes = self.norm_y_nodes(Y_nodes)
 
         Y_edges = self._rbf(
@@ -390,8 +640,114 @@ class TokenFeatures(nn.Module):
             aromatic_edges = (Y_aromatic[:, :, :, None] * Y_aromatic[:, :, None, :]).unsqueeze(-1)
             y_edge_mask = (Y_m[:, :, :, None] * Y_m[:, :, None, :]).to(dtype=aromatic_edges.dtype).unsqueeze(-1)
             Y_edges = Y_edges + self.ligand_aromatic_edge_linear(aromatic_edges * y_edge_mask)
+        if self.ligand_bond_order_linear is not None:
+            Y_edges = Y_edges + self.ligand_bond_order_linear(Y_bond_order)
+        if self.token_bond_edge_linear is not None:
+            Y_edges = Y_edges + self.token_bond_edge_linear(Y_token_bond_edges)
         Y_edges = self.norm_y_edges(Y_edges)
         return Y_nodes, Y_edges
+
+    def _build_ligand_bond_order_features(self, batch, Y_idx, Y_m):
+        if not self.use_ligand_bond_order:
+            return None
+        atom_bond_order = self._require_batch_feature(
+            batch,
+            "atom_ligand_bond_order",
+            "use_ligand_bond_order",
+        ).long()
+        gathered_bond_order = gather_dense_pair_features(atom_bond_order, Y_idx)
+        bonded = (gathered_bond_order >= 1) & (gathered_bond_order <= 5)
+        bond_order_features = F.one_hot(
+            (gathered_bond_order - 1).clamp(min=0, max=4),
+            num_classes=self.ligand_bond_order_feature_dim,
+        ).float()
+        bond_order_features = bond_order_features * bonded.unsqueeze(-1)
+
+        eligible_atom_mask = torch.zeros_like(batch["atom_pad_mask"], dtype=torch.bool)
+        for key in (
+            "atom_is_small_molecule_chain",
+            "atom_is_metal_chain",
+            "atom_is_nucleic_acid_chain",
+        ):
+            eligible_atom_mask |= self._require_batch_feature(
+                batch,
+                key,
+                "use_ligand_bond_order",
+            ).bool()
+        gathered_eligibility = self._gather_nearest_atom_features(
+            atom_features=eligible_atom_mask,
+            nn_idx=Y_idx,
+            number_of_ligand_atoms=self.ligand_atom_context_num,
+            device=Y_idx.device,
+        ).squeeze(-1)
+        pair_mask = (
+            gathered_eligibility[:, :, :, None]
+            & gathered_eligibility[:, :, None, :]
+            & Y_m[:, :, :, None].bool()
+            & Y_m[:, :, None, :].bool()
+        )
+        return bond_order_features * pair_mask.unsqueeze(-1)
+
+    def _build_token_bond_features(
+        self,
+        batch,
+        Y_idx,
+        Y_m,
+        protein_residue_node_mask,
+    ):
+        if not self.use_token_bonds:
+            return None, None
+        token_bonds = self._require_batch_feature(
+            batch,
+            "token_bonds",
+            "use_token_bonds",
+        ).float()
+        atom_to_token_map = batch["atom_to_token_map"].long()
+        context_token_ids = torch.gather(
+            atom_to_token_map[:, None, :].expand(-1, Y_idx.shape[1], -1),
+            dim=2,
+            index=Y_idx,
+        )
+
+        context_context_bonds = gather_dense_pair_features(
+            token_bonds,
+            context_token_ids,
+        )
+        context_pair_mask = (
+            Y_m[:, :, :, None].bool() & Y_m[:, :, None, :].bool()
+        )
+        context_context_bonds = (
+            context_context_bonds * context_pair_mask.to(context_context_bonds.dtype)
+        ).unsqueeze(-1)
+
+        batch_indices = torch.arange(
+            token_bonds.shape[0],
+            device=token_bonds.device,
+        )[:, None, None]
+        current_token_ids = torch.arange(
+            Y_idx.shape[1],
+            device=token_bonds.device,
+        )[None, :, None]
+        interaction_bonds = token_bonds[
+            batch_indices,
+            current_token_ids,
+            context_token_ids,
+        ]
+        interaction_mask = (
+            protein_residue_node_mask[:, :, None].bool() & Y_m.bool()
+        )
+        interaction_bonds = (
+            interaction_bonds * interaction_mask.to(interaction_bonds.dtype)
+        ).unsqueeze(-1)
+        return context_context_bonds, interaction_bonds
+
+    @staticmethod
+    def _require_batch_feature(batch, key, feature_flag):
+        if key not in batch:
+            raise KeyError(
+                f"{feature_flag}=true requires batch feature {key!r}"
+            )
+        return batch[key]
 
 
     def _get_protein_token_center_coords(self, batch: dict[str, TensorType["b ..."]]) -> TensorType["b n 3", float]:

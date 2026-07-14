@@ -213,8 +213,6 @@ class ElixMPNN(nn.Module):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
-        if self.ligand_conditioning:
-            self.token_features.zero_init_ligand_feature_projections()
 
         # Skip path: zero-init W_ctx so the skip contribution starts at 0 (ControlNet-style).
         # The model initializes close to the use_context_skip_connection=False baseline,

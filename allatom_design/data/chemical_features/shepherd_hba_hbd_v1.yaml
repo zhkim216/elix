@@ -1,0 +1,6 @@
+pharmacophore_definition: shepherd_hba_hbd_v1
+source: coleygroup/shepherd-score
+source_commit: 75f1b6b6730cbe8adea638f7121f780f23182787
+source_file: shepherd_score/pharm_utils/smarts_features.fdef
+source_sha256: 76b9408488b810eb4bcab9ba7aab14a53635e18201d382bcfa20bbc3dbfa3fba
+rdkit_version: 2025.09.4

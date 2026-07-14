@@ -17,7 +17,7 @@ from allatom_design.model.seq_denoiser.sd_loss import SDLoss
 from allatom_design.model.seq_denoiser.sd_model import SeqDenoiser
 from allatom_design.utils.checkpoint_utils import (
     elix_mpnn_config,
-    elix_mpnn_state_dict,
+    migrate_elix_feature_projection_state_dict,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,7 +48,10 @@ class LitSeqDenoiser(L.LightningModule):
         self.save_hyperparameters()
 
     def on_load_checkpoint(self, checkpoint: dict) -> None:
-        checkpoint["state_dict"] = elix_mpnn_state_dict(checkpoint["state_dict"])
+        checkpoint["state_dict"] = migrate_elix_feature_projection_state_dict(
+            self,
+            checkpoint["state_dict"],
+        )
         hyper_parameters = checkpoint.get("hyper_parameters", {})
         if "cfg" in hyper_parameters:
             hyper_parameters["cfg"] = elix_mpnn_config(hyper_parameters["cfg"])

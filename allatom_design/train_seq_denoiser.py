@@ -18,8 +18,8 @@ from datetime import datetime
 from allatom_design.model.ema.ema import EMA, EMAModelCheckpoint, EMATrackerCheckpoint
 from allatom_design.model.seq_denoiser.lit_sd_model import LitSeqDenoiser
 from allatom_design.utils.checkpoint_utils import (
+    migrate_elix_feature_projection_state_dict,
     repair_state_dict,
-    select_latest_training_checkpoint,
 )
 
 
@@ -160,9 +160,8 @@ def main(cfg: DictConfig):
     if cfg.finetuning.enabled:
         print(f"Loading model weights from {cfg.finetuning.ckpt_path}")
         checkpoint = torch.load(cfg.finetuning.ckpt_path, map_location="cpu")
-        state_dict = checkpoint["state_dict"]
-        if not cfg.train.compile.compile_model:
-            state_dict = repair_state_dict(state_dict)
+        state_dict = repair_state_dict(checkpoint["state_dict"])
+        state_dict = migrate_elix_feature_projection_state_dict(lit_model, state_dict)
         lit_model.load_state_dict(state_dict, strict=True)
 
     if not cfg.wandb.no_wandb and cfg.logging.get("wandb_watch_enabled", False):

@@ -27,6 +27,31 @@ from allatom_design.utils.sample_io_utils import load_example_with_parse
 from allatom_design.utils.tensor_utils import to
 
 
+def featurizer_cfg_with_model_feature_producers(
+    featurizer_cfg: DictConfig | dict[str, Any] | None,
+    model: Any,
+) -> DictConfig | dict[str, Any] | None:
+    """Match optional atom-feature producers to the loaded ELIX model."""
+    if featurizer_cfg is None or model is None:
+        return featurizer_cfg
+
+    denoiser = getattr(model, "denoiser", None)
+    elix_mpnn = getattr(denoiser, "elix_mpnn", None)
+    token_features = getattr(elix_mpnn, "token_features", None)
+    if token_features is None:
+        return featurizer_cfg
+
+    source_cfg = featurizer_cfg if OmegaConf.is_config(featurizer_cfg) else OmegaConf.create(featurizer_cfg)
+    cfg = OmegaConf.create(OmegaConf.to_container(source_cfg, resolve=True))
+    for feature_flag in (
+        "use_ligand_cached_rdkit_chirality",
+        "use_ligand_bond_order",
+        "add_hydrogenbond_feature",
+    ):
+        cfg[feature_flag] = bool(getattr(token_features, feature_flag, False))
+    return cfg
+
+
 def create_sample_dict(
     *,
     sample_paths: list[str] | None = None,

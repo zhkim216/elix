@@ -36,7 +36,7 @@ from atomworks.ml.transforms.filters import (FilterToProteins,
 import allatom_design.data.const as const
 from allatom_design.data.transform.preprocess import AtomizeByCCDName
 # Import custom transforms and constants from custom_transforms
-from allatom_design.data.transform.bonds import AddAF3TokenBondFeatures
+from allatom_design.data.transform.bonds import AddAF3TokenBondFeatures, AddLigandBondOrderFeatures
 from allatom_design.data.transform.custom_transforms import (
     # Constants
     FEAT_TO_TOKEN_DIM,
@@ -51,7 +51,10 @@ from allatom_design.data.transform.custom_transforms import (
     FilterToQueryPNUnits,
     MaskAtomizedTokensInProtein,
     ErrIfAllUnresolved,
+    AddCachedRDKitFeatures,
     AddCachedResidueData,
+    AddCachedRDKitChiralityFeatures,
+    AnnotateNonPolymerCovalentBondEndpoints,
     AnnotateLigandPockets,
     GetNCACOAndPseudoCBCoords,
     AddTrainingRandomNoise,
@@ -109,6 +112,9 @@ def sd_featurizer(
     # For reference molecule features
     residue_cache_dir: str | None = "/scratch/users/zhkim216/datasets/atomworks/cached_residue_data",
     max_conformers_per_residue: int | None = 50,
+    use_ligand_cached_rdkit_chirality: bool = False,
+    add_hydrogenbond_feature: bool = False,
+    use_ligand_bond_order: bool = False,
 
     # For center random augmentation
     apply_random_augmentation: bool = True,
@@ -126,10 +132,26 @@ def sd_featurizer(
     """
     Build a transform pipeline that transforms a featurized structure into a training example (including cropping).
     """
+    if (use_ligand_cached_rdkit_chirality or add_hydrogenbond_feature) and residue_cache_dir is None:
+        raise ValueError(
+            "residue_cache_dir must be set when cached RDKit features are enabled"
+        )
+    cached_rdkit_features = (
+        AddCachedRDKitFeatures(
+            residue_cache_dir,
+            add_chirality=use_ligand_cached_rdkit_chirality,
+            add_hydrogenbond_feature=add_hydrogenbond_feature,
+        )
+        if use_ligand_cached_rdkit_chirality or add_hydrogenbond_feature
+        else Identity()
+    )
     # Featurization that must be done before cropping
     featurization_transforms_pre_crop = [
         # InferenceRoute(StrtoBoolforIsXFeatures()), # Todo: need this later if we want to use load_any
         AddData({"is_inference": is_inference}),
+        AnnotateNonPolymerCovalentBondEndpoints()
+        if add_hydrogenbond_feature
+        else Identity(),
         AddDataCategory(),
         FilterToQueryPNUnits(),
         AnnotateChainTypes(),
@@ -198,6 +220,8 @@ def sd_featurizer(
         ),
         ConvertToTorch(keys=["encoded", "feats"]),
         AddAF3TokenBondFeatures(distance_cutoff=2.4),
+        cached_rdkit_features,
+        AddLigandBondOrderFeatures() if use_ligand_bond_order else Identity(),
         TrainingRoute(CenterRandomAugmentation(apply_random_augmentation=apply_random_augmentation,
                             translation_scale=translation_scale)),
         TrainingRoute(AddTrainingRandomNoise(
@@ -255,6 +279,9 @@ def sd_featurizer_for_design(
     # For reference molecule features
     residue_cache_dir: str | None = "/scratch/users/zhkim216/datasets/atomworks/cached_residue_data",
     max_conformers_per_residue: int | None = 50,
+    use_ligand_cached_rdkit_chirality: bool = False,
+    add_hydrogenbond_feature: bool = False,
+    use_ligand_bond_order: bool = False,
 
     # For center random augmentation
     apply_random_augmentation: bool = True,
@@ -272,9 +299,25 @@ def sd_featurizer_for_design(
     """
     Build a transform pipeline that transforms a featurized structure into an example for designing samples.
     """
+    if (use_ligand_cached_rdkit_chirality or add_hydrogenbond_feature) and residue_cache_dir is None:
+        raise ValueError(
+            "residue_cache_dir must be set when cached RDKit features are enabled"
+        )
+    cached_rdkit_features = (
+        AddCachedRDKitFeatures(
+            residue_cache_dir,
+            add_chirality=use_ligand_cached_rdkit_chirality,
+            add_hydrogenbond_feature=add_hydrogenbond_feature,
+        )
+        if use_ligand_cached_rdkit_chirality or add_hydrogenbond_feature
+        else Identity()
+    )
     # Featurization that must be done before cropping
     featurization_transforms_pre_crop = [
         AddData({"is_inference": is_inference}),
+        AnnotateNonPolymerCovalentBondEndpoints()
+        if add_hydrogenbond_feature
+        else Identity(),
         FilterToQueryPNUnits(),
         AnnotateChainTypes(),
         MaskResiduesWithSpecificUnresolvedAtoms(chain_type_to_atom_names={
@@ -310,6 +353,8 @@ def sd_featurizer_for_design(
         # PlaceUnresolvedTokenOnClosestResolvedTokenInSequence(annotation_to_update="coord", annotation_to_copy="coord"),
         # Add features from the atom_array
         AddAF3TokenBondFeatures(distance_cutoff=2.4),
+        cached_rdkit_features,
+        AddLigandBondOrderFeatures() if use_ligand_bond_order else Identity(),
         FeaturizeCoordsAndMasks(pseudo_ligand_occupancy_threshold=pseudo_ligand_occupancy_threshold),  # JH Changed 260416
         GetNCACOAndPseudoCBCoords(),
     ]

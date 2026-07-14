@@ -7,6 +7,8 @@ import torch.nn.functional as F
 import numpy as np
 from pathlib import Path
 import re
+from rdkit import Chem
+from rdkit.Chem import ChemicalFeatures
 
 import biotite.structure as struc
 from biotite.structure import AtomArray
@@ -38,6 +40,7 @@ from atomworks.ml.utils.token import get_token_starts
 from atomworks.ml.transforms.base import Transform
 from atomworks.ml.transforms._checks import check_contains_keys, check_is_instance, check_atom_array_annotation
 from atomworks.ml.transforms.filters import filter_to_specified_pn_units
+from atomworks.ml.transforms.rdkit_utils import get_chiral_centers
 from atomworks.ml.utils.geometry import masked_center, random_rigid_augmentation
 from atomworks.ml.utils.token import apply_token_wise, get_af3_token_center_idxs, apply_and_spread_token_wise
 from atomworks.ml.conditions.annotator import is_protein_backbone, is_protein_sidechain
@@ -68,6 +71,21 @@ _ATOM_CHIRALITY_TAG_TO_ID = {
     "R": 1,
     "S": 2,
 }
+
+_CACHED_RDKIT_CHIRALITY_TAG_TO_ID = {
+    "N": 0,
+    "R": 1,
+    "S": 2,
+}
+
+_CACHE_EXCLUDED_STANDARD_RESIDUES = frozenset((*STANDARD_AA, *STANDARD_RNA, *STANDARD_DNA))
+
+_SHEPHERD_HBA_HBD_FDEF_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "chemical_features"
+    / "shepherd_hba_hbd_v1.fdef"
+)
+_NONPOLYMER_COVALENT_ATTACHMENT_ANNOTATION = "is_nonpolymer_covalent_attachment"
 
 
 # Standard heavy-atom sidechain chi definitions.  These intentionally omit the
@@ -204,6 +222,7 @@ FEAT_TO_TOKEN_DIM = {
     "token_is_prot_std_aa": [0],
     "chi_angles": [0],
     "chi_mask": [0],
+    "token_bonds": [0, 1],
 
     # optional features that might not be present
     "seq_cond_mask": [0],
@@ -226,6 +245,12 @@ FEAT_TO_ATOM_DIM = {
     "atom_formal_charge": [0],
     "atom_is_aromatic": [0],
     "atom_chirality_tag": [0],
+    "atom_cached_rdkit_chirality_tag": [0],
+    "atom_cached_rdkit_chirality_mask": [0],
+    "atom_is_HBA": [0],
+    "atom_is_HBD": [0],
+    "atom_hydrogenbond_feature_mask": [0],
+    "atom_ligand_bond_order": [0, 1],
     "atom_is_covalent_modification": [0],
     "atom_is_ligand_pocket": [0],
     "atom_is_protein_chain": [0],   
@@ -381,7 +406,24 @@ class FeaturizeCoordsAndMasks(Transform):
         feats["tokenwise_atom_idxs_mask"] = tokenwise_atom_idxs_mask                        
                 
         # Get bond features        
-        feats["token_bonds"] = torch.tensor(feats["token_bonds"]).float()
+        feats["token_bonds"] = torch.as_tensor(feats["token_bonds"]).float()
+        if "atom_cached_rdkit_chirality_tag" in feats:
+            feats["atom_cached_rdkit_chirality_tag"] = torch.as_tensor(
+                feats["atom_cached_rdkit_chirality_tag"], dtype=torch.long
+            )
+            feats["atom_cached_rdkit_chirality_mask"] = torch.as_tensor(
+                feats["atom_cached_rdkit_chirality_mask"], dtype=torch.float32
+            )
+        if "atom_is_HBA" in feats:
+            feats["atom_is_HBA"] = torch.as_tensor(feats["atom_is_HBA"], dtype=torch.float32)
+            feats["atom_is_HBD"] = torch.as_tensor(feats["atom_is_HBD"], dtype=torch.float32)
+            feats["atom_hydrogenbond_feature_mask"] = torch.as_tensor(
+                feats["atom_hydrogenbond_feature_mask"], dtype=torch.float32
+            )
+        if "atom_ligand_bond_order" in feats:
+            feats["atom_ligand_bond_order"] = torch.as_tensor(
+                feats["atom_ligand_bond_order"], dtype=torch.int8
+            )
         
         # Add protein_standard_residue mask
         feats["atom_is_prot_std_aa"] = feats["atom_is_protein_chain"] * (1 - feats["atom_is_atomized"])
@@ -649,6 +691,413 @@ class AddCachedResidueData(Transform): #! (JH) changed 251001
         if self._residue_cache:
             data["cached_residue_level_data"] = {"residues": self._residue_cache}
         return data
+
+
+class AnnotateNonPolymerCovalentBondEndpoints(Transform):
+    """Mark non-polymer endpoints of covalent polymer/non-polymer bonds."""
+
+    def check_input(self, data: dict) -> None:
+        check_contains_keys(data, ["atom_array"])
+        check_is_instance(data, "atom_array", AtomArray)
+        check_atom_array_annotation(data, ["is_polymer", "is_covalent_modification"])
+
+    @override
+    def forward(self, data: dict) -> dict:
+        atom_array = data["atom_array"]
+        endpoint_mask = np.zeros(len(atom_array), dtype=bool)
+        if atom_array.bonds is not None:
+            bonds = atom_array.bonds.as_array()
+            if len(bonds) > 0:
+                atom_a = bonds[:, 0].astype(int)
+                atom_b = bonds[:, 1].astype(int)
+                is_polymer = np.asarray(atom_array.is_polymer, dtype=bool)
+                is_covalent_modification = np.asarray(
+                    atom_array.is_covalent_modification, dtype=bool
+                )
+                is_attachment_bond = (
+                    (is_polymer[atom_a] != is_polymer[atom_b])
+                    & is_covalent_modification[atom_a]
+                    & is_covalent_modification[atom_b]
+                )
+                attachment_atom_a = atom_a[is_attachment_bond]
+                attachment_atom_b = atom_b[is_attachment_bond]
+                nonpolymer_endpoints = np.where(
+                    is_polymer[attachment_atom_a],
+                    attachment_atom_b,
+                    attachment_atom_a,
+                )
+                endpoint_mask[nonpolymer_endpoints] = True
+
+        atom_array.set_annotation(_NONPOLYMER_COVALENT_ATTACHMENT_ANNOTATION, endpoint_mask)
+        return data
+
+
+class AddCachedRDKitFeatures(Transform):
+    """Add enabled atom features from residue-level cached RDKit molecules."""
+
+    def __init__(
+        self,
+        residue_cache_dir: str | Path,
+        *,
+        add_chirality: bool = False,
+        add_hydrogenbond_feature: bool = False,
+        hydrogenbond_feature_definition_path: str | Path = _SHEPHERD_HBA_HBD_FDEF_PATH,
+    ):
+        if residue_cache_dir is None:
+            raise ValueError(
+                "residue_cache_dir must be set when cached RDKit features are enabled"
+            )
+        if not add_chirality and not add_hydrogenbond_feature:
+            raise ValueError("At least one cached RDKit feature must be enabled")
+
+        self.residue_cache_dir = Path(residue_cache_dir)
+        self.add_chirality = add_chirality
+        self.add_hydrogenbond_feature = add_hydrogenbond_feature
+        self._residue_cache: dict[str, tuple[dict | None, str | None, str | None]] = {}
+        self._warned_chirality_failures: set[tuple[str, str]] = set()
+        self._warned_hydrogenbond_unknowns: set[tuple[str, str]] = set()
+        self._hydrogenbond_factory = None
+        self._hydrogenbond_factory_error: str | None = None
+        if add_hydrogenbond_feature:
+            try:
+                self._hydrogenbond_factory = ChemicalFeatures.BuildFeatureFactory(
+                    str(hydrogenbond_feature_definition_path)
+                )
+            except Exception as exc:
+                self._hydrogenbond_factory_error = str(exc)
+
+    def check_input(self, data: dict) -> None:
+        check_contains_keys(data, ["atom_array"])
+        check_is_instance(data, "atom_array", AtomArray)
+        annotations = []
+        if self.add_chirality:
+            annotations.extend(
+                [
+                    "atom_is_small_molecule_chain",
+                    "atom_is_metal_chain",
+                    "atom_is_nucleic_acid_chain",
+                ]
+            )
+        if self.add_hydrogenbond_feature:
+            annotations.extend(
+                ["is_polymer", _NONPOLYMER_COVALENT_ATTACHMENT_ANNOTATION]
+            )
+        check_atom_array_annotation(data, annotations)
+
+    def _load_residue_entry(self, res_name: str) -> tuple[dict | None, str | None, str | None]:
+        if res_name in self._residue_cache:
+            return self._residue_cache[res_name]
+
+        path = self.residue_cache_dir / res_name / f"{res_name}.pt"
+        if not path.exists():
+            result = (None, "missing_cache_file", str(path))
+        else:
+            try:
+                entry = torch.load(path, map_location="cpu", weights_only=False)
+            except Exception as exc:
+                result = (None, "cache_load_failed", str(exc))
+            else:
+                result = (entry, None, None) if entry is not None else (None, "empty_cache_entry", str(path))
+
+        self._residue_cache[res_name] = result
+        return result
+
+    def _warn_chirality_failure(
+        self,
+        res_name: str,
+        reason: str,
+        detail: str | None = None,
+    ) -> None:
+        warning_key = (res_name, reason)
+        if warning_key in self._warned_chirality_failures:
+            return
+        self._warned_chirality_failures.add(warning_key)
+        detail_suffix = f" ({detail})" if detail else ""
+        logger.warning(
+            "Omitting cached chirality conditioning for CCD %s: %s%s",
+            res_name,
+            reason,
+            detail_suffix,
+        )
+
+    def _warn_hydrogenbond_unknown(
+        self,
+        res_name: str,
+        reason: str,
+        detail: str | None = None,
+    ) -> None:
+        warning_key = (res_name, reason)
+        if warning_key in self._warned_hydrogenbond_unknowns:
+            return
+        self._warned_hydrogenbond_unknowns.add(warning_key)
+        detail_suffix = f" ({detail})" if detail else ""
+        logger.warning(
+            "Incomplete HBA/HBD conditioning for CCD %s: %s%s",
+            res_name,
+            reason,
+            detail_suffix,
+        )
+
+    @staticmethod
+    def _normalized_atom_names(atom_names: Sequence[Any] | np.ndarray) -> np.ndarray:
+        return np.asarray([str(name).strip() for name in atom_names], dtype=object)
+
+    def _encode_chirality_residue(
+        self,
+        res_name: str,
+        runtime_atom_names: np.ndarray,
+    ) -> tuple[np.ndarray | None, str | None, str | None]:
+        entry, reason, detail = self._load_residue_entry(res_name)
+        if reason is not None:
+            return None, reason, detail
+        if not isinstance(entry, dict):
+            return None, "invalid_cache_entry", f"type={type(entry).__name__}"
+
+        mol = entry.get("mol")
+        if mol is None:
+            return None, "missing_cached_mol", None
+
+        cached_atom_names_raw = entry.get("atom_names")
+        if cached_atom_names_raw is None:
+            return None, "missing_cached_atom_names", None
+        cached_atom_names = self._normalized_atom_names(cached_atom_names_raw)
+
+        try:
+            n_mol_atoms = int(mol.GetNumAtoms())
+        except Exception as exc:
+            return None, "invalid_cached_mol", str(exc)
+        if len(cached_atom_names) != n_mol_atoms:
+            return (
+                None,
+                "cached_atom_names_mol_count_mismatch",
+                f"{len(cached_atom_names)} != {n_mol_atoms}",
+            )
+        if len(set(cached_atom_names.tolist())) != len(cached_atom_names):
+            return None, "duplicate_cached_atom_names", None
+
+        cached_idx_by_name = {name: idx for idx, name in enumerate(cached_atom_names)}
+        missing_names = [name for name in runtime_atom_names if name not in cached_idx_by_name]
+        if missing_names:
+            return None, "incomplete_atom_name_coverage", ",".join(sorted(set(missing_names)))
+
+        if mol.GetNumConformers() == 0:
+            return None, "missing_cached_conformer", None
+
+        try:
+            chiral_centers = get_chiral_centers(Chem.Mol(mol))
+        except Exception as exc:
+            return None, "chiral_assignment_failed", str(exc)
+
+        encoded_by_cached_idx = np.full(
+            n_mol_atoms,
+            _CACHED_RDKIT_CHIRALITY_TAG_TO_ID["N"],
+            dtype=np.int64,
+        )
+        for center in chiral_centers:
+            center_idx = center.get("chiral_center_idx")
+            if not isinstance(center_idx, (int, np.integer)) or not 0 <= int(center_idx) < n_mol_atoms:
+                return None, "invalid_cached_chiral_center_index", str(center_idx)
+            chirality = center.get("chirality")
+            if chirality not in ("R", "S"):
+                return None, "invalid_cached_chirality_label", str(chirality)
+            encoded_by_cached_idx[int(center_idx)] = _CACHED_RDKIT_CHIRALITY_TAG_TO_ID[chirality]
+
+        return (
+            np.asarray(
+                [encoded_by_cached_idx[cached_idx_by_name[name]] for name in runtime_atom_names],
+                dtype=np.int64,
+            ),
+            None,
+            None,
+        )
+
+    def _encode_hydrogenbond_residue(
+        self,
+        res_name: str,
+        runtime_atom_names: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, str | None, str | None]:
+        is_hba = np.zeros(len(runtime_atom_names), dtype=bool)
+        is_hbd = np.zeros(len(runtime_atom_names), dtype=bool)
+        valid = np.zeros(len(runtime_atom_names), dtype=bool)
+
+        entry, reason, detail = self._load_residue_entry(res_name)
+        if reason is not None:
+            return is_hba, is_hbd, valid, reason, detail
+        if not isinstance(entry, dict):
+            return is_hba, is_hbd, valid, "invalid_cache_entry", f"type={type(entry).__name__}"
+
+        mol = entry.get("mol")
+        if mol is None:
+            return is_hba, is_hbd, valid, "missing_cached_mol", None
+        cached_atom_names_raw = entry.get("atom_names")
+        if cached_atom_names_raw is None:
+            return is_hba, is_hbd, valid, "missing_cached_atom_names", None
+        cached_atom_names = self._normalized_atom_names(cached_atom_names_raw)
+
+        try:
+            n_mol_atoms = int(mol.GetNumAtoms())
+        except Exception as exc:
+            return is_hba, is_hbd, valid, "invalid_cached_mol", str(exc)
+        if len(cached_atom_names) != n_mol_atoms:
+            detail = f"{len(cached_atom_names)} != {n_mol_atoms}"
+            return is_hba, is_hbd, valid, "cached_atom_names_mol_count_mismatch", detail
+        if len(set(cached_atom_names.tolist())) != len(cached_atom_names):
+            return is_hba, is_hbd, valid, "duplicate_cached_atom_names", None
+        if self._hydrogenbond_factory is None:
+            return (
+                is_hba,
+                is_hbd,
+                valid,
+                "feature_factory_unavailable",
+                self._hydrogenbond_factory_error,
+            )
+
+        cached_is_hba = np.zeros(n_mol_atoms, dtype=bool)
+        cached_is_hbd = np.zeros(n_mol_atoms, dtype=bool)
+        try:
+            acceptor_features = self._hydrogenbond_factory.GetFeaturesForMol(
+                mol, includeOnly="Acceptor"
+            )
+            donor_features = self._hydrogenbond_factory.GetFeaturesForMol(
+                mol, includeOnly="Donor"
+            )
+            for features, output in (
+                (acceptor_features, cached_is_hba),
+                (donor_features, cached_is_hbd),
+            ):
+                for feature in features:
+                    atom_ids = feature.GetAtomIds()
+                    if any(not 0 <= int(atom_idx) < n_mol_atoms for atom_idx in atom_ids):
+                        return is_hba, is_hbd, valid, "invalid_feature_atom_index", str(atom_ids)
+                    output[np.asarray(atom_ids, dtype=int)] = True
+        except Exception as exc:
+            return is_hba, is_hbd, valid, "hydrogenbond_assignment_failed", str(exc)
+
+        cached_idx_by_name = {name: idx for idx, name in enumerate(cached_atom_names)}
+        missing_names = []
+        for runtime_idx, atom_name in enumerate(runtime_atom_names):
+            cached_idx = cached_idx_by_name.get(atom_name)
+            if cached_idx is None:
+                missing_names.append(atom_name)
+                continue
+            is_hba[runtime_idx] = cached_is_hba[cached_idx]
+            is_hbd[runtime_idx] = cached_is_hbd[cached_idx]
+            valid[runtime_idx] = True
+
+        if missing_names:
+            detail = ",".join(sorted(set(missing_names)))
+            return is_hba, is_hbd, valid, "incomplete_atom_name_coverage", detail
+        return is_hba, is_hbd, valid, None, None
+
+    def _add_chirality_features(
+        self,
+        atom_array: AtomArray,
+        residue_boundaries: np.ndarray,
+        feats: dict,
+    ) -> None:
+        encoded = np.full(
+            len(atom_array),
+            _CACHED_RDKIT_CHIRALITY_TAG_TO_ID["N"],
+            dtype=np.int64,
+        )
+        valid = np.zeros(len(atom_array), dtype=bool)
+        eligible = (
+            atom_array.get_annotation("atom_is_small_molecule_chain").astype(bool)
+            | atom_array.get_annotation("atom_is_metal_chain").astype(bool)
+            | atom_array.get_annotation("atom_is_nucleic_acid_chain").astype(bool)
+        )
+
+        for start, stop in zip(residue_boundaries[:-1], residue_boundaries[1:], strict=True):
+            residue_indices = np.arange(start, stop)
+            eligible_indices = residue_indices[eligible[start:stop]]
+            if len(eligible_indices) == 0:
+                continue
+
+            res_name = str(atom_array.res_name[start])
+            if res_name in _CACHE_EXCLUDED_STANDARD_RESIDUES:
+                continue
+
+            runtime_atom_names = self._normalized_atom_names(atom_array.atom_name[eligible_indices])
+            if len(set(runtime_atom_names.tolist())) != len(runtime_atom_names):
+                residue_encoding = None
+                reason = "duplicate_runtime_atom_names"
+                detail = None
+            else:
+                residue_encoding, reason, detail = self._encode_chirality_residue(
+                    res_name, runtime_atom_names
+                )
+            if reason is not None:
+                self._warn_chirality_failure(res_name, reason, detail)
+            else:
+                encoded[eligible_indices] = residue_encoding
+                valid[eligible_indices] = True
+
+        feats["atom_cached_rdkit_chirality_tag"] = encoded
+        feats["atom_cached_rdkit_chirality_mask"] = valid
+
+    def _add_hydrogenbond_features(
+        self,
+        atom_array: AtomArray,
+        residue_boundaries: np.ndarray,
+        feats: dict,
+    ) -> None:
+        is_hba = np.zeros(len(atom_array), dtype=bool)
+        is_hbd = np.zeros(len(atom_array), dtype=bool)
+        valid = np.zeros(len(atom_array), dtype=bool)
+        is_polymer = np.asarray(atom_array.is_polymer, dtype=bool)
+        is_attachment = np.asarray(
+            atom_array.get_annotation(_NONPOLYMER_COVALENT_ATTACHMENT_ANNOTATION),
+            dtype=bool,
+        )
+
+        for start, stop in zip(residue_boundaries[:-1], residue_boundaries[1:], strict=True):
+            residue_indices = np.arange(start, stop)
+            eligible_indices = residue_indices[~is_polymer[start:stop]]
+            if len(eligible_indices) == 0:
+                continue
+
+            res_name = str(atom_array.res_name[start])
+            runtime_atom_names = self._normalized_atom_names(atom_array.atom_name[eligible_indices])
+            residue_hba, residue_hbd, residue_valid, reason, detail = (
+                self._encode_hydrogenbond_residue(res_name, runtime_atom_names)
+            )
+            if reason is not None:
+                self._warn_hydrogenbond_unknown(res_name, reason, detail)
+
+            endpoint_local_mask = is_attachment[eligible_indices]
+            residue_hba[endpoint_local_mask] = False
+            residue_hbd[endpoint_local_mask] = False
+            residue_valid[endpoint_local_mask] = False
+            is_hba[eligible_indices] = residue_hba
+            is_hbd[eligible_indices] = residue_hbd
+            valid[eligible_indices] = residue_valid
+
+        feats["atom_is_HBA"] = is_hba
+        feats["atom_is_HBD"] = is_hbd
+        feats["atom_hydrogenbond_feature_mask"] = valid
+
+    @override
+    def forward(self, data: dict) -> dict:
+        atom_array = data["atom_array"]
+        feats = data.setdefault("feats", {})
+        residue_boundaries = struc.get_residue_starts(
+            atom_array, add_exclusive_stop=True
+        )
+        if self.add_chirality:
+            self._add_chirality_features(atom_array, residue_boundaries, feats)
+        if self.add_hydrogenbond_feature:
+            self._add_hydrogenbond_features(atom_array, residue_boundaries, feats)
+        return data
+
+
+class AddCachedRDKitChiralityFeatures(AddCachedRDKitFeatures):
+    """Backward-compatible chirality-only cached RDKit transform."""
+
+    def __init__(self, residue_cache_dir: str | Path):
+        super().__init__(residue_cache_dir, add_chirality=True)
+
+    # Retain the private method name used by focused chirality tests/callers.
+    _encode_residue = AddCachedRDKitFeatures._encode_chirality_residue
 
 ### Binding site annotation
 def _normalized_element_values(values: Sequence[Any] | np.ndarray) -> np.ndarray:
