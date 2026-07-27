@@ -8,6 +8,7 @@ import atomworks.enums as aw_enums
 import numpy as np
 import pandas as pd
 from atomworks.io.utils.sequence import get_3_from_1_letter_code
+from atomworks.io.utils.selection import get_residue_starts
 
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
@@ -19,6 +20,7 @@ from allatom_design.eval.structure_prediction.af3_json import (
 )
 from allatom_design.eval.structure_prediction.af3_runner import (
     expected_prediction_count_from_json,
+    inference_config_with_residue_index_by_chain,
     run_af3_single_sequence,
     run_af3_template_conditioned,
     summarize_af3_prediction_outputs,
@@ -441,12 +443,10 @@ def _restore_af3_prediction_protein_res_ids(
 ) -> Any:
     """Restore source label-sequence IDs lost at the AF3 JSON boundary.
 
-    AF3 numbers each serialized protein from one, while ``make_af3_json()`` emits
-    the inclusive source label-ID span from the designed structure.  Validate the
-    prediction against the exact JSON CCD sequence (canonical base sequence plus
-    explicit modifications), then invert that writer mapping.  This preserves
-    source label IDs without requiring raw modified-residue names to equal their
-    canonical AF3 sequence letters.
+    AF3 numbers each serialized protein from one. ``make_af3_json()`` emits either
+    observed residues with sparse source label IDs (the SS default), or the
+    inclusive source label-ID span for TC and explicitly requested gap-filled SS.
+    Validate the exact JSON CCD sequence, then invert the applicable writer mapping.
     """
     required_annotations = {"pn_unit_iid", "atom_name", "res_name", "res_id"}
     for label, atom_array in (
@@ -508,39 +508,44 @@ def _restore_af3_prediction_protein_res_ids(
             raise ValueError(
                 f"AF3 JSON {json_path} has no protein sequence for chain {chain_id}"
             )
-        designed_ca_indices = np.where(
-            (designed_sample_atom_array.pn_unit_iid == pn_unit_iid)
-            & (designed_sample_atom_array.atom_name == "CA")
-        )[0]
-        pred_ca_indices = np.where(
-            (pred_atom_array.pn_unit_iid == pn_unit_iid)
-            & (pred_atom_array.atom_name == "CA")
-        )[0]
-        if len(designed_ca_indices) == 0:
-            raise ValueError(f"No designed protein CA residues found for {pn_unit_iid}")
+        designed_chain = designed_sample_atom_array[
+            designed_sample_atom_array.pn_unit_iid == pn_unit_iid
+        ]
+        pred_chain = pred_atom_array[pred_atom_array.pn_unit_iid == pn_unit_iid]
+        designed_residue_starts = get_residue_starts(designed_chain)
+        pred_residue_starts = get_residue_starts(pred_chain)
+        if len(designed_residue_starts) == 0:
+            raise ValueError(f"No designed protein residues found for {pn_unit_iid}")
         designed_res_ids = np.asarray(
-            designed_sample_atom_array.res_id[designed_ca_indices], dtype=int
+            designed_chain.res_id[designed_residue_starts], dtype=int
         )
-        if len(np.unique(designed_res_ids)) != len(designed_res_ids):
+        if np.any(np.diff(designed_res_ids) <= 0):
             raise ValueError(
-                f"Designed protein chain {pn_unit_iid} has duplicate CA res_ids"
+                f"Designed protein chain {pn_unit_iid} residue res_ids must be "
+                "strictly increasing"
             )
         min_res_id = int(np.min(designed_res_ids))
         max_res_id = int(np.max(designed_res_ids))
-        source_res_ids = np.arange(min_res_id, max_res_id + 1, dtype=int)
-        if len(expected_res_names) != len(source_res_ids):
+        full_span_res_ids = np.arange(min_res_id, max_res_id + 1, dtype=int)
+        # (JH) fixed: invert both the sparse default and explicit gap-filled form.
+        if len(expected_res_names) == len(designed_res_ids):
+            source_res_ids = designed_res_ids
+        elif len(expected_res_names) == len(full_span_res_ids):
+            source_res_ids = full_span_res_ids
+        else:
             raise ValueError(
-                "AF3 JSON protein length does not match the designed source label-ID "
-                f"span for {pn_unit_iid}: json={len(expected_res_names)}, "
-                f"source_span={len(source_res_ids)} ({min_res_id}..{max_res_id})"
+                "AF3 JSON protein length matches neither observed designed residues "
+                f"nor their source label-ID span for {pn_unit_iid}: "
+                f"json={len(expected_res_names)}, observed={len(designed_res_ids)}, "
+                f"source_span={len(full_span_res_ids)} ({min_res_id}..{max_res_id})"
             )
-        if len(pred_ca_indices) != len(expected_res_names):
+        if len(pred_residue_starts) != len(expected_res_names):
             raise ValueError(
                 "AF3 predicted protein residue count does not match serialized "
                 f"chain {pn_unit_iid}: json={len(expected_res_names)}, "
-                f"predicted={len(pred_ca_indices)}"
+                f"predicted={len(pred_residue_starts)}"
             )
-        pred_names = np.asarray(pred_atom_array.res_name[pred_ca_indices], dtype=str)
+        pred_names = np.asarray(pred_chain.res_name[pred_residue_starts], dtype=str)
         expected_names = np.asarray(expected_res_names, dtype=str)
         mismatch_indices = np.where(expected_names != pred_names)[0]
         if len(mismatch_indices):
@@ -553,10 +558,10 @@ def _restore_af3_prediction_protein_res_ids(
                 f"JSON sequence for {pn_unit_iid}: {examples}"
             )
 
-        pred_res_ids = np.asarray(pred_atom_array.res_id[pred_ca_indices])
+        pred_res_ids = np.asarray(pred_chain.res_id[pred_residue_starts])
         if len(np.unique(pred_res_ids)) != len(pred_res_ids):
             raise ValueError(
-                f"Predicted protein chain {pn_unit_iid} has duplicate CA res_ids"
+                f"Predicted protein chain {pn_unit_iid} has duplicate residue res_ids"
             )
         for pred_res_id, source_res_id in zip(pred_res_ids, source_res_ids):
             residue_mask = (
@@ -655,9 +660,24 @@ def _evaluate_af3_mode(
             has_role_metrics = subsample_dict.get("pn_unit_roles") is not None
 
             json_path = subsample_dict[mode_spec.json_paths_key][dsidx]
+            job_inference_config = af3_inference_config
+            if mode == "ss":
+                residue_index_mappings = subsample_dict.get(
+                    "af3_ss_residue_index_by_chain"
+                )
+                residue_index_by_chain = (
+                    residue_index_mappings[dsidx]
+                    if residue_index_mappings is not None
+                    else None
+                )
+                # (JH) fixed: each generated SS JSON carries only its own mapping.
+                job_inference_config = inference_config_with_residue_index_by_chain(
+                    af3_inference_config,
+                    residue_index_by_chain,
+                )
             n_expected_predictions = expected_prediction_count_from_json(
                 json_path,
-                af3_inference_config,
+                job_inference_config,
                 mode,
             )
             status_row = _new_prediction_status_row(
@@ -675,7 +695,7 @@ def _evaluate_af3_mode(
                         json_path=json_path,
                         prediction_dir=prediction_dir,
                         runner_path=af3_runner_path,
-                        inference_config=af3_inference_config,
+                        inference_config=job_inference_config,
                     )
                 except Exception as exc:
                     print(
@@ -693,7 +713,7 @@ def _evaluate_af3_mode(
                 job_name=designed_sample_id,
                 expected_count=n_expected_predictions,
                 json_path=json_path,
-                inference_config=af3_inference_config,
+                inference_config=job_inference_config,
                 mode=mode,
                 strict_input_fingerprint=strict_input_fingerprint,
             )

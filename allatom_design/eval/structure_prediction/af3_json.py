@@ -14,7 +14,7 @@ from atomworks.io.utils.atom_array_plus import AtomArray
 from atomworks.io.utils.selection import get_residue_starts
 from atomworks.io.utils.sequence import get_1_from_3_letter_code
 
-from allatom_design.eval.config import get_json_config_value
+from allatom_design.eval.config import config_value_as_bool, get_json_config_value
 from allatom_design.eval.utils.sampling_inputs import normalize_pn_unit_roles
 
 
@@ -36,6 +36,45 @@ def make_af3_protein_sequence_entry(
             "templates": templates or [],
         }
     }
+
+
+def ss_preserve_residue_index_gaps(
+    json_config: dict | DictConfig | None,
+) -> bool:
+    """Return whether SS inputs should encode missing residues as sparse indices."""
+    # (JH) fixed: sparse residue indices are the SS default; gap filling is opt-in.
+    return config_value_as_bool(
+        get_json_config_value(
+            json_config or {},
+            "ss_preserve_residue_index_gaps",
+            default=True,
+        )
+    )
+
+
+def _protein_sequence_components(
+    res_names: np.ndarray,
+    hetero_flags: np.ndarray,
+) -> tuple[str, list[dict]]:
+    modifications: list[dict] = []
+    sequence_letters: list[str] = []
+    for idx, (res_name, is_hetero) in enumerate(
+        zip(res_names, hetero_flags, strict=True)
+    ):
+        one_letter = get_1_from_3_letter_code(
+            res_name,
+            chain_type=ChainType.POLYPEPTIDE_L,
+            use_closest_canonical=True,
+        )
+        sequence_letters.append(one_letter)
+        if is_hetero and res_name not in STANDARD_AA and res_name != "UNK":
+            modifications.append(
+                {
+                    "ptmType": res_name,
+                    "ptmPosition": idx + 1,
+                }
+            )
+    return "".join(sequence_letters), modifications
 
 
 def _get_user_ccd_path(json_config: dict | DictConfig, pdb_chain_info: dict) -> str | None:
@@ -152,6 +191,7 @@ def make_af3_json(
     json_config = json_config or {}
     model_seeds = list(json_config.get("model_seeds", [42]))
     version = int(json_config.get("version", 2))
+    preserve_ss_residue_index_gaps = ss_preserve_residue_index_gaps(json_config)
 
     if not make_ss_input and not make_tc_input:
         raise ValueError("At least one of make_ss_input or make_tc_input must be true")
@@ -167,6 +207,7 @@ def make_af3_json(
     for input_sample_id in tqdm(sample_dict.keys(), desc="Creating AF3 JSONs"):
         if make_ss_input:
             sample_dict[input_sample_id]["af3_ss_json_paths"] = []
+            sample_dict[input_sample_id]["af3_ss_residue_index_by_chain"] = []
         if make_tc_input:
             sample_dict[input_sample_id]["af3_tc_json_paths"] = []
         subsample_dict = sample_dict[input_sample_id]
@@ -234,10 +275,23 @@ def make_af3_json(
 
             ss_sequences = []
             tc_sequences = []
+            ss_residue_index_by_chain: dict[str, list[int]] = {}
             for protein_pn_unit_iid in protein_pn_unit_iids:
                 chain_mask = designed_sample_atom_array.pn_unit_iid == protein_pn_unit_iid
                 _res_starts = get_residue_starts(designed_sample_atom_array[chain_mask])
-                _res_ids = designed_sample_atom_array[chain_mask].res_id[_res_starts]
+                _res_ids = np.asarray(
+                    designed_sample_atom_array[chain_mask].res_id[_res_starts],
+                    dtype=int,
+                )
+                if len(_res_ids) == 0:
+                    raise ValueError(
+                        f"Protein PN unit {protein_pn_unit_iid!r} has no residues"
+                    )
+                if np.any(np.diff(_res_ids) <= 0):
+                    raise ValueError(
+                        "Protein residue IDs must be strictly increasing for AF3 "
+                        f"serialization: {protein_pn_unit_iid!r}={_res_ids.tolist()}"
+                    )
                 _res_ids_0based = _res_ids - np.min(_res_ids)
 
                 full_length = np.max(_res_ids) - np.min(_res_ids) + 1
@@ -256,33 +310,35 @@ def make_af3_json(
                 hetero_flags_with_gaps = np.full(full_length, False)
                 hetero_flags_with_gaps[_res_ids_0based] = chain_hetero
 
-                modifications = []
-                sequence_letters = []
-                for idx, (res_name, is_hetero) in enumerate(zip(chain_seq_with_gaps, hetero_flags_with_gaps)):
-                    one_letter = get_1_from_3_letter_code(
-                        res_name,
-                        chain_type=ChainType.POLYPEPTIDE_L,
-                        use_closest_canonical=True,
+                sequence_with_gaps, modifications_with_gaps = (
+                    _protein_sequence_components(
+                        chain_seq_with_gaps,
+                        hetero_flags_with_gaps,
                     )
-                    sequence_letters.append(one_letter)
-
-                    if is_hetero and res_name not in STANDARD_AA and res_name != "UNK":
-                        modifications.append({
-                            "ptmType": res_name,
-                            "ptmPosition": idx + 1,
-                        })
-
-                sequence_with_gaps = "".join(sequence_letters)
+                )
+                observed_sequence, observed_modifications = (
+                    _protein_sequence_components(chain_seq, chain_hetero)
+                )
 
                 if make_tc_input:
                     query_indices = template_indices = [int(x) for x in list(_res_ids_0based)]
 
                 if make_ss_input:
+                    # (JH) fixed: keep only observed SS tokens and carry their source
+                    # label IDs into the in-process AF3 featurised residue_index.
+                    if preserve_ss_residue_index_gaps:
+                        ss_sequence = observed_sequence
+                        ss_modifications = observed_modifications
+                        if np.any(np.diff(_res_ids) > 1):
+                            ss_residue_index_by_chain[chain_id] = _res_ids.tolist()
+                    else:
+                        ss_sequence = sequence_with_gaps
+                        ss_modifications = modifications_with_gaps
                     ss_sequences.append(
                         make_af3_protein_sequence_entry(
                             chain_id=chain_id,
-                            sequence=sequence_with_gaps,
-                            modifications=modifications,
+                            sequence=ss_sequence,
+                            modifications=ss_modifications,
                             templates=[],
                         )
                     )
@@ -295,7 +351,7 @@ def make_af3_json(
                         make_af3_protein_sequence_entry(
                             chain_id=chain_id,
                             sequence=sequence_with_gaps,
-                            modifications=modifications,
+                            modifications=modifications_with_gaps,
                             templates=(
                                 [
                                     {
@@ -356,6 +412,9 @@ def make_af3_json(
                 with open(json_path_ss, "w") as f:
                     json.dump(sample_af3_ss_json, f)
                 sample_dict[input_sample_id]["af3_ss_json_paths"].append(json_path_ss)
+                sample_dict[input_sample_id][
+                    "af3_ss_residue_index_by_chain"
+                ].append(ss_residue_index_by_chain)
 
             if make_tc_input:
                 json_path_tc = Path(af3_tc_input_dir, f"{job_name}.json")

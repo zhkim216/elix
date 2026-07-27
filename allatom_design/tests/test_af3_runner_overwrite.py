@@ -1,17 +1,117 @@
 import sys
 import types
 
+import numpy as np
+import pytest
 from omegaconf import OmegaConf
 
 from allatom_design.eval.structure_prediction.af3_runner import (
+    _ResidueIndexOverrideModelRunner,
+    _apply_residue_index_by_chain,
     _af3_prediction_outputs_complete,
     _af3_overwrite_enabled,
     _load_af3_runner,
     _prepare_af3_prediction_run,
     _run_af3_inprocess,
     _write_af3_input_fingerprint,
+    inference_config_with_residue_index_by_chain,
     summarize_af3_prediction_outputs,
 )
+
+
+def test_apply_residue_index_by_chain_changes_only_selected_protein_tokens() -> None:
+    example = {
+        "residue_index": np.array([1, 2, 1, 0, 0], dtype=np.int32),
+        "asym_id": np.array([1, 1, 2, 0, 0], dtype=np.int32),
+        "seq_mask": np.array([True, True, True, False, False]),
+        "is_protein": np.array([True, True, False, False, False]),
+        "token_index": np.array([1, 2, 3, 0, 0], dtype=np.int32),
+    }
+    original_asym_id = example["asym_id"].copy()
+    original_token_index = example["token_index"].copy()
+
+    _apply_residue_index_by_chain(
+        example,
+        chain_ids=["A", "B"],
+        residue_index_by_chain={"A": [100, 119]},
+    )
+
+    np.testing.assert_array_equal(
+        example["residue_index"],
+        np.array([100, 119, 1, 0, 0], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(example["asym_id"], original_asym_id)
+    np.testing.assert_array_equal(example["token_index"], original_token_index)
+
+
+def test_apply_residue_index_by_chain_rejects_token_count_mismatch() -> None:
+    example = {
+        "residue_index": np.array([1, 2], dtype=np.int32),
+        "asym_id": np.array([1, 1], dtype=np.int32),
+        "seq_mask": np.array([True, True]),
+        "is_protein": np.array([True, True]),
+    }
+
+    with pytest.raises(ValueError, match="3 indices.*2 protein tokens"):
+        _apply_residue_index_by_chain(
+            example,
+            chain_ids=["A"],
+            residue_index_by_chain={"A": [100, 119, 120]},
+        )
+
+
+def test_residue_index_adapter_shares_mutated_batch_with_output_extraction() -> None:
+    example = {
+        "residue_index": np.array([1, 2], dtype=np.int32),
+        "asym_id": np.array([1, 1], dtype=np.int32),
+        "seq_mask": np.array([True, True]),
+        "is_protein": np.array([True, True]),
+    }
+
+    class FakeModelRunner:
+        def run_inference(self, featurised_example, rng_key):
+            assert rng_key == "rng"
+            np.testing.assert_array_equal(
+                featurised_example["residue_index"],
+                np.array([100, 119], dtype=np.int32),
+            )
+            return {"result": True}
+
+        def extract_inference_results(self, *, batch, result, target_name):
+            assert result == {"result": True}
+            assert target_name == "target"
+            return batch["residue_index"].copy()
+
+    adapter = _ResidueIndexOverrideModelRunner(
+        FakeModelRunner(),
+        chain_ids=["A"],
+        residue_index_by_chain={"A": [100, 119]},
+    )
+    result = adapter.run_inference(example, "rng")
+    extracted_residue_index = adapter.extract_inference_results(
+        batch=example,
+        result=result,
+        target_name="target",
+    )
+
+    np.testing.assert_array_equal(
+        extracted_residue_index,
+        np.array([100, 119], dtype=np.int32),
+    )
+
+
+def test_sparse_mapping_is_attached_to_only_the_cloned_job_config() -> None:
+    base = OmegaConf.create({"ss": {"num_diffusion_samples": 5}})
+    job = inference_config_with_residue_index_by_chain(
+        base,
+        {"A": [100, 119]},
+    )
+
+    # (JH) fixed: a job override must not contaminate the next AF3 job.
+    assert OmegaConf.select(base, "ss.residue_index_by_chain") is None
+    assert OmegaConf.to_container(job.ss.residue_index_by_chain) == {
+        "A": [100, 119]
+    }
 
 
 def test_af3_overwrite_enabled_parses_config_values() -> None:

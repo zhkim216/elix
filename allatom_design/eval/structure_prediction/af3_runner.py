@@ -8,9 +8,11 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping, Sequence
 from functools import lru_cache
 from pathlib import Path
 
+import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
@@ -338,6 +340,166 @@ def _af3_overwrite_enabled(mode_config: dict | DictConfig | None) -> bool:
     return config_value_as_bool(get_config_value(mode_config, "overwrite", False))
 
 
+def _residue_index_by_chain(
+    mode_config: dict | DictConfig | None,
+) -> dict[str, tuple[int, ...]] | None:
+    """Return a validated, optional AF3 chain-to-label-sequence-index mapping."""
+    raw_mapping = get_config_value(mode_config, "residue_index_by_chain", None)
+    if raw_mapping is None:
+        return None
+    mapping = _plain_config(raw_mapping)
+    if not isinstance(mapping, dict) or not mapping:
+        raise ValueError("residue_index_by_chain must be a non-empty mapping")
+
+    validated: dict[str, tuple[int, ...]] = {}
+    for raw_chain_id, raw_indices in mapping.items():
+        chain_id = str(raw_chain_id)
+        if not chain_id:
+            raise ValueError("residue_index_by_chain contains an empty chain ID")
+        if (
+            isinstance(raw_indices, (str, bytes))
+            or not isinstance(raw_indices, Sequence)
+            or not raw_indices
+        ):
+            raise ValueError(
+                f"residue_index_by_chain[{chain_id!r}] must be a non-empty sequence"
+            )
+        indices = tuple(int(index) for index in raw_indices)
+        if any(index <= 0 for index in indices):
+            raise ValueError(
+                f"residue_index_by_chain[{chain_id!r}] must contain positive indices"
+            )
+        if any(right <= left for left, right in zip(indices, indices[1:])):
+            raise ValueError(
+                f"residue_index_by_chain[{chain_id!r}] must be strictly increasing"
+            )
+        validated[chain_id] = indices
+    return validated
+
+
+def inference_config_with_residue_index_by_chain(
+    inference_config: dict | DictConfig,
+    residue_index_by_chain: Mapping[str, Sequence[int]] | None,
+) -> DictConfig:
+    """Clone an AF3 config and attach one SS job's sparse residue indices."""
+    config = OmegaConf.create(
+        OmegaConf.to_container(inference_config, resolve=True)
+        if isinstance(inference_config, DictConfig)
+        else inference_config
+    )
+    if not residue_index_by_chain:
+        if OmegaConf.select(config, "ss.residue_index_by_chain", default=None) is not None:
+            OmegaConf.update(config, "ss.residue_index_by_chain", None)
+        return config
+
+    validated = _residue_index_by_chain(
+        {"residue_index_by_chain": dict(residue_index_by_chain)}
+    )
+    assert validated is not None
+    # (JH) fixed: isolate the per-job sparse mapping from the shared base config.
+    OmegaConf.update(
+        config,
+        "ss.residue_index_by_chain",
+        {chain_id: list(indices) for chain_id, indices in validated.items()},
+        force_add=True,
+    )
+    return config
+
+
+def _apply_residue_index_by_chain(
+    featurised_example: dict,
+    *,
+    chain_ids: Sequence[str],
+    residue_index_by_chain: Mapping[str, Sequence[int]],
+) -> None:
+    """Replace protein token residue indices while preserving chain identity."""
+    required_features = ("residue_index", "asym_id", "seq_mask", "is_protein")
+    missing = [
+        feature_name
+        for feature_name in required_features
+        if feature_name not in featurised_example
+    ]
+    if missing:
+        raise ValueError(
+            "AF3 featurised example is missing residue-index override features: "
+            f"{missing}"
+        )
+
+    residue_index = np.asarray(featurised_example["residue_index"])
+    asym_id = np.asarray(featurised_example["asym_id"])
+    seq_mask = np.asarray(featurised_example["seq_mask"], dtype=bool)
+    is_protein = np.asarray(featurised_example["is_protein"], dtype=bool)
+    if not (
+        residue_index.shape == asym_id.shape == seq_mask.shape == is_protein.shape
+    ):
+        raise ValueError(
+            "AF3 residue_index, asym_id, seq_mask, and is_protein shapes differ"
+        )
+
+    active_asym_ids = list(
+        dict.fromkeys(int(value) for value in asym_id[seq_mask].tolist())
+    )
+    ordered_chain_ids = [str(chain_id) for chain_id in chain_ids]
+    if len(active_asym_ids) != len(ordered_chain_ids):
+        raise ValueError(
+            "AF3 active asym count does not match fold-input chain count: "
+            f"{len(active_asym_ids)} != {len(ordered_chain_ids)}"
+        )
+    chain_id_to_asym_id = dict(
+        zip(ordered_chain_ids, active_asym_ids, strict=True)
+    )
+
+    updated_residue_index = np.array(residue_index, copy=True)
+    for chain_id, raw_indices in residue_index_by_chain.items():
+        if chain_id not in chain_id_to_asym_id:
+            raise ValueError(
+                f"Residue-index override chain {chain_id!r} is absent from fold input"
+            )
+        indices = np.asarray(tuple(raw_indices), dtype=updated_residue_index.dtype)
+        chain_mask = (
+            seq_mask
+            & is_protein
+            & (asym_id == chain_id_to_asym_id[chain_id])
+        )
+        token_count = int(np.count_nonzero(chain_mask))
+        if token_count != len(indices):
+            raise ValueError(
+                f"Residue-index override for chain {chain_id!r} has {len(indices)} "
+                f"indices but AF3 featurised {token_count} protein tokens"
+            )
+        updated_residue_index[chain_mask] = indices
+
+    featurised_example["residue_index"] = updated_residue_index
+
+
+class _ResidueIndexOverrideModelRunner:
+    """Apply sparse label-sequence indices before delegating AF3 inference."""
+
+    # (JH) fixed: the official AF3 feature batch is patched immediately before
+    # inference so the same batch is also used during result extraction.
+    def __init__(
+        self,
+        model_runner,
+        *,
+        chain_ids: Sequence[str],
+        residue_index_by_chain: Mapping[str, Sequence[int]],
+    ):
+        self._model_runner = model_runner
+        self._chain_ids = tuple(str(chain_id) for chain_id in chain_ids)
+        self._residue_index_by_chain = dict(residue_index_by_chain)
+
+    def run_inference(self, featurised_example: dict, rng_key):
+        _apply_residue_index_by_chain(
+            featurised_example,
+            chain_ids=self._chain_ids,
+            residue_index_by_chain=self._residue_index_by_chain,
+        )
+        return self._model_runner.run_inference(featurised_example, rng_key)
+
+    def __getattr__(self, name: str):
+        return getattr(self._model_runner, name)
+
+
 def _prepare_af3_sample_dir(
     *,
     json_path: str,
@@ -573,6 +735,7 @@ def _run_af3_inprocess(
     from alphafold3.common import folding_input
 
     mode_config = get_config_value(inference_config, mode, {})
+    residue_index_by_chain = _residue_index_by_chain(mode_config)
     if _prepare_af3_prediction_run(
         json_path=json_path,
         out_dir=out_dir,
@@ -587,10 +750,23 @@ def _run_af3_inprocess(
         mode=mode,
     )
 
-    fold_inputs = folding_input.load_fold_inputs_from_path(pathlib.Path(json_path))
+    fold_inputs = tuple(
+        folding_input.load_fold_inputs_from_path(pathlib.Path(json_path))
+    )
+    if residue_index_by_chain is not None and len(fold_inputs) != 1:
+        raise ValueError(
+            "residue_index_by_chain requires exactly one AF3 job per JSON file"
+        )
 
     for fold_input_item in fold_inputs:
         output_dir = os.path.join(out_dir, fold_input_item.sanitised_name())
+        item_model_runner = model_runner
+        if residue_index_by_chain is not None:
+            item_model_runner = _ResidueIndexOverrideModelRunner(
+                model_runner,
+                chain_ids=[chain.id for chain in fold_input_item.chains],
+                residue_index_by_chain=residue_index_by_chain,
+            )
         fix_standalone_glycans = _resolve_fix_standalone_glycans(
             mode_config=mode_config,
             fold_input=fold_input_item,
@@ -599,7 +775,7 @@ def _run_af3_inprocess(
             runner.process_fold_input(
                 fold_input=fold_input_item,
                 data_pipeline_config=data_pipeline_config,
-                model_runner=model_runner,
+                model_runner=item_model_runner,
                 output_dir=output_dir,
                 buckets=_AF3_BUCKETS,
                 ref_max_modified_date=_AF3_MAX_TEMPLATE_DATE,
@@ -638,6 +814,10 @@ def run_af3_single_sequence(
     """Run AF3 single-sequence inference."""
     ss_config = inference_config.ss
     if use_subprocess:
+        if _residue_index_by_chain(ss_config) is not None:
+            raise ValueError(
+                "residue_index_by_chain is supported only by in-process AF3 inference"
+            )
         if _prepare_af3_prediction_run(
             json_path=json_path,
             out_dir=out_dir,

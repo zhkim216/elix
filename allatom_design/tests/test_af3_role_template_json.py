@@ -129,6 +129,52 @@ def test_ss_and_tc_json_share_chain_ids_for_transformed_pn_units(tmp_path) -> No
         ] == ["A", "CA", "L"]
 
 
+def test_ss_sparse_index_is_default_and_gap_filling_is_explicit(tmp_path) -> None:
+    sample_dict = _sample_dict(tmp_path, template_pn_unit_iids=["C_1"])
+    atom_array = sample_dict["toy"]["designed_sample_atom_array"][0]
+    atom_array.res_id[:3] = np.asarray([10, 12, 13])
+    sample_dict["toy"]["native_res_name_by_chain_res_id"] = {("A", 11): "GLY"}
+
+    make_af3_json(
+        af3_ss_input_dir=tmp_path / "sparse",
+        sample_dict=sample_dict,
+        json_config={"model_seeds": [42]},
+        make_tc_input=False,
+    )
+    with sample_dict["toy"]["af3_ss_json_paths"][0].open() as handle:
+        sparse_payload = json.load(handle)
+    assert sparse_payload["sequences"][0]["protein"]["sequence"] == "AAA"
+    assert sample_dict["toy"]["af3_ss_residue_index_by_chain"] == [
+        {"A": [10, 12, 13]}
+    ]
+
+    gap_filled_sample_dict = _sample_dict(
+        tmp_path,
+        template_pn_unit_iids=["C_1"],
+    )
+    gap_filled_atoms = gap_filled_sample_dict["toy"][
+        "designed_sample_atom_array"
+    ][0]
+    gap_filled_atoms.res_id[:3] = np.asarray([10, 12, 13])
+    gap_filled_sample_dict["toy"]["native_res_name_by_chain_res_id"] = {
+        ("A", 11): "GLY"
+    }
+    make_af3_json(
+        af3_ss_input_dir=tmp_path / "gap_filled",
+        sample_dict=gap_filled_sample_dict,
+        json_config={
+            "model_seeds": [42],
+            # (JH) fixed: this is the only switch that restores legacy gap filling.
+            "ss_preserve_residue_index_gaps": False,
+        },
+        make_tc_input=False,
+    )
+    with gap_filled_sample_dict["toy"]["af3_ss_json_paths"][0].open() as handle:
+        gap_filled_payload = json.load(handle)
+    assert gap_filled_payload["sequences"][0]["protein"]["sequence"] == "AGAA"
+    assert gap_filled_sample_dict["toy"]["af3_ss_residue_index_by_chain"] == [{}]
+
+
 def test_af3_chain_mapping_preserves_multiletter_id_with_empty_ligands() -> None:
     assert build_af3_chain_id_to_pn_unit_iid(
         protein_pn_unit_iids=["CA_1"],

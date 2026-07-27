@@ -515,6 +515,87 @@ def test_prediction_res_id_restore_round_trips_source_label_ids(tmp_path: Path) 
     assert restored.res_id.tolist() == [7, 7, 8, 8]
 
 
+def test_prediction_res_id_restore_round_trips_sparse_source_label_ids(
+    tmp_path: Path,
+) -> None:
+    designed = AtomArray(4)
+    designed.coord = np.zeros((4, 3))
+    designed.chain_id = np.asarray(["A"] * 4)
+    designed.atom_name = np.asarray(["N", "CA", "N", "CA"])
+    designed.res_name = np.asarray(["MET", "MET", "LYS", "LYS"])
+    designed.res_id = np.asarray([7, 7, 9, 9])
+    designed.set_annotation("pn_unit_iid", np.asarray(["A_1"] * 4))
+    predicted = designed.copy()
+    predicted.res_id = np.asarray([1, 1, 2, 2])
+    json_path = tmp_path / "sparse_input.json"
+    json_path.write_text(
+        json.dumps(
+            {
+                "sequences": [
+                    {
+                        "protein": {
+                            "id": "A",
+                            "sequence": "MK",
+                            "modifications": [],
+                        }
+                    }
+                ]
+            }
+        )
+    )
+
+    # (JH) fixed: compact AF3 positions restore directly to observed source IDs.
+    restored = af3_evaluation._restore_af3_prediction_protein_res_ids(
+        predicted,
+        designed_sample_atom_array=designed,
+        protein_pn_unit_iids=["A_1"],
+        af3_chain_id_to_pn_unit_iid={"A": "A_1"},
+        json_path=json_path,
+    )
+    assert restored.res_id.tolist() == [7, 7, 9, 9]
+
+
+def test_prediction_res_id_restore_preserves_n_terminal_non_ca_modification(
+    tmp_path: Path,
+) -> None:
+    designed = AtomArray(5)
+    designed.coord = np.zeros((5, 3))
+    designed.chain_id = np.asarray(["A"] * 5)
+    designed.atom_name = np.asarray(["C", "N", "CA", "N", "CA"])
+    designed.res_name = np.asarray(["ACE", "MET", "MET", "LYS", "LYS"])
+    designed.res_id = np.asarray([1, 2, 2, 3, 3])
+    designed.set_annotation("pn_unit_iid", np.asarray(["A_1"] * 5))
+
+    predicted = designed.copy()
+    predicted.res_id = np.asarray([1, 2, 2, 3, 3])
+    json_path = tmp_path / "input.json"
+    json_path.write_text(
+        json.dumps(
+            {
+                "sequences": [
+                    {
+                        "protein": {
+                            "id": "A",
+                            "sequence": "XMK",
+                            "modifications": [{"ptmType": "ACE", "ptmPosition": 1}],
+                        }
+                    }
+                ]
+            }
+        )
+    )
+
+    restored = af3_evaluation._restore_af3_prediction_protein_res_ids(
+        predicted,
+        designed_sample_atom_array=designed,
+        protein_pn_unit_iids=["A_1"],
+        af3_chain_id_to_pn_unit_iid={"A": "A_1"},
+        json_path=json_path,
+    )
+
+    assert restored.res_id.tolist() == [1, 2, 2, 3, 3]
+
+
 def test_prediction_res_id_restore_rejects_serialized_sequence_mismatch(
     tmp_path: Path,
 ) -> None:
