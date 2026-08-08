@@ -323,11 +323,24 @@ def compute_ensemble_potts_params(
     )
     representative_batch = slice_feats(repeated_batch, representative_indices)
     output_batch = dict(batch)
-    output_batch["protein_residue_node_mask"] = representative_batch["protein_residue_node_mask"]
-    output_batch["token_exists_mask"] = representative_batch["token_exists_mask"]
-    output_batch["restype"] = representative_batch["restype"]
-    if "target_restype" in representative_batch:
-        output_batch["target_restype"] = representative_batch["target_restype"]
+    for key in (
+        "sequence_input",
+        "target_restype",
+        "protein_residue_node_mask",
+        "potts_node_mask",
+        "sequence_target_mask",
+        "seq_cond_mask_potts",
+        "token_exists_mask",
+    ):
+        if key in representative_batch:
+            output_batch[key] = representative_batch[key]
+    mask_dtype_source = output_batch.get(
+        "potts_node_mask",
+        output_batch.get("token_pad_mask", potts_decoder_aux["mask_i"]),
+    )
+    output_batch["potts_node_mask"] = potts_decoder_aux["mask_i"].to(
+        dtype=mask_dtype_source.dtype
+    )
     return potts_decoder_aux, output_batch, sampling_inputs
 
 

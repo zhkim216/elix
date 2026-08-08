@@ -98,7 +98,7 @@ case ${IDX} in
     ;;
 esac
 
-EXP_NAME="elix_exp43_cfg${IDX}_${CONDITION_NAME}_${NOISE_NAME}_seed${TRAIN_SEED}"
+EXP_NAME="elix_exp43_architecture_ablation_cfg${IDX}_${CONDITION_NAME}_${NOISE_NAME}_seed${TRAIN_SEED}"
 WANDB_RUN_ID="${EXP_NAME}_job${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-manual}}"
 HYDRA_DIR=${HYDRA_ROOT}/${EXP_NAME}
 export TORCHINDUCTOR_CACHE_DIR="/scratch/users/zhkim216/cache/inductor_cache_${EXP_NAME}"
@@ -261,7 +261,6 @@ MPNN_OVERRIDES=(
   denoiser.mpnn.use_mpnn_decoder=true
   denoiser.mpnn.decoder_input_mode=legacy_node_add
   denoiser.mpnn.update_final_encoder_edge=true
-  denoiser.mpnn.use_potts_encoding=true
   denoiser.mpnn.dropout_p=0.2
   denoiser.mpnn.ligand_conditioning=true
   denoiser.mpnn.use_context_skip_connection=false

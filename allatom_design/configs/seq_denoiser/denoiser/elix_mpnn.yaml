@@ -14,7 +14,6 @@ mpnn:
   decoder_input_mode: "legacy_node_add"
   # Legacy and existing checkpoints skip only the final encoder edge update.
   update_final_encoder_edge: false
-  use_potts_encoding: false  # false preserves legacy AF3-width sequence logits/checkpoints.
   dropout_p: 0.1
   ligand_conditioning: true
 

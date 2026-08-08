@@ -13,8 +13,7 @@ from omegaconf import DictConfig
 from torchtyping import TensorType
 from tqdm import tqdm
 
-import allatom_design.data.const as const
-import allatom_design.data.transform.potts_encoding as potts_encoding
+import allatom_design.data.transform.sequence_encoding as sequence_encoding
 import allatom_design.model.seq_denoiser.denoisers.seq_design.potts as potts
 from allatom_design.utils.feature_utils import slice_feats
 from allatom_design.utils.tensor_utils import to
@@ -75,8 +74,10 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
 
         self.cfg = cfg
         self.task = cfg.task
-        self.use_potts_encoding = bool(cfg.mpnn.get("use_potts_encoding", False))
-        self.sequence_encoding = potts_encoding.selected_sequence_encoding(self.use_potts_encoding)
+        self.input_encoding = sequence_encoding.INPUT_ENCODING
+        self.output_encoding = sequence_encoding.OUTPUT_ENCODING
+        self.num_input_states = len(self.input_encoding.tokens)
+        self.num_output_states = len(self.output_encoding.tokens)
 
         # Keep the historical attribute name because sampling and analysis
         # consumers access ``elix_mpnn.decoder_S_potts`` directly.
@@ -93,16 +94,21 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
                 sampling_inputs: dict[str, Any] | None = None,
                 ) -> tuple[TensorType["b n c", float],  # seq_logits
                            dict[str, TensorType["b ..."]]]:
-        if self.use_potts_encoding:
-            batch = potts_encoding.apply_potts_standard_aa_mask(batch)
-
         # Build some helpful masks based on conditioning sequence and atoms
         batch = self.build_masks(batch, is_sampling)
 
-        if self.use_potts_encoding:
-            batch = potts_encoding.apply_potts_restype_encoding(batch)
-        else:
-            batch["target_restype"] = batch["restype"].argmax(dim=-1)
+        allow_unk_redesign = False
+        if is_sampling and sampling_inputs is not None:
+            allow_unk_redesign = bool(
+                sampling_inputs.get("potts_sampling_cfg", {}).get(
+                    "allow_unk_redesign", False
+                )
+            )
+        batch = sequence_encoding.apply_sequence_encoding(
+            batch,
+            is_sampling=is_sampling,
+            allow_unk_redesign=allow_unk_redesign,
+        )
 
         # Run model
         seq_logits, mpnn_feats = self.elix_mpnn(batch, is_sampling)
@@ -121,6 +127,12 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
             "sidechain_context_token_mask": batch["sidechain_context_token_mask"],
             "token_exists_mask": batch["token_exists_mask"],
             "protein_residue_node_mask": batch["protein_residue_node_mask"],
+            "potts_node_mask": batch["potts_node_mask"],
+            "sequence_target_mask": batch["sequence_target_mask"],
+            "seq_cond_mask_potts": batch.get(
+                "seq_cond_mask_potts", batch["seq_cond_mask"]
+            ),
+            "sequence_input": batch["sequence_input"],
             "target_restype": batch["target_restype"],
             "restype": batch["restype"],
         }
@@ -141,6 +153,12 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
 
         # Ensure the conditioning masks only contain non-pad, resolved entries.
         batch["seq_cond_mask"] = batch["seq_cond_mask"] * batch["token_resolved_mask"] * batch["token_pad_mask"]
+        if "seq_cond_mask_potts" in batch:
+            batch["seq_cond_mask_potts"] = (
+                batch["seq_cond_mask_potts"]
+                * batch["token_resolved_mask"]
+                * batch["token_pad_mask"]
+            )
         batch["atom_cond_mask"] = batch["atom_cond_mask"] * batch["atom_resolved_mask"] * batch["atom_pad_mask"]
         batch["sidechain_context_token_mask"] = batch.get(
             "sidechain_context_token_mask",
@@ -160,27 +178,9 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
         token_exists_override = batch.get("token_exists_override", torch.ones_like(batch["token_exists_mask"]))
         batch["token_exists_mask"] = batch["token_exists_mask"] * token_exists_override
 
-        # Mask out hetero residues in protein residue graphs for sampling, if specified.
-        #Todo: Need to implement functionality for redesigning hetero residues into standard AA in the future.
-        residuewise_hetero_mask = batch.get("residuewise_hetero_mask", torch.ones_like(batch["token_exists_mask"]))
+        # Mask hetero atoms from sampling context when requested.
         atomwise_hetero_mask = batch.get("atomwise_hetero_mask", torch.ones_like(batch["atom_resolved_mask"]))
-
-        if not is_sampling:
-            batch["protein_residue_node_mask"] = (
-                batch["token_is_prot_std_aa"] *
-                batch["token_exists_mask"] *
-                batch["token_pad_mask"]
-            )
-
-        else:
-            #Todo: Need to implement functionality for redesigning hetero residues into standard AA in the future.
-            batch["protein_residue_node_mask"] = (
-                batch["token_is_prot_std_aa"] *
-                residuewise_hetero_mask *
-                batch["token_exists_mask"] *
-                batch["token_pad_mask"]
-            )
-
+        if is_sampling:
             batch["atom_cond_mask"] = batch["atom_cond_mask"] * atomwise_hetero_mask
 
         return batch
@@ -297,44 +297,28 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
         self,
         pos_restrict_aatype: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        return potts_encoding.project_pos_restrict_aatype_to_encoding(
-            pos_restrict_aatype,
-            use_potts_encoding=self.use_potts_encoding,
-        )
+        return sequence_encoding.project_pos_restrict_aatype(pos_restrict_aatype)
 
     def _sampling_ban_indices(self, omit_aas: list[str] | tuple[str, ...] | None) -> list[int]:
-        ban_aas = {"X"}
-        if omit_aas is not None:
-            ban_aas = ban_aas | set(omit_aas)
-        if not self.use_potts_encoding:
-            ban_S = const.AF3_ENCODING.encode_aa_seq(ban_aas)
-            ban_S = ban_S + const.AF3_ENCODING.encode(const.AF3_ENCODING.non_protein_tokens)
-            return sorted(set(ban_S))
-
-        ban_S = self.sequence_encoding.encode_aa_seq(ban_aas)
-        special_tokens = (
-            const.UNKNOWN_AA,
-            const.POTTS_NON_PROTEIN_TOKEN,
-            const.POTTS_MASK_TOKEN,
-            const.POTTS_PAD_TOKEN,
-        )
-        ban_S = ban_S + self.sequence_encoding.encode(special_tokens)
-        return sorted(set(ban_S))
+        if omit_aas is None:
+            return []
+        standard_aas = [aa for aa in omit_aas if aa != "X"]
+        return sorted(set(self.output_encoding.encode_aa_seq(standard_aas)))
 
     def _validate_potts_aux_alphabet(self, potts_decoder_aux: dict[str, torch.Tensor]) -> None:
         n_states = potts_decoder_aux["h"].shape[-1]
-        if n_states != self.sequence_encoding.n_tokens:
+        if n_states != self.num_output_states:
             raise ValueError(
-                f"Potts aux alphabet size {n_states} does not match selected sequence "
-                f"encoding size {self.sequence_encoding.n_tokens}."
+                f"Potts aux alphabet size {n_states} does not match output encoding "
+                f"size {self.num_output_states}."
             )
 
     def _validate_restype_alphabet(self, batch: dict[str, torch.Tensor]) -> None:
-        n_states = batch["restype"].shape[-1]
-        if n_states != self.sequence_encoding.n_tokens:
+        n_states = batch["sequence_input"].shape[-1]
+        if n_states != self.num_input_states:
             raise ValueError(
-                f"Batch restype alphabet size {n_states} does not match selected sequence "
-                f"encoding size {self.sequence_encoding.n_tokens}."
+                f"Batch sequence_input alphabet size {n_states} does not match input "
+                f"encoding size {self.num_input_states}."
             )
 
     @staticmethod
@@ -408,6 +392,11 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
         sampling_inputs: dict[str, Any],
         guidance_cfg: dict[str, Any],
     ) -> tuple[dict[str, list[AtomArray]], dict[str, Any]]:
+        raise NotImplementedError(
+            "Potts guidance mode='selectivity' is not implemented for the "
+            "22-state input / 20-state output sequence contract."
+        )
+
         selectivity_pair = self._require_selectivity_pair_guidance(guidance_cfg, batch)
         potts_sampling_cfg = sampling_inputs["potts_sampling_cfg"]
         if "tied_sampling_ids" in batch:
@@ -444,7 +433,7 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
         mask_sample_full = (
             (1 - batch["seq_cond_mask_potts"])
             * batch["token_pad_mask"]
-            * batch["protein_residue_node_mask"]
+            * batch["potts_node_mask"]
         )
         mask_sample_common = (
             mask_sample_full[0, common_token_idx[0]]
@@ -526,8 +515,6 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
                 S_full = S_full_init.clone()
                 S_full[positive_batch_idx, positive_common_idx] = S_common[0]
                 S_full[negative_batch_idx, negative_common_idx] = S_common[0]
-                S_full = self._set_non_protein_tokens(S_full, batch)
-
                 U_positive, _, U_positive_per_res = potts.compute_potts_energy(
                     S_common,
                     positive_aux["h"],
@@ -671,11 +658,8 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
         Potts sampling for sequence design.
 
         When ``potts_sampling_cfg.guidance_cfg.enabled`` is true, Potts
-        parameters are computed for positive and negative branches. In
-        ``cond_uncond`` mode these are the ligand-conditioned and protein-only
-        branches. In ``selectivity`` mode the eval layer supplies selectivity-pair
-        common-token tensors and sampling runs on the aligned common axis. The
-        sampler then runs DLMC on the linearly-mixed parameters
+        parameters are computed for ligand-conditioned and protein-only
+        branches. The sampler then runs DLMC on the linearly-mixed parameters
 
             h_mix = scale * h_positive + (1 - scale) * h_negative
             J_mix = scale * J_positive + (1 - scale) * J_negative
@@ -688,6 +672,20 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
             output_feats: list[dict[str, TensorType["b ..."]]]: list of length (n_samples_per_pdb) of output features for each sample
             aux: dict[str, Any]: auxiliary outputs
         """
+        potts_sampling_cfg = sampling_inputs["potts_sampling_cfg"]
+        guidance_cfg = potts_sampling_cfg.get("guidance_cfg", None)
+        use_guidance = bool(guidance_cfg) and bool(
+            guidance_cfg.get("enabled", False)
+        )
+        if (
+            use_guidance
+            and str(guidance_cfg.get("mode", "cond_uncond")) == "selectivity"
+        ):
+            raise NotImplementedError(
+                "Potts guidance mode='selectivity' is not implemented for the "
+                "22-state input / 20-state output sequence contract."
+            )
+
         # Preserve scaffold conditioning before the primary checkpoint applies
         # its own ``potts_only_cond`` policy or ensemble aggregation.
         mixing_source_batch = None
@@ -706,10 +704,6 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
             print("Conditioning on sequence only in the potts model")
             batch["seq_cond_mask"] = torch.zeros_like(batch["seq_cond_mask"])  # zero out model-level sequence conditioning mask
 
-        # Parse guidance config (optional).
-        potts_sampling_cfg = sampling_inputs["potts_sampling_cfg"]
-        guidance_cfg = potts_sampling_cfg.get("guidance_cfg", None)
-        use_guidance = bool(guidance_cfg) and bool(guidance_cfg.get("enabled", False))
         frustration_cfg = potts_sampling_cfg.get("frustration", {}) or {}
         use_frustration = bool(frustration_cfg.get("enabled", False))
         if use_frustration and use_guidance:
@@ -730,12 +724,6 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
                 raise NotImplementedError(
                     "Potts-model mixing cannot be combined with frustration."
                 )
-        if use_guidance and str(guidance_cfg.get("mode", "cond_uncond")) == "selectivity":
-            return self._potts_sample_selectivity_pair(
-                batch=batch,
-                sampling_inputs=sampling_inputs,
-                guidance_cfg=guidance_cfg,
-            )
         if use_guidance:
             if "tied_sampling_ids" in batch:
                 raise NotImplementedError(
@@ -760,11 +748,15 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
                 batch_positive,
                 sampling_inputs,
             )
-            batch["protein_residue_node_mask"] = batch_positive["protein_residue_node_mask"]
-            batch["token_exists_mask"] = batch_positive["token_exists_mask"]
-            if self.use_potts_encoding:
-                batch["restype"] = batch_positive["restype"]
-                batch["target_restype"] = batch_positive["target_restype"]
+            for key in (
+                "sequence_input",
+                "target_restype",
+                "protein_residue_node_mask",
+                "potts_node_mask",
+                "sequence_target_mask",
+                "token_exists_mask",
+            ):
+                batch[key] = batch_positive[key]
         elif potts_aux_provider is None:
             potts_decoder_aux, batch, sampling_inputs = self.compute_potts_params(batch, sampling_inputs)
         else:
@@ -824,8 +816,21 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
         )
         rejection_step = potts_sampling_cfg.get("rejection_step", potts_proposal == "chromatic")
 
-        B, N, C = batch["restype"].shape
-        logits_init = torch.zeros((B, N, C), device=batch["restype"].device).float()
+        B, N = batch["target_restype"].shape
+        if bool(
+            (
+                (batch["target_restype"] < 0)
+                | (batch["target_restype"] >= self.num_output_states)
+            ).any()
+        ):
+            raise ValueError(
+                "Potts sampling target_restype must contain only 20-state "
+                "output indices"
+            )
+        logits_init = torch.zeros(
+            (B, N, self.num_output_states),
+            device=batch["target_restype"].device,
+        ).float()
 
         # Handle banned amino acids and aatype restrictions
         ban_S = self._sampling_ban_indices(sampling_inputs.get("omit_aas", None))
@@ -833,8 +838,7 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
         # Initialize random sequence and sampling masks
         mask_sample = (
             (1 - batch["seq_cond_mask_potts"])
-            * batch["token_pad_mask"]
-            * batch["protein_residue_node_mask"]
+            * batch["potts_node_mask"]
         )  # 1 where we can sample, 0 where we can't
         pos_restrict_aatype = self._project_pos_restrict_aatype_to_encoding(
             sampling_inputs.get("pos_restrict_aatype", None)
@@ -846,14 +850,12 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
         # Fixed sampler positions must still start from their unmasked target
         # identities, otherwise the fixed state (and its pairwise energies)
         # incorrectly remains the mask token.
-        sampling_sequence = batch.get("target_restype")
-        if sampling_sequence is None:
-            sampling_sequence = batch["restype"].argmax(dim=-1)
-        if sampling_sequence.shape != batch["restype"].shape[:-1]:
+        sampling_sequence = batch["target_restype"]
+        if sampling_sequence.shape != (B, N):
             raise ValueError(
-                "Potts sampling target/restype shape mismatch: "
+                "Potts sampling target shape mismatch: "
                 f"target={tuple(sampling_sequence.shape)}, "
-                f"restype={tuple(batch['restype'].shape)}"
+                f"expected={(B, N)}"
             )
 
         mask_sample, _, S_init = potts.init_sampling_masks(
@@ -870,7 +872,7 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
         edge_idx_coloring = None
         if regularization == "LCP":
             C_complexity = batch["asym_id"] - torch.min(batch["asym_id"]) + 1  # renumber asym_id to have min value of 1
-            C_complexity = C_complexity * batch["protein_residue_node_mask"]
+            C_complexity = C_complexity * batch["potts_node_mask"]
             #! fixed, 251110
             # mask out i) non-protein chains, ii) pad tokens, iii) tokens that don't exist in the graph
             # complexity is only calculated for the residues where C_complexity > 0
@@ -1178,9 +1180,6 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
                 else:
                     S_sample, U_sample = sample_output
 
-                # Set all tokens that don't exist in the graph to unknown
-                S_sample = self._set_non_protein_tokens(S_sample, batch)
-
                 if use_guidance:
                     energies = self._compute_branch_energies(
                         S_sample,
@@ -1225,7 +1224,7 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
                     )
                     if local_mixture.alpha is not None:
                         alpha = local_mixture.alpha[..., 0]
-                        alpha_mask = batch["protein_residue_node_mask"].bool()
+                        alpha_mask = batch["potts_node_mask"].bool()
                         alpha_count = alpha_mask.sum(dim=-1).clamp(min=1)
                         sample_entry.update(
                             transition_alpha_min=torch.where(
@@ -1295,10 +1294,11 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
         )                                                     # [B, N_atoms]
 
         # Entries with zero C-alpha coords flag non-standard / unresolved tokens.
-        # Combine with the existing protein-residue node mask to be safe.
+        # Potts energy denominators include only residues represented on the
+        # 20-state Potts axis; graph-context-only UNKs must not change them.
         ca_valid = (
             (ca.norm(dim=-1) > 1e-6)
-            & batch["protein_residue_node_mask"].bool()
+            & batch["potts_node_mask"].bool()
         )                                                     # [B, N]
         n_protein = ca_valid.sum(-1).float()                  # [B]
 
@@ -1315,41 +1315,6 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
             pocket[b] = (min_d2 < d2_threshold).float()
         pocket = pocket * ca_valid.float()
         return pocket, n_protein
-
-    def _set_non_protein_tokens(self,
-                                S: TensorType["b n", int],
-                                batch: dict[str, TensorType["b ..."]],
-                                ) -> TensorType["b n", int]:
-        """Set non-protein-residue-node positions to appropriate unknown tokens."""
-        non_protein = ~batch["protein_residue_node_mask"].bool()
-        if self.use_potts_encoding:
-            token_pad_mask = batch["token_pad_mask"].bool()
-            protein_context = potts_encoding.protein_context_token_mask(batch)
-            S = torch.where(
-                non_protein & token_pad_mask & protein_context,
-                S.new_full((), self.sequence_encoding.token_to_idx[const.UNKNOWN_AA]),
-                S,
-            )
-            S = torch.where(
-                non_protein & token_pad_mask & ~protein_context,
-                S.new_full((), self.sequence_encoding.token_to_idx[const.POTTS_NON_PROTEIN_TOKEN]),
-                S,
-            )
-            S = torch.where(
-                ~token_pad_mask,
-                S.new_full((), self.sequence_encoding.token_to_idx[const.POTTS_PAD_TOKEN]),
-                S,
-            )
-            return S
-
-        S = torch.where(non_protein & (batch["is_protein"] | batch["is_ligand"]),
-                        const.AF3_ENCODING.token_to_idx[const.UNKNOWN_AA], S)
-        S = torch.where(non_protein & batch["is_rna"],
-                        const.AF3_ENCODING.token_to_idx[const.UNKNOWN_RNA], S)
-        S = torch.where(non_protein & batch["is_dna"],
-                        const.AF3_ENCODING.token_to_idx[const.UNKNOWN_DNA], S)
-        return S
-
 
     def _postprocess_sampled_sequences(
         self,
@@ -1390,13 +1355,13 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
                 atom_cond_mask = batch["atom_cond_mask"][bi][atom_pad_mask]
                 atom_resolved_mask = batch["atom_resolved_mask"][bi][atom_pad_mask]
 
-                # Update only sampled standard protein residues.
-                protein_residue_node_mask = batch["protein_residue_node_mask"][bi][token_pad_mask].bool()
+                # Update only unconditioned positions represented by the Potts output.
+                potts_node_mask = batch["potts_node_mask"][bi][token_pad_mask].bool()
                 update_seq_mask = (
-                    ~seq_cond_mask.bool() & protein_residue_node_mask
+                    ~seq_cond_mask.bool() & potts_node_mask
                 ).numpy().astype(bool)
                 atomwise_update_seq_mask = spread_token_wise(atom_array, update_seq_mask)
-                decoded_resnames = self.sequence_encoding.idx_to_token[new_restype.numpy()]
+                decoded_resnames = self.output_encoding.idx_to_token[new_restype.numpy()]
                 atomwise_resnames = spread_token_wise(atom_array, decoded_resnames)
                 atomwise_resnames = np.where(atomwise_update_seq_mask,
                                              atomwise_resnames,
@@ -1495,10 +1460,16 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
 
         # Run model and collect potts parameters
         potts_decoder_aux = {}  # potts parameters
-        token_exists_mask = []
-        protein_residue_node_mask = []  # keep track of the residues that exist in the graph
-        restype = []
-        target_restype = []
+        propagated_keys = (
+            "sequence_input",
+            "target_restype",
+            "protein_residue_node_mask",
+            "potts_node_mask",
+            "sequence_target_mask",
+            "seq_cond_mask_potts",
+            "token_exists_mask",
+        )
+        propagated_values = {key: [] for key in propagated_keys}
         for bi in tqdm(range(0, B, subbatch_size), desc="Computing potts parameters", leave=False):
             subbatch = slice_feats(batch, slice(bi, bi + subbatch_size))
 
@@ -1506,21 +1477,13 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
 
             for k, v in aux_preds_i["potts_decoder_aux"].items():
                 potts_decoder_aux.setdefault(k, []).append(v)
-            protein_residue_node_mask.append(aux_preds_i["protein_residue_node_mask"])
-            token_exists_mask.append(aux_preds_i["token_exists_mask"])
-            if self.use_potts_encoding:
-                restype.append(aux_preds_i["restype"])
-                target_restype.append(aux_preds_i["target_restype"])
+            for key in propagated_keys:
+                propagated_values[key].append(aux_preds_i[key])
             del aux_preds_i  # free seq_logits, h_V, h_ESV etc.
         potts_decoder_aux = {k: torch.cat(v, dim=0) for k, v in potts_decoder_aux.items()}
 
-        token_exists_mask = torch.cat(token_exists_mask, dim=0)
-        protein_residue_node_mask = torch.cat(protein_residue_node_mask, dim=0)
-        batch["protein_residue_node_mask"] = protein_residue_node_mask  # store in batch for downstream use
-        batch["token_exists_mask"] = token_exists_mask  # store in batch for downstream use
-        if self.use_potts_encoding:
-            batch["restype"] = torch.cat(restype, dim=0)
-            batch["target_restype"] = torch.cat(target_restype, dim=0)
+        for key in propagated_keys:
+            batch[key] = torch.cat(propagated_values[key], dim=0)
 
         # Handle tied sampling
         if "tied_sampling_ids" in batch:
@@ -1538,6 +1501,9 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
                 potts_decoder_aux,
                 tied_sampling_inputs,
                 reduce=tied_sampling_inputs["reduce"],
+            )
+            batch["potts_node_mask"] = potts_decoder_aux["mask_i"].to(
+                dtype=batch["potts_node_mask"].dtype
             )
 
         return potts_decoder_aux, batch, sampling_inputs

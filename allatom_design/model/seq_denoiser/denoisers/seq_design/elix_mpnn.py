@@ -2,10 +2,12 @@ from omegaconf import DictConfig, ListConfig
 
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
 from torchtyping import TensorType
 
-import allatom_design.data.const as const
+from allatom_design.data.transform.sequence_encoding import (
+    INPUT_ENCODING,
+    OUTPUT_ENCODING,
+)
 import allatom_design.model.seq_denoiser.denoisers.seq_design.potts as potts
 from allatom_design.model.seq_denoiser.denoisers.sidechain_prediction import (
     ChiAnglePredictionHead,
@@ -78,9 +80,10 @@ class ElixMPNN(nn.Module):
         self.num_decoder_layers = cfg.num_decoder_layers
         self.use_mpnn_decoder = cfg.get("use_mpnn_decoder", True)
         self.k_neighbors = cfg.k_neighbors
-        self.use_potts_encoding = bool(cfg.get("use_potts_encoding", False))
-        self.sequence_encoding = const.POTTS_ENCODING if self.use_potts_encoding else const.AF3_ENCODING
-        self.n_tokens = self.sequence_encoding.n_tokens
+        self.input_encoding = INPUT_ENCODING
+        self.output_encoding = OUTPUT_ENCODING
+        self.num_input_states = len(self.input_encoding.tokens)
+        self.num_output_states = len(self.output_encoding.tokens)
         self.decoder_input_mode = str(cfg.get("decoder_input_mode", "legacy_node_add"))
         if self.decoder_input_mode not in {
             "legacy_node_add",
@@ -200,7 +203,7 @@ class ElixMPNN(nn.Module):
 
         self.token_features = TokenFeatures(cfg.token_features)
         self.W_e = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False) # Edge embedding
-        self.W_s = nn.Linear(self.n_tokens, self.hidden_dim, bias=False) # Sequence embedding
+        self.W_s = nn.Linear(self.num_input_states, self.hidden_dim, bias=False) # Sequence embedding
         self.dropout = nn.Dropout(cfg.dropout_p)
 
         # Encoder layers
@@ -408,7 +411,7 @@ class ElixMPNN(nn.Module):
             self.decoder_S_potts = potts.GraphPotts(
                 dim_nodes=self.dim_nodes_potts,
                 dim_edges=self.dim_edges_potts,
-                num_states=self.n_tokens,
+                num_states=self.num_output_states,
                 parameterization=self.parameterization,
                 num_heads=self.num_heads,
                 reduce=self.reduce,
@@ -433,7 +436,7 @@ class ElixMPNN(nn.Module):
                 self.chi_angle_prediction_head = None
 
         # Output layers
-        self.W_out = nn.Linear(self.hidden_dim, self.n_tokens, bias=True)
+        self.W_out = nn.Linear(self.hidden_dim, self.num_output_states, bias=True)
 
         # Initialize weights
         for p in self.parameters():
@@ -499,26 +502,16 @@ class ElixMPNN(nn.Module):
 
     def forward(self, batch: dict[str, TensorType["b ..."]], is_sampling: bool):
         # Get token-level features
-        B, N, C = batch["restype"].shape
-        if C != self.n_tokens:
+        B, N, C = batch["sequence_input"].shape
+        if C != self.num_input_states:
             raise ValueError(
-                f"ElixMPNN expected restype alphabet size {self.n_tokens}, got {C}. "
-                "Check denoiser.mpnn.use_potts_encoding and restype projection."
+                "ElixMPNN expected sequence_input alphabet size "
+                f"{self.num_input_states}, got {C}."
             )
-        h_V = torch.zeros((B, N, self.hidden_dim), device=batch["restype"].device)
+        h_V = torch.zeros((B, N, self.hidden_dim), device=batch["sequence_input"].device)
 
         # Concatenate residue-level features to h_V
-        if self.use_potts_encoding:
-            restype = batch["restype"]
-        else:
-            ## first, mask out residues using gap token
-            masked = F.one_hot(torch.full((B, N), const.AF3_ENCODING.token_to_idx["<G>"],
-                                          device=batch["restype"].device), num_classes=C).float()
-
-            #! (JH) During sampling, seq_cond_mask is also 1 for padded tokens
-            #! (JH) So padded parts are also considered as gaps here, but I guess it's okay.
-            restype = torch.where(batch["seq_cond_mask"].unsqueeze(-1).bool(), batch["restype"], masked)
-        h_S = self.W_s(restype) #! (JH) different from the original lmpnn (zero-initialized)
+        h_S = self.W_s(batch["sequence_input"])
 
         # Build graph and get edge features
         token_feature_outputs = self.token_features(
@@ -548,6 +541,11 @@ class ElixMPNN(nn.Module):
         protein_residue_node_mask = batch["protein_residue_node_mask"]
         protein_residue_node_mask_2d = gather_nodes(protein_residue_node_mask.unsqueeze(-1), E_idx).squeeze(-1)
         protein_residue_node_mask_2d = protein_residue_node_mask.unsqueeze(-1) * protein_residue_node_mask_2d
+        potts_node_mask = batch["potts_node_mask"]
+        potts_node_mask_2d = gather_nodes(
+            potts_node_mask.unsqueeze(-1), E_idx
+        ).squeeze(-1)
+        potts_node_mask_2d = potts_node_mask.unsqueeze(-1) * potts_node_mask_2d
 
         if self.use_shared_atom_triangle:
             if context_metadata is None:
@@ -690,13 +688,13 @@ class ElixMPNN(nn.Module):
                 )
 
             if self.max_dist_potts is not None:
-                protein_residue_node_mask_2d = protein_residue_node_mask_2d * (D_neighbors <= self.max_dist_potts)  # mask out edges that are too far away
+                potts_node_mask_2d = potts_node_mask_2d * (D_neighbors <= self.max_dist_potts)  # mask out edges that are too far away
 
             if self.k_neighbors_potts is not None:
                 # truncate to k_neighbors_potts
                 h_E = h_E[:, :, :self.k_neighbors_potts]
                 E_idx = E_idx[:, :, :self.k_neighbors_potts]
-                protein_residue_node_mask_2d = protein_residue_node_mask_2d[:, :, :self.k_neighbors_potts]
+                potts_node_mask_2d = potts_node_mask_2d[:, :, :self.k_neighbors_potts]
 
             return_multi_head_stats = (
                 self.full_multi_head_aggregation is not None and not is_sampling
@@ -705,8 +703,8 @@ class ElixMPNN(nn.Module):
                 h_V_potts,
                 h_E,
                 E_idx,
-                protein_residue_node_mask,
-                protein_residue_node_mask_2d,
+                potts_node_mask,
+                potts_node_mask_2d,
                 return_multi_head_stats=return_multi_head_stats,
             )
             if return_multi_head_stats:
@@ -716,16 +714,16 @@ class ElixMPNN(nn.Module):
                 multi_head_stats = None
             coupling_mask = potts.build_coupling_mask(
                 E_idx,
-                protein_residue_node_mask,
-                protein_residue_node_mask_2d,
+                potts_node_mask,
+                potts_node_mask_2d,
                 require_reciprocal=self.decoder_S_potts.symmetric_J,
             )
             potts_decoder_aux = {
                 "h": h,
                 "J": J,
                 "edge_idx": E_idx,
-                "mask_i": protein_residue_node_mask,
-                "mask_ij": protein_residue_node_mask_2d,
+                "mask_i": potts_node_mask,
+                "mask_ij": potts_node_mask_2d,
                 "coupling_mask": coupling_mask,
             }
             if multi_head_stats is not None:

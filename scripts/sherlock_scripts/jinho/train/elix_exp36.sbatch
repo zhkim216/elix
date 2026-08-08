@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-EXP_NAME_BASE=elix_exp36
+EXP_NAME_BASE=elix_exp36_architecture_ablation
 BASE_DIR=/home/users/zhkim216/code/elix
 HYDRA_DIR=/scratch/users/zhkim216/hydra_outputs/train_seq_denoiser/${EXP_NAME_BASE}
 OUT_DIR=/scratch/users/zhkim216/out_dir
@@ -192,7 +192,7 @@ python3 allatom_design/train_seq_denoiser.py \
     trainer.strategy=ddp_find_unused_parameters_true \
     denoiser.name="${DENOISER_TYPE}" \
     resume.use_current_cfg=true \
-    resume.ckpt_path=auto \
+    resume.ckpt_path=null \
     loss.loss_weights.seq_loss=1.0 \
     loss.main_seq_loss_pocket_only=false \
     loss.main_potts_loss_pocket_only=false \
@@ -249,7 +249,6 @@ python3 allatom_design/train_seq_denoiser.py \
     denoiser.mpnn.num_decoder_layers="${NUM_DECODER_LAYERS}" \
     denoiser.mpnn.lmpnn_module.num_context_feature_processor_layers=2 \
     denoiser.mpnn.lmpnn_module.num_context_feature_aggregator_layers=2 \
-    denoiser.mpnn.use_potts_encoding=true \
     denoiser.mpnn.potts.multi_head.num_heads=2 \
     denoiser.mpnn.potts.multi_head.reduce=mean \
     denoiser.mpnn.potts.multi_head.adapter_hidden_dim=640 \
