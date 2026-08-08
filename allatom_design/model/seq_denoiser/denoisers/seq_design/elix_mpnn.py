@@ -13,13 +13,11 @@ from allatom_design.model.seq_denoiser.denoisers.sidechain_prediction import (
     ChiAnglePredictionHead,
 )
 from allatom_design.model.seq_denoiser.denoisers.seq_design.mpnn_layers import (
-    CalibyDecLayer,
-    ContextModule,
-    Contextfeatureaggregator,
-    Contextfeatureprocessor,
-    DecLayer,
-    EncLayer,
+    CalibyMixingEncoderLayer,
+    ContextConditioner,
+    MixingEncoderLayer,
     PositionWiseFeedForward,
+    ProteinEncoderLayer,
 )
 from allatom_design.model.seq_denoiser.denoisers.seq_design.mpnn_utils import (
     cat_neighbors_nodes,
@@ -76,34 +74,40 @@ class ElixMPNN(nn.Module):
         self.cfg = cfg
         self.ligand_conditioning = cfg.ligand_conditioning
         self.hidden_dim = cfg.hidden_dim
-        self.num_encoder_layers = cfg.num_encoder_layers
-        self.num_decoder_layers = cfg.num_decoder_layers
-        self.use_mpnn_decoder = cfg.get("use_mpnn_decoder", True)
+        self.num_protein_encoder_layers = cfg.num_protein_encoder_layers
+        self.num_mixing_encoder_layers = cfg.num_mixing_encoder_layers
+        self.use_mixing_encoder = cfg.get("use_mixing_encoder", True)
         self.k_neighbors = cfg.k_neighbors
         self.input_encoding = INPUT_ENCODING
         self.output_encoding = OUTPUT_ENCODING
         self.num_input_states = len(self.input_encoding.tokens)
         self.num_output_states = len(self.output_encoding.tokens)
-        self.decoder_input_mode = str(cfg.get("decoder_input_mode", "legacy_node_add"))
-        if self.decoder_input_mode not in {
-            "legacy_node_add",
-            "caliby_concat",
+        self.mixing_encoder_input_mode = str(
+            cfg.get("mixing_encoder_input_mode", "node_add")
+        )
+        if self.mixing_encoder_input_mode not in {
+            "node_add",
+            "caliby_edge_concat",
         }:
             raise ValueError(
-                "Invalid decoder_input_mode: "
-                f"{self.decoder_input_mode!r}. Expected 'legacy_node_add' or "
-                "'caliby_concat'."
+                "Invalid mixing_encoder_input_mode: "
+                f"{self.mixing_encoder_input_mode!r}. Expected 'node_add' or "
+                "'caliby_edge_concat'."
             )
-        self.use_caliby_decoder = self.decoder_input_mode == "caliby_concat"
-        if self.use_caliby_decoder and not self.use_mpnn_decoder:
-            raise ValueError(
-                f"decoder_input_mode={self.decoder_input_mode!r} requires use_mpnn_decoder=true"
-            )
-        requested_final_encoder_edge_update = bool(
-            cfg.get("update_final_encoder_edge", False)
+        self.use_caliby_mixing_encoder = (
+            self.mixing_encoder_input_mode == "caliby_edge_concat"
         )
-        self.update_final_encoder_edge = (
-            self.use_caliby_decoder or requested_final_encoder_edge_update
+        if self.use_caliby_mixing_encoder and not self.use_mixing_encoder:
+            raise ValueError(
+                "mixing_encoder_input_mode='caliby_edge_concat' requires "
+                "use_mixing_encoder=true"
+            )
+        requested_final_protein_encoder_edge_update = bool(
+            cfg.get("update_final_protein_encoder_edge", False)
+        )
+        self.update_final_protein_encoder_edge = (
+            self.use_caliby_mixing_encoder
+            or requested_final_protein_encoder_edge_update
         )
         self.expansion_mode = cfg.get("expansion_mode", None)
         self.use_shared_edge_multi_head_potts = (
@@ -117,7 +121,7 @@ class ElixMPNN(nn.Module):
             raise ValueError(
                 f"Invalid expansion mode: {self.expansion_mode!r}. Expected "
                 "'node_concat', the shared-edge gated multi-head mode, or null for "
-                "decoder_input_mode='caliby_concat'."
+                "mixing_encoder_input_mode='caliby_edge_concat'."
             )
         self.full_multi_head_aggregation = (
             "gate_nonlinear"
@@ -129,7 +133,7 @@ class ElixMPNN(nn.Module):
         self.shared_atom_mixing_encoder_layers = _validated_layer_indices(
             shared_atom_triangle_cfg,
             "mixing_encoder_layers",
-            num_layers=self.num_decoder_layers,
+            num_layers=self.num_mixing_encoder_layers,
             config_path="shared_atom_triangle",
         )
         self.use_shared_atom_triangle = bool(
@@ -140,7 +144,7 @@ class ElixMPNN(nn.Module):
             _validated_layer_indices(
                 protein_pair_triangle_cfg,
                 "mixing_encoder_layers",
-                num_layers=self.num_decoder_layers,
+                num_layers=self.num_mixing_encoder_layers,
                 config_path="protein_pair_triangle",
             )
         )
@@ -149,52 +153,54 @@ class ElixMPNN(nn.Module):
         )
         if self.use_shared_atom_triangle and (
             not self.ligand_conditioning
-            or not self.use_mpnn_decoder
-            or self.decoder_input_mode != "legacy_node_add"
+            or not self.use_mixing_encoder
+            or self.mixing_encoder_input_mode != "node_add"
         ):
             raise ValueError(
                 "shared_atom_triangle.mixing_encoder_layers requires "
                 "ligand_conditioning=true, "
-                "use_mpnn_decoder=true, and decoder_input_mode='legacy_node_add'"
+                "use_mixing_encoder=true, and "
+                "mixing_encoder_input_mode='node_add'"
             )
         if self.use_mixing_encoder_pair_triangle and (
-            not self.use_mpnn_decoder
-            or self.decoder_input_mode != "legacy_node_add"
+            not self.use_mixing_encoder
+            or self.mixing_encoder_input_mode != "node_add"
         ):
             raise ValueError(
                 "protein_pair_triangle.mixing_encoder_layers requires "
-                "use_mpnn_decoder=true and decoder_input_mode='legacy_node_add'"
+                "use_mixing_encoder=true and "
+                "mixing_encoder_input_mode='node_add'"
             )
-        if self.use_caliby_decoder and self.expansion_mode is not None:
+        if self.use_caliby_mixing_encoder and self.expansion_mode is not None:
             raise ValueError(
-                "decoder_input_mode='caliby_concat' supplies the 3H Potts edge "
-                "state directly and requires expansion_mode=null"
+                "mixing_encoder_input_mode='caliby_edge_concat' supplies the "
+                "3H Potts edge state directly and requires expansion_mode=null"
             )
-        if not self.use_caliby_decoder and self.expansion_mode is None:
+        if not self.use_caliby_mixing_encoder and self.expansion_mode is None:
             raise ValueError(
-                "decoder_input_mode='legacy_node_add' requires "
+                "mixing_encoder_input_mode='node_add' requires "
                 "expansion_mode='node_concat' or the shared-edge gated "
                 "multi-head mode"
             )
-        if self.use_caliby_decoder and self.use_context_skip_connection:
+        if self.use_caliby_mixing_encoder and self.use_context_skip_connection:
             raise ValueError(
-                "decoder_input_mode='caliby_concat' does not support "
+                "mixing_encoder_input_mode='caliby_edge_concat' does not support "
                 "use_context_skip_connection=true"
             )
         if self.use_shared_edge_multi_head_potts and (
             not self.ligand_conditioning
-            or not self.use_mpnn_decoder
-            or self.decoder_input_mode != "legacy_node_add"
+            or not self.use_mixing_encoder
+            or self.mixing_encoder_input_mode != "node_add"
         ):
             raise ValueError(
                 f"expansion_mode={self.expansion_mode!r} requires "
-                "ligand_conditioning=true, use_mpnn_decoder=true, and "
-                "decoder_input_mode='legacy_node_add'"
+                "ligand_conditioning=true, use_mixing_encoder=true, and "
+                "mixing_encoder_input_mode='node_add'"
             )
         if self.use_context_skip_connection:
             assert self.ligand_conditioning, (
                 "use_context_skip_connection requires ligand_conditioning=True; "
-                "the skip path sources its signal from the ligand ContextModule."
+                "the skip path sources its signal from ContextConditioner."
             )
         self.return_context_skip = (
             self.use_context_skip_connection
@@ -206,82 +212,102 @@ class ElixMPNN(nn.Module):
         self.W_s = nn.Linear(self.num_input_states, self.hidden_dim, bias=False) # Sequence embedding
         self.dropout = nn.Dropout(cfg.dropout_p)
 
-        # Encoder layers
-        self.encoder_layers = nn.ModuleList([
-            EncLayer(self.hidden_dim, self.hidden_dim*3, dropout=cfg.dropout_p,
-                     is_last_layer=(not self.update_final_encoder_edge and i == self.num_encoder_layers - 1))
-            for i in range(self.num_encoder_layers)
+        # Protein encoder layers
+        self.protein_encoder_layers = nn.ModuleList([
+            ProteinEncoderLayer(
+                self.hidden_dim,
+                self.hidden_dim * 3,
+                dropout=cfg.dropout_p,
+                is_last_layer=(
+                    not self.update_final_protein_encoder_edge
+                    and i == self.num_protein_encoder_layers - 1
+                ),
+            )
+            for i in range(self.num_protein_encoder_layers)
         ])
 
-        # Decoder layers
-        if self.use_caliby_decoder:
-            self.decoder_layers = nn.ModuleList([
-                CalibyDecLayer(self.hidden_dim, self.hidden_dim * 3, dropout=cfg.dropout_p)
-                for _ in range(self.num_decoder_layers)
+        # Sequence/structure mixing layers
+        if self.use_caliby_mixing_encoder:
+            self.mixing_encoder_layers = nn.ModuleList([
+                CalibyMixingEncoderLayer(
+                    self.hidden_dim,
+                    self.hidden_dim * 3,
+                    dropout=cfg.dropout_p,
+                )
+                for _ in range(self.num_mixing_encoder_layers)
             ])
         else:
-            self.decoder_layers = nn.ModuleList([
-                DecLayer(self.hidden_dim, self.hidden_dim*3, dropout=cfg.dropout_p,
-                         use_context_skip_connection=self.use_context_skip_connection)
-                for _ in range(self.num_decoder_layers)
+            self.mixing_encoder_layers = nn.ModuleList([
+                MixingEncoderLayer(
+                    self.hidden_dim,
+                    self.hidden_dim * 3,
+                    dropout=cfg.dropout_p,
+                    use_context_skip_connection=(
+                        self.use_context_skip_connection
+                    ),
+                )
+                for _ in range(self.num_mixing_encoder_layers)
             ])
 
         if self.ligand_conditioning:
-            cfg_lmpnn_module = cfg.get("lmpnn_module", None)
-            self.num_context_feature_processor_layers = cfg_lmpnn_module.get("num_context_feature_processor_layers", None)
-            self.num_context_feature_aggregator_layers = cfg_lmpnn_module.get("num_context_feature_aggregator_layers", None)
-
-            assert cfg_lmpnn_module is not None, "lmpnn_module is required for ligand conditioning"
-            assert self.num_context_feature_processor_layers is not None, "num_context_feature_processor_layers is required for ligand conditioning"
-            assert self.num_context_feature_aggregator_layers is not None, "num_context_feature_aggregator_layers is required for ligand conditioning"
-
-            legacy_context_edge_update = bool(
-                cfg_lmpnn_module.get("context_edge_update", False)
+            cfg_context_conditioner = cfg.get("context_conditioner", None)
+            assert cfg_context_conditioner is not None, (
+                "context_conditioner is required for ligand conditioning"
             )
-            self.context_pair_update = bool(
-                cfg_lmpnn_module.get(
-                    "context_pair_update",
-                    legacy_context_edge_update,
+            self.num_context_encoder_layers = cfg_context_conditioner.get(
+                "num_context_encoder_layers", None
+            )
+            self.num_context_to_protein_layers = cfg_context_conditioner.get(
+                "num_context_to_protein_layers", None
+            )
+            assert self.num_context_encoder_layers is not None, (
+                "num_context_encoder_layers is required for ligand conditioning"
+            )
+            assert self.num_context_to_protein_layers is not None, (
+                "num_context_to_protein_layers is required for ligand conditioning"
+            )
+            self.update_context_edges = bool(
+                cfg_context_conditioner.get("update_context_edges", False)
+            )
+            self.update_protein_context_edges = bool(
+                cfg_context_conditioner.get(
+                    "update_protein_context_edges", False
                 )
             )
-            self.protein_context_pair_update = bool(
-                cfg_lmpnn_module.get(
-                    "protein_context_pair_update",
-                    legacy_context_edge_update,
-                )
+            self.update_final_context_edge = bool(
+                cfg_context_conditioner.get("update_final_context_edge", True)
             )
-            self.update_final_context_processor_edge = bool(
-                cfg_lmpnn_module.get("update_final_context_processor_edge", True)
-            )
-            self.update_final_context_aggregator_edge = bool(
-                cfg_lmpnn_module.get(
-                    "update_final_context_aggregator_edge",
-                    False,
+            self.update_final_protein_context_edge = bool(
+                cfg_context_conditioner.get(
+                    "update_final_protein_context_edge", False
                 )
             )
             if (
                 self.use_shared_atom_triangle
-                and not self.protein_context_pair_update
+                and not self.update_protein_context_edges
             ):
                 raise ValueError(
                     "shared_atom_triangle.mixing_encoder_layers requires "
-                    "lmpnn_module.protein_context_pair_update=true"
+                    "context_conditioner.update_protein_context_edges=true"
                 )
-            context_module_dropout_p = float(
-                cfg_lmpnn_module.get("dropout_p", cfg.dropout_p)
+            context_conditioner_dropout_p = float(
+                cfg_context_conditioner.get("dropout_p", cfg.dropout_p)
             )
 
-            # Encapsulate context feature processing into a separate module
-            self.context_module = ContextModule(
+            self.context_conditioner = ContextConditioner(
                 hidden_dim=self.hidden_dim,
-                dropout_p=context_module_dropout_p,
-                num_processor_layers=self.num_context_feature_processor_layers,
-                num_aggregator_layers=self.num_context_feature_aggregator_layers,
-                context_pair_update=self.context_pair_update,
-                protein_context_pair_update=self.protein_context_pair_update,
-                update_final_processor_edge=self.update_final_context_processor_edge,
-                update_final_aggregator_edge=(
-                    self.update_final_context_aggregator_edge
+                dropout_p=context_conditioner_dropout_p,
+                num_context_encoder_layers=self.num_context_encoder_layers,
+                num_context_to_protein_layers=(
+                    self.num_context_to_protein_layers
+                ),
+                update_context_edges=self.update_context_edges,
+                update_protein_context_edges=(
+                    self.update_protein_context_edges
+                ),
+                update_final_context_edge=self.update_final_context_edge,
+                update_final_protein_context_edge=(
+                    self.update_final_protein_context_edge
                 ),
                 return_context_skip=self.return_context_skip,
             )
@@ -371,7 +397,10 @@ class ElixMPNN(nn.Module):
             self.reduce = "mean"
             self.adapter_hidden_dim = None
             self.shared_edge_dim = None
-            if self.use_caliby_decoder or self.expansion_mode == "node_concat":
+            if (
+                self.use_caliby_mixing_encoder
+                or self.expansion_mode == "node_concat"
+            ):
                 if self.parameterization != "factor":
                     raise ValueError(
                         f"expansion_mode={self.expansion_mode!r} requires "
@@ -450,12 +479,12 @@ class ElixMPNN(nn.Module):
         # The model initializes close to the use_context_skip_connection=False baseline,
         # and the skip path only learns non-trivial contributions if they reduce loss.
         if self.use_context_skip_connection:
-            for layer in self.decoder_layers:
+            for layer in self.mixing_encoder_layers:
                 nn.init.zeros_(layer.W_ctx.weight)
                 nn.init.zeros_(layer.W_ctx.bias)
 
 
-    def _apply_shared_atom_triangle_after_decoder_layer(
+    def _apply_shared_atom_triangle_after_mixing_layer(
         self,
         *,
         layer_index: int,
@@ -566,19 +595,19 @@ class ElixMPNN(nn.Module):
                 protein_residue_node_mask_2d,
             )
 
-        # Pass through encoder layers
+        # Pass through protein encoder layers
         # Residue-level encoding, for standard AAs in protein chains only
         h_V = h_V + h_S
         h_E = self.W_e(h_E)
 
-        for layer_index, layer in enumerate(self.encoder_layers):
+        for layer in self.protein_encoder_layers:
             h_V, h_E = layer(h_V, h_E, E_idx, protein_residue_node_mask, protein_residue_node_mask_2d)
 
         # Process ligand context features
         h_V_C_skip = None
         h_E_context_for_shared_atom_triangle = None
         if self.ligand_conditioning:
-            context_outputs = self.context_module(
+            context_outputs = self.context_conditioner(
                 h_V=h_V,
                 h_E=h_E,
                 V=V,
@@ -598,12 +627,12 @@ class ElixMPNN(nn.Module):
             else:
                 h_V, h_V_C_skip = context_outputs
 
-        # Add sequence information to the decoder using the selected input contract.
-        if self.use_mpnn_decoder:
-            if self.use_caliby_decoder:
+        # Add sequence information using the selected mixing input contract.
+        if self.use_mixing_encoder:
+            if self.use_caliby_mixing_encoder:
                 h_ES = cat_neighbors_nodes(h_S, h_E, E_idx)
                 h_E = cat_neighbors_nodes(h_V, h_ES, E_idx)
-                for layer in self.decoder_layers:
+                for layer in self.mixing_encoder_layers:
                     h_V, h_E = layer(
                         h_V=h_V,
                         h_E=h_E,
@@ -613,7 +642,9 @@ class ElixMPNN(nn.Module):
                     )
             else:
                 h_V = h_V + h_S
-                for layer_index, layer in enumerate(self.decoder_layers):
+                for layer_index, layer in enumerate(
+                    self.mixing_encoder_layers
+                ):
                     h_V, h_E = layer(h_V = h_V, h_E = h_E,
                                         mask_V = protein_residue_node_mask, E_idx = E_idx,
                                         mask_attend = protein_residue_node_mask_2d, h_V_C_skip=h_V_C_skip)
@@ -628,7 +659,7 @@ class ElixMPNN(nn.Module):
                                 "shared_atom_triangle requires updated "
                                 "protein-context edges"
                             )
-                        h_E = self._apply_shared_atom_triangle_after_decoder_layer(
+                        h_E = self._apply_shared_atom_triangle_after_mixing_layer(
                             layer_index=layer_index,
                             protein_context_pairs=(
                                 h_E_context_for_shared_atom_triangle
@@ -663,7 +694,7 @@ class ElixMPNN(nn.Module):
                             protein_pair_lookup=protein_pair_lookup,
                         )
 
-        if self.use_caliby_decoder:
+        if self.use_caliby_mixing_encoder:
             h_V_potts = h_V
         else:
             h_V_potts = self._expand_potts_nodes(h_V, h_V_C_skip)
@@ -746,7 +777,7 @@ class ElixMPNN(nn.Module):
         if h_V_C_skip is None:
             raise RuntimeError(
                 f"expansion_mode={self.expansion_mode!r} requires context "
-                "features from ContextModule"
+                "features from ContextConditioner"
             )
         return torch.cat([h_V, h_V_C_skip], -1)
 
@@ -774,7 +805,7 @@ class ElixMPNN(nn.Module):
         if h_V_C is None:
             raise RuntimeError(
                 "edge-first Potts expansion requires context features from "
-                "ContextModule"
+                "ContextConditioner"
             )
         h_V_j = gather_nodes(h_V, E_idx)
         h_V_i = h_V.unsqueeze(-2).expand(-1, -1, h_E.size(-2), -1)

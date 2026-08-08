@@ -1,4 +1,4 @@
-"""Encoder, decoder, and ligand-context layers used by ElixMPNN."""
+"""Protein, context-conditioning, and mixing-encoder layers for ElixMPNN."""
 
 import torch
 import torch.nn as nn
@@ -22,7 +22,9 @@ class PositionWiseFeedForward(torch.nn.Module):
         return h
 
 
-class EncLayer(nn.Module):
+class ProteinEncoderLayer(nn.Module):
+    """Update protein nodes and, except at the configured end, protein edges."""
+
     def __init__(
         self,
         num_hidden,
@@ -31,7 +33,7 @@ class EncLayer(nn.Module):
         scale=30,
         is_last_layer=False,
     ):
-        super(EncLayer, self).__init__()
+        super().__init__()
         self.num_hidden = num_hidden
         self.num_in = num_in
         self.scale = scale
@@ -101,7 +103,9 @@ class EncLayer(nn.Module):
         return h_V, h_E
 
 
-class DecLayer(nn.Module):
+class MixingEncoderLayer(nn.Module):
+    """Mix sequence-conditioned protein nodes, edges, and optional context."""
+
     def __init__(
         self,
         num_hidden,
@@ -111,7 +115,7 @@ class DecLayer(nn.Module):
         is_last_layer=False,
         use_context_skip_connection=False,
     ):
-        super(DecLayer, self).__init__()
+        super().__init__()
         self.num_hidden = num_hidden
         self.num_in = num_in
         self.scale = scale
@@ -194,8 +198,8 @@ class DecLayer(nn.Module):
         return h_V, h_E
 
 
-class CalibyDecLayer(nn.Module):
-    """Update H-wide nodes and the persistent 3H Caliby decoder edge state."""
+class CalibyMixingEncoderLayer(nn.Module):
+    """Update H-wide nodes and the persistent 3H Caliby mixing edge state."""
 
     def __init__(self, num_hidden, num_in, dropout=0.1, scale=30):
         super().__init__()
@@ -251,14 +255,16 @@ class CalibyDecLayer(nn.Module):
         return h_V, h_E
 
 
-class Contextfeatureprocessor(nn.Module):
+class ContextEncoderLayer(nn.Module):
+    """Update context nodes and optionally context-context edges."""
+
     def __init__(self, num_hidden, num_in, dropout=0.1, num_heads=None,
-                 scale=30, context_edge_update=False):
-        super(Contextfeatureprocessor, self).__init__()
+                 scale=30, update_edges=False):
+        super().__init__()
         self.num_hidden = num_hidden
         self.num_in = num_in
         self.scale = scale
-        self.context_edge_update = context_edge_update
+        self.update_edges = update_edges
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(self.num_hidden)
@@ -270,7 +276,7 @@ class Contextfeatureprocessor(nn.Module):
         self.W3 = nn.Linear(self.num_hidden, self.num_hidden, bias=True)
 
         # Edge update
-        if self.context_edge_update:
+        if self.update_edges:
             self.W11 = nn.Linear(self.num_in, self.num_hidden, bias=True) # nh * 2 for vi AND vj
             self.W12 = nn.Linear(self.num_hidden, self.num_hidden, bias=True)
             self.W13 = nn.Linear(self.num_hidden, self.num_hidden, bias=True) # num_in is hidden dim of edges h_E
@@ -306,7 +312,7 @@ class Contextfeatureprocessor(nn.Module):
             mask_V = mask_V.unsqueeze(-1)
             h_V = mask_V * h_V
 
-        if self.context_edge_update:
+        if self.update_edges:
             first_hidden = factorized_triplet_linear(
                 self.W11,
                 h_V.unsqueeze(-2),
@@ -326,14 +332,16 @@ class Contextfeatureprocessor(nn.Module):
             return h_V, None
 
 
-class Contextfeatureaggregator(nn.Module): #! (JH) self.context_encoder_layers in ligandMPNN
+class ContextToProteinLayer(nn.Module):
+    """Aggregate context nodes into protein nodes and protein-context edges."""
+
     def __init__(self, num_hidden, num_in, dropout=0.1, num_heads=None,
-                 scale=30, context_edge_update=False):
-        super(Contextfeatureaggregator, self).__init__()
+                 scale=30, update_edges=False):
+        super().__init__()
         self.num_hidden = num_hidden
         self.num_in = num_in
         self.scale = scale
-        self.context_edge_update = context_edge_update
+        self.update_edges = update_edges
 
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
@@ -346,7 +354,7 @@ class Contextfeatureaggregator(nn.Module): #! (JH) self.context_encoder_layers i
         self.W3 = nn.Linear(self.num_hidden, self.num_hidden, bias=True)
 
         # Edge update
-        if self.context_edge_update:
+        if self.update_edges:
             self.W11 = nn.Linear(self.num_in, self.num_hidden, bias=True)
             self.W12 = nn.Linear(self.num_hidden, self.num_hidden, bias=True)
             self.W13 = nn.Linear(self.num_hidden, self.num_hidden, bias=True) # num_in is hidden dim of edges h_E
@@ -384,7 +392,7 @@ class Contextfeatureaggregator(nn.Module): #! (JH) self.context_encoder_layers i
             h_V = mask_V * h_V
 
         # edge updates
-        if self.context_edge_update:
+        if self.update_edges:
             first_hidden = factorized_triplet_linear(
                 self.W11,
                 h_V.unsqueeze(-2),
@@ -404,25 +412,27 @@ class Contextfeatureaggregator(nn.Module): #! (JH) self.context_encoder_layers i
             return h_V, None
 
 
-class ContextModule(nn.Module):
+class ContextConditioner(nn.Module):
+    """Encode the context graph, then condition protein representations."""
+
     def __init__(
         self,
         hidden_dim: int,
         dropout_p: float,
-        num_processor_layers: int,
-        num_aggregator_layers: int,
-        context_pair_update: bool,
-        protein_context_pair_update: bool,
+        num_context_encoder_layers: int,
+        num_context_to_protein_layers: int,
+        update_context_edges: bool,
+        update_protein_context_edges: bool,
         return_context_skip: bool,
-        update_final_processor_edge: bool = True,
-        update_final_aggregator_edge: bool = False,
+        update_final_context_edge: bool = True,
+        update_final_protein_context_edge: bool = False,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.context_pair_update = context_pair_update
-        self.protein_context_pair_update = protein_context_pair_update
-        self.update_final_processor_edge = update_final_processor_edge
-        self.update_final_aggregator_edge = update_final_aggregator_edge
+        self.update_context_edges = update_context_edges
+        self.update_protein_context_edges = update_protein_context_edges
+        self.update_final_context_edge = update_final_context_edge
+        self.update_final_protein_context_edge = update_final_protein_context_edge
         self.return_context_skip = return_context_skip
 
         # Projections
@@ -435,29 +445,29 @@ class ContextModule(nn.Module):
         self.dropout = torch.nn.Dropout(dropout_p)
 
         # Stacks
-        self.context_feature_processor = torch.nn.ModuleList(
-            [Contextfeatureprocessor(self.hidden_dim, 3 * self.hidden_dim,
-                                     dropout=dropout_p,
-                                     context_edge_update=(
-                                         self.context_pair_update
-                                         and (
-                                             self.update_final_processor_edge
-                                             or i < num_processor_layers - 1
-                                         )
-                                     )) for i in range(num_processor_layers)]
+        self.context_encoder_layers = torch.nn.ModuleList(
+            [ContextEncoderLayer(self.hidden_dim, 3 * self.hidden_dim,
+                                 dropout=dropout_p,
+                                 update_edges=(
+                                     self.update_context_edges
+                                     and (
+                                         self.update_final_context_edge
+                                         or i < num_context_encoder_layers - 1
+                                     )
+                                 )) for i in range(num_context_encoder_layers)]
 
         )
 
-        self.context_feature_aggregator = torch.nn.ModuleList(
-            [Contextfeatureaggregator(self.hidden_dim, 3 * self.hidden_dim,
-                                      dropout=dropout_p,
-                                      context_edge_update=(
-                                          self.protein_context_pair_update
-                                          and (
-                                              self.update_final_aggregator_edge
-                                              or i < num_aggregator_layers - 1
-                                          )
-                                      )) for i in range(num_aggregator_layers)]
+        self.context_to_protein_layers = torch.nn.ModuleList(
+            [ContextToProteinLayer(self.hidden_dim, 3 * self.hidden_dim,
+                                   dropout=dropout_p,
+                                   update_edges=(
+                                       self.update_protein_context_edges
+                                       and (
+                                           self.update_final_protein_context_edge
+                                           or i < num_context_to_protein_layers - 1
+                                       )
+                                   )) for i in range(num_context_to_protein_layers)]
         )
 
     def forward(self, h_V = None, h_E = None,
@@ -471,8 +481,8 @@ class ContextModule(nn.Module):
         Y_nodes = self.W_nodes_y(Y_nodes)
         Y_edges = self.W_edges_y(Y_edges)
 
-        for i in range(len(self.context_feature_aggregator)):
-            Y_nodes, updated_Y_edges = self.context_feature_processor[i](
+        for layer in self.context_encoder_layers:
+            Y_nodes, updated_Y_edges = layer(
                 h_V=Y_nodes,
                 h_E=Y_edges,
                 mask_V=Y_m,
@@ -481,7 +491,8 @@ class ContextModule(nn.Module):
             if updated_Y_edges is not None:
                 Y_edges = updated_Y_edges
 
-            h_V_C, updated_h_E_context = self.context_feature_aggregator[i](
+        for layer in self.context_to_protein_layers:
+            h_V_C, updated_h_E_context = layer(
                 h_V=h_V_C,
                 h_E_context=h_E_context,
                 Y_nodes=Y_nodes,

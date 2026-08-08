@@ -8,31 +8,24 @@ task: ${model.task}
 mpnn:
   hidden_dim: 128
   k_neighbors: 32
-  num_encoder_layers: 3
-  num_decoder_layers: 3
-  use_mpnn_decoder: true
-  decoder_input_mode: "legacy_node_add"
-  # Legacy and existing checkpoints skip only the final encoder edge update.
-  update_final_encoder_edge: false
+  num_protein_encoder_layers: 3
+  num_mixing_encoder_layers: 3
+  use_mixing_encoder: true
+  mixing_encoder_input_mode: "node_add"
+  update_final_protein_encoder_edge: false
   dropout_p: 0.1
   ligand_conditioning: true
 
   # ligand conditioning options
   use_context_skip_connection: false
-  lmpnn_module:
-    # ContextModule processor, aggregator, and final residual dropout.
-    # Following the global value preserves legacy behavior unless explicitly overridden.
+  context_conditioner:
     dropout_p: ${denoiser.mpnn.dropout_p}
-    num_context_feature_processor_layers: 2
-    num_context_feature_aggregator_layers: 2
-    # Controls edge update inside ContextModule (ligand context branch).
-    context_edge_update: false
-    # Preserve existing context-edge-update checkpoints by default. New runs may
-    # disable only the final processor edge update because its edge is not consumed.
-    update_final_context_processor_edge: true
-    # The final PC edge was historically terminal. Keep it off unless a
-    # downstream shared-atom triangle consumes the returned PC representation.
-    update_final_context_aggregator_edge: false
+    num_context_encoder_layers: 2
+    num_context_to_protein_layers: 2
+    update_context_edges: false
+    update_protein_context_edges: false
+    update_final_context_edge: true
+    update_final_protein_context_edge: false
   shared_atom_triangle:
     hidden_dim: 128
     edge_chunk_size: 4
