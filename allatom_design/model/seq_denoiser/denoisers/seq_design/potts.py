@@ -21,6 +21,7 @@ Adapted from Chroma by Richard Shuai.
 Modified for Elix by Jinho Kim.
 """
 
+from dataclasses import dataclass
 from typing import Any, Callable, List, Literal, Optional, Tuple, Union
 
 import numpy as np
@@ -33,8 +34,87 @@ from tqdm.auto import tqdm
 from allatom_design.model.seq_denoiser.denoisers.seq_design import \
     graph_utils as graph
 from allatom_design.model.seq_denoiser.denoisers.seq_design.multi_head_potts import (
-    MultiHeadFactorPotts,
+    SharedEdgeBottleneckMultiHeadFactorPotts,
 )
+from allatom_design.model.seq_denoiser.denoisers.seq_design.inference_schedule import (
+    InferenceScheduleTrace,
+    build_inference_schedule_trace,
+)
+from allatom_design.model.seq_denoiser.denoisers.seq_design.potts_proposal_dispatch import (
+    PottsProposalMode,
+    resolve_potts_proposal_mode,
+)
+
+
+PottsMixingScheme = Literal["probability", "energy", "mean_energy", "pcebm"]
+POTTS_MIXING_SCHEMES = frozenset(
+    {"probability", "energy", "mean_energy", "pcebm"}
+)
+SPATIAL_POTTS_MIXING_SCHEMES = frozenset({"probability", "energy"})
+
+
+@dataclass(frozen=True)
+class PottsLocalMixture:
+    """Secondary Potts branch and composition rule for local DLMC mixing."""
+
+    h: torch.Tensor
+    J: torch.Tensor
+    edge_idx: torch.LongTensor
+    mask_i: torch.Tensor
+    alpha: torch.Tensor | None
+    mixing_scheme: PottsMixingScheme
+
+
+@dataclass(frozen=True)
+class PottsObjective:
+    """One additional objective in a multi-objective Potts composition."""
+
+    label: str
+    h: torch.Tensor
+    J: torch.Tensor
+    edge_idx: torch.LongTensor
+    mask_i: torch.Tensor
+
+
+@dataclass(frozen=True)
+class PottsMultiObjectiveMixture:
+    """Additional branches for simplex-constrained multi-objective pcEBM."""
+
+    primary_label: str
+    additional_objectives: tuple[PottsObjective, ...]
+    mixing_scheme: Literal["pcebm_multi"] = "pcebm_multi"
+
+
+@dataclass(frozen=True)
+class PottsMixingDiagnostics:
+    """Per-sequence pcEBM pocket weights accumulated during sampling."""
+
+    lambda_pocket_final: torch.Tensor
+    lambda_pocket_min: torch.Tensor
+    lambda_pocket_max: torch.Tensor
+    lambda_pocket_mean: torch.Tensor
+
+
+@dataclass(frozen=True)
+class PottsMultiObjectiveDiagnostics:
+    """Per-objective pcEBM weights accumulated during sampling."""
+
+    objective_labels: tuple[str, ...]
+    objective_weights_last_proposal: torch.Tensor
+    objective_weights_terminal: torch.Tensor
+    objective_weights_min: torch.Tensor
+    objective_weights_max: torch.Tensor
+    objective_weights_mean: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _PottsProposalResult:
+    """Energy, transition logits, and optional mixing weight for one proposal."""
+
+    energy: torch.Tensor
+    log_probs: torch.Tensor
+    lambda_pocket: torch.Tensor | None = None
+    objective_weights: torch.Tensor | None = None
 
 
 class GraphPotts(nn.Module):
@@ -44,23 +124,15 @@ class GraphPotts(nn.Module):
         dim_nodes (int): Hidden dimension of node tensor.
         dim_edges (int): Hidden dimension of edge tensor.
         num_states (int): Size of the vocabulary.
-        parameterization (str): Parameterization choice in
-            `{'linear', 'factor', 'multi_head_factor', 'factor_scale', 'score',
-            'score_zsum', 'score_scale'}`,
-            or any of those suffixed with `_beta`, which will add in a globally
-            learnable temperature scaling parameter.
+        parameterization (str): Either the single-head `factor` model or the
+            shared-edge gated `multi_head_factor` model.
         symmetric_J (bool): If True enforce symmetry of Potts model i.e.
             `J_ij(s_i, s_j) = J_ji(s_j, s_i)`.
         init_scale (float): Scale factor for the weights and couplings at
             initialization.
         dropout (float): Probability of per-dimension dropout on `[0,1]`.
-        num_factors (int): Number of factors to use for the `factor`
-            parameterization mode.
-        num_heads (int): Number of heads to use for the `multi_head_factor`
-            parameterization mode.
-        reduce (str): Reduction for `multi_head_factor`, in `{'mean', 'sqrt'}`.
-        beta_init (float): Initial temperature scaling factor for parameterizations
-            with the `_beta` suffix.
+        num_heads (int): Number of shared-edge Potts heads.
+        reduce (str): Shared-edge head reduction; currently `mean`.
 
     Inputs:
         node_h (torch.Tensor): Node features with shape
@@ -85,104 +157,109 @@ class GraphPotts(nn.Module):
         dim_nodes: int,
         dim_edges: int,
         num_states: int,
-        parameterization: str = "score",
+        parameterization: str = "factor",
         symmetric_J: bool = True,
         init_scale: float = 0.1,
         dropout: float = 0.0,
-        num_factors: Optional[int] = None,
         num_heads: Optional[int] = None,
         reduce: str = "mean",
-        beta_init: float = 10.0,
-        dim_multi_head: Optional[int] = None,
+        full_multi_head_aggregation: Optional[str] = None,
+        adapter_hidden_dim: Optional[int] = None,
+        shared_edge_dim: Optional[int] = None,
     ):
-        super(GraphPotts, self).__init__()
+        super().__init__()
         self.dim_nodes = dim_nodes
         self.dim_edges = dim_edges
         self.num_states = num_states
-        self.dim_multi_head = dim_multi_head
-
-        # Beta parameterization support temperature learning
-        self.scale_beta = False
-        if parameterization.endswith("_beta"):
-            parameterization = parameterization.split("_beta")[0]
-            self.scale_beta = True
-            self.log_beta = nn.Parameter(np.log(beta_init) * torch.ones(1))
-
         self.init_scale = init_scale
         self.parameterization = parameterization
         self.symmetric_J = symmetric_J
-        if self.parameterization == "linear":
-            self.log_scale = nn.Parameter(np.log(init_scale) * torch.ones(1))
-            self.W_h = nn.Linear(self.dim_nodes, self.num_states, bias=True)
-            self.W_J = nn.Linear(self.dim_edges, self.num_states ** 2, bias=True)
-        elif self.parameterization == "factor":
-            self.log_scale = nn.Parameter(np.log(init_scale) * torch.ones(1))
-            self.W_h = nn.Linear(self.dim_nodes, self.num_states, bias=True)
-            self.W_J_left = nn.Linear(self.dim_edges, self.num_states ** 2, bias=True)
-            self.W_J_right = nn.Linear(self.dim_edges, self.num_states ** 2, bias=True)
+        self.full_multi_head_aggregation = full_multi_head_aggregation
+        self.shared_edge_dim = shared_edge_dim
+
+        if self.parameterization == "factor":
+            if (
+                self.full_multi_head_aggregation is not None
+                or self.shared_edge_dim is not None
+            ):
+                raise ValueError(
+                    "factor Potts does not use multi-head aggregation or "
+                    "shared_edge_dim"
+                )
+            self.log_scale = nn.Parameter(
+                np.log(init_scale) * torch.ones(1)
+            )
+            self.W_h = nn.Linear(
+                self.dim_nodes,
+                self.num_states,
+                bias=True,
+            )
+            self.W_J_left = nn.Linear(
+                self.dim_edges,
+                self.num_states**2,
+                bias=True,
+            )
+            self.W_J_right = nn.Linear(
+                self.dim_edges,
+                self.num_states**2,
+                bias=True,
+            )
         elif self.parameterization == "multi_head_factor":
+            if self.full_multi_head_aggregation != "gate_nonlinear":
+                raise ValueError(
+                    "multi_head_factor requires "
+                    "full_multi_head_aggregation='gate_nonlinear'"
+                )
+            if reduce != "mean":
+                raise ValueError(
+                    "shared-edge multi-head Potts requires reduce='mean'; "
+                    f"got {reduce!r}"
+                )
             if num_heads is None:
-                num_heads = 1
+                raise ValueError(
+                    "shared-edge multi-head Potts requires num_heads"
+                )
+            if adapter_hidden_dim is None:
+                raise ValueError(
+                    "shared-edge multi-head Potts requires adapter_hidden_dim"
+                )
+            if isinstance(shared_edge_dim, bool) or not isinstance(
+                shared_edge_dim,
+                int,
+            ):
+                raise ValueError(
+                    "shared-edge multi-head Potts requires integer "
+                    f"shared_edge_dim; got {shared_edge_dim!r}"
+                )
+
             self.num_heads = int(num_heads)
             self.reduce = reduce
-            self.multi_head_factor = MultiHeadFactorPotts(
-                dim_nodes=self.dim_nodes,
-                dim_edges=self.dim_edges,
-                dim_multi_head=self.dim_multi_head,
-                num_states=self.num_states,
-                num_heads=self.num_heads,
-                reduce=self.reduce,
-                init_scale=init_scale,
-                dropout=dropout,
+            self.full_multi_head_factor = (
+                SharedEdgeBottleneckMultiHeadFactorPotts(
+                    dim_nodes=self.dim_nodes,
+                    dim_edges=self.dim_edges,
+                    shared_edge_dim=shared_edge_dim,
+                    num_states=self.num_states,
+                    num_heads=self.num_heads,
+                    node_adapter_hidden_dim=adapter_hidden_dim,
+                    init_scale=init_scale,
+                    dropout=dropout,
+                )
             )
-        elif self.parameterization == "score":
-            if num_factors is None:
-                num_factors = dim_edges
-            self.num_factors = num_factors
-            self.log_scale = nn.Parameter(np.log(init_scale) * torch.ones(1))
-            self.W_h_bg = nn.Linear(self.dim_nodes, 1)
-            self.W_J_bg = nn.Linear(self.dim_edges, 1)
-            self.W_h = nn.Linear(self.dim_nodes, self.num_states, bias=True)
-            self.W_J_left = nn.Linear(
-                self.dim_edges, self.num_states * num_factors, bias=True
-            )
-            self.W_J_right = nn.Linear(
-                self.dim_edges, self.num_states * num_factors, bias=True
-            )
-        elif self.parameterization == "score_zsum":
-            if num_factors is None:
-                num_factors = dim_edges
-            self.num_factors = num_factors
-            self.log_scale = nn.Parameter(np.log(init_scale) * torch.ones(1))
-            self.W_h = nn.Linear(self.dim_nodes, self.num_states, bias=True)
-            self.W_J_left = nn.Linear(
-                self.dim_edges, self.num_states * num_factors, bias=True
-            )
-            self.W_J_right = nn.Linear(
-                self.dim_edges, self.num_states * num_factors, bias=True
-            )
-        elif self.parameterization == "score_scale":
-            if num_factors is None:
-                num_factors = dim_edges
-            self.num_factors = num_factors
-            self.W_h_bg = nn.Linear(self.dim_nodes, 1)
-            self.W_J_bg = nn.Linear(self.dim_edges, 1)
-            self.W_h_log_scale = nn.Linear(self.dim_nodes, 1)
-            self.W_J_log_scale = nn.Linear(self.dim_edges, 1)
-            self.W_h = nn.Linear(self.dim_nodes, self.num_states)
-            self.W_J_left = nn.Linear(self.dim_edges, self.num_states * num_factors)
-            self.W_J_right = nn.Linear(self.dim_edges, self.num_states * num_factors)
-        elif self.parameterization == "factor_scale":
-            # factor parameterization + per-token/per-edge learnable log-scale (no background).
-            self.W_h_log_scale = nn.Linear(self.dim_nodes, 1)
-            self.W_J_log_scale = nn.Linear(self.dim_edges, 1)
-            self.W_h = nn.Linear(self.dim_nodes, self.num_states, bias=True)
-            self.W_J_left = nn.Linear(self.dim_edges, self.num_states ** 2, bias=True)
-            self.W_J_right = nn.Linear(self.dim_edges, self.num_states ** 2, bias=True)
         else:
-            print(f"Unknown potts parameterization: {parameterization}")
-            raise NotImplementedError
+            raise ValueError(
+                "Unsupported Potts parameterization: "
+                f"{self.parameterization!r}. Expected 'factor' or "
+                "'multi_head_factor'."
+            )
         self.dropout = nn.Dropout(dropout)
+
+    def reset_full_multi_head_special_initialization(self) -> None:
+        if (
+            self.parameterization == "multi_head_factor"
+            and self.full_multi_head_factor is not None
+        ):
+            self.full_multi_head_factor.reset_special_initialization()
 
 
     def forward(
@@ -192,20 +269,20 @@ class GraphPotts(nn.Module):
         edge_idx: torch.LongTensor,
         mask_i: torch.Tensor,
         mask_ij: torch.Tensor,
+        return_multi_head_stats: bool = False,
     ):
         #! (JH) 260131Note
         # edge_idx: E_idx between only protein tokens in protein chains,
         # mask_i: protein_residue_node_mask, mask_ij: protein_residue_edge_mask_2d
-        mask_J = _mask_J(edge_idx, mask_i, mask_ij)
+        mask_J = build_coupling_mask(
+            edge_idx,
+            mask_i,
+            mask_ij,
+            require_reciprocal=False,
+        )
+        multi_head_stats = None
 
-        if self.parameterization == "linear":
-            # Compute site params (h) from node embeddings
-            # Compute coupling params (J) from edge embeddings
-            scale = torch.exp(self.log_scale)
-            h = scale * mask_i.unsqueeze(-1) * self.W_h(node_h)
-            J = scale * mask_J.unsqueeze(-1) * self.W_J(edge_h)
-            J = J.view(list(edge_h.size())[:3] + ([self.num_states] * 2))
-        elif self.parameterization == "factor":
+        if self.parameterization == "factor":
             scale = torch.exp(self.log_scale)
             h = scale * mask_i.unsqueeze(-1) * self.W_h(node_h)
             mask_J = scale * mask_J.unsqueeze(-1)
@@ -214,7 +291,6 @@ class GraphPotts(nn.Module):
             J_right = (mask_J * self.W_J_right(edge_h)).view(shape_J)
             J = torch.matmul(J_left, J_right)
             J = self.dropout(J)
-            # Zero-sum gauge
             h = h - h.mean(-1, keepdim=True)
             J = (
                 J
@@ -222,144 +298,24 @@ class GraphPotts(nn.Module):
                 - J.mean(-2, keepdim=True)
                 + J.mean(dim=[-1, -2], keepdim=True)
             )
-        elif self.parameterization == "multi_head_factor":
-            h, J = self.multi_head_factor(node_h, edge_h, mask_i, mask_J)
-        elif self.parameterization == "score":
-            node_h = self.dropout(node_h)
-            edge_h = self.dropout(edge_h)
-
-            scale = torch.exp(self.log_scale)
-            mask_h = scale * mask_i.unsqueeze(-1)
-            mask_J = scale * mask_J.unsqueeze(-1)
-            h = mask_h * self.W_h(node_h)
-
-            shape_J_prefix = list(edge_h.size())[:3]
-            J_left = (mask_J * self.W_J_left(edge_h)).view(
-                shape_J_prefix + [self.num_states, self.num_factors]
+        else:
+            output = self.full_multi_head_factor(
+                node_h,
+                edge_h,
+                mask_i,
+                mask_J,
+                return_stats=return_multi_head_stats,
             )
-            J_right = (mask_J * self.W_J_right(edge_h)).view(
-                shape_J_prefix + [self.num_factors, self.num_states]
-            )
-            J = torch.matmul(J_left, J_right)
-
-            # Zero-sum gauge
-            h = h - h.mean(-1, keepdim=True)
-            J = (
-                J
-                - J.mean(-1, keepdim=True)
-                - J.mean(-2, keepdim=True)
-                + J.mean(dim=[-1, -2], keepdim=True)
-            )
-
-            # Background components
-            h = h + mask_h * self.W_h_bg(node_h)
-            J = J + (mask_J * self.W_J_bg(edge_h)).unsqueeze(-1)
-        elif self.parameterization == "score_zsum":
-            node_h = self.dropout(node_h)
-            edge_h = self.dropout(edge_h)
-
-            scale = torch.exp(self.log_scale)
-            mask_h_scale = scale * mask_i.unsqueeze(-1)
-            mask_J_scale = scale * mask_J.unsqueeze(-1)
-            h = mask_h_scale * self.W_h(node_h)
-
-            shape_J_prefix = list(edge_h.size())[:3]
-            J_left = (mask_J_scale * self.W_J_left(edge_h)).view(
-                shape_J_prefix + [self.num_states, self.num_factors]
-            )
-            J_right = (mask_J_scale * self.W_J_right(edge_h)).view(
-                shape_J_prefix + [self.num_factors, self.num_states]
-            )
-            J = torch.matmul(J_left, J_right)
-            J = self.dropout(J)
-
-            # Zero-sum gauge
-            J = (
-                J
-                - J.mean(-1, keepdim=True)
-                - J.mean(-2, keepdim=True)
-                + J.mean(dim=[-1, -2], keepdim=True)
-            )
-
-            # Subtract off J background average
-            mask_J = mask_J.view(list(mask_J.size()) + [1, 1])
-            J_i_avg = J.sum(dim=[1, 2], keepdim=True) / mask_J.sum([1, 2], keepdim=True)
-            J = mask_J * (J - J_i_avg)
-        elif self.parameterization == "score_scale":
-            node_h = self.dropout(node_h)
-            edge_h = self.dropout(edge_h)
-
-            mask_h = mask_i.unsqueeze(-1)
-            mask_J = mask_J.unsqueeze(-1)
-            h = mask_h * self.W_h(node_h)
-
-            shape_J_prefix = list(edge_h.size())[:3]
-            J_left = (mask_J * self.W_J_left(edge_h)).view(
-                shape_J_prefix + [self.num_states, self.num_factors]
-            )
-            J_right = (mask_J * self.W_J_right(edge_h)).view(
-                shape_J_prefix + [self.num_factors, self.num_states]
-            )
-            J = torch.matmul(J_left, J_right)
-
-            # Zero-sum gauge
-            h = h - h.mean(-1, keepdim=True)
-            J = (
-                J
-                - J.mean(-1, keepdim=True)
-                - J.mean(-2, keepdim=True)
-                + J.mean(dim=[-1, -2], keepdim=True)
-            )
-
-            # Background components
-            log_scale = np.log(self.init_scale)
-            h_scale = torch.exp(self.W_h_log_scale(node_h) + log_scale)
-            J_scale = torch.exp(self.W_J_log_scale(edge_h) + 2 * log_scale).unsqueeze(
-                -1
-            )
-            h_bg = mask_h * self.W_h_bg(node_h)
-            J_bg = (mask_J * self.W_J_bg(edge_h)).unsqueeze(-1)
-            h = h_scale * (h + h_bg)
-            J = J_scale * (J + J_bg)
-        elif self.parameterization == "factor_scale":
-            # factor-style bilinear J and unary h with per-token/per-edge
-            # learnable log-scale (no background). The 2x offset on the J
-            # log-scale preserves the scale^1 vs scale^2 asymmetry of the
-            # plain `factor` mode at initialization.
-            mask_h_raw = mask_i.unsqueeze(-1)
-            mask_J_raw = mask_J.unsqueeze(-1)
-            h = mask_h_raw * self.W_h(node_h)
-            shape_J = list(edge_h.size())[:3] + ([self.num_states] * 2)
-            J_left = (mask_J_raw * self.W_J_left(edge_h)).view(shape_J)
-            J_right = (mask_J_raw * self.W_J_right(edge_h)).view(shape_J)
-            J = torch.matmul(J_left, J_right)
-            J = self.dropout(J)
-
-            # Zero-sum gauge (matches factor)
-            h = h - h.mean(-1, keepdim=True)
-            J = (
-                J
-                - J.mean(-1, keepdim=True)
-                - J.mean(-2, keepdim=True)
-                + J.mean(dim=[-1, -2], keepdim=True)
-            )
-
-            # Per-token / per-edge learnable log-scale with init_scale offset.
-            log_scale_offset = np.log(self.init_scale)
-            h_scale = torch.exp(self.W_h_log_scale(node_h) + log_scale_offset)
-            J_scale = torch.exp(
-                self.W_J_log_scale(edge_h) + 2 * log_scale_offset
-            ).unsqueeze(-1)
-            h = h_scale * h
-            J = J_scale * J
+            if return_multi_head_stats:
+                h, J, multi_head_stats = output
+            else:
+                h, J = output
 
         if self.symmetric_J:
             J = self._symmetrize_J(J, edge_idx, mask_ij)
 
-        if self.scale_beta:
-            beta = torch.exp(self.log_beta)
-            h = beta * h
-            J = beta * J
+        if return_multi_head_stats:
+            return h, J, multi_head_stats
         return h, J
 
     def _symmetrize_J_serial(self, J, edge_idx, mask_ij):
@@ -488,7 +444,20 @@ class GraphPotts(nn.Module):
         edge_idx_uncond: Optional[torch.LongTensor] = None,
         gamma: float = 1.0,
         gamma_schedule_cfg: Optional[dict] = None,
-    ) -> tuple[torch.LongTensor, torch.Tensor]:
+        local_mixture: Optional[
+            Union[PottsLocalMixture, PottsMultiObjectiveMixture]
+        ] = None,
+        temperature_schedule_cfg: Optional[dict] = None,
+        temperature_schedule_override: Optional[torch.Tensor] = None,
+        return_temperature_schedule: bool = False,
+        return_mixing_diagnostics: bool = False,
+        dlmc_dt: float = 0.1,
+    ) -> Union[
+        tuple[torch.LongTensor, torch.Tensor],
+        tuple[torch.LongTensor, torch.Tensor, InferenceScheduleTrace],
+        tuple[torch.LongTensor, torch.Tensor, PottsMixingDiagnostics],
+        tuple[torch.LongTensor, torch.Tensor, PottsMultiObjectiveDiagnostics],
+    ]:
         """Sample from Potts model with Chromatic Gibbs sampling.
 
         Args:
@@ -525,6 +494,8 @@ class GraphPotts(nn.Module):
                 proposals are `dlmc` for Discrete Langevin Monte Carlo [1] or `chromatic`
                 for Gibbs sampling with graph coloring.
                 [1] Sun et al. Discrete Langevin Sampler via Wasserstein Gradient Flow (2023).
+            dlmc_dt (float): Step size used by DLMC transition probabilities. Ignored
+                when ``proposal="chromatic"``.
             verbose (bool): If True print verbose output during sampling.
             edge_idx_coloring (torch.LongerTensor, optional): Alternative
                 graph dependency structure that can be provided for the
@@ -550,9 +521,16 @@ class GraphPotts(nn.Module):
         B, N, _ = h.shape
 
         if symmetry_order is not None:
-            if h_uncond is not None:
+            schedule_enabled = bool(temperature_schedule_cfg) and bool(
+                temperature_schedule_cfg.get("enabled", True)
+            )
+            if schedule_enabled or temperature_schedule_override is not None:
                 raise NotImplementedError(
-                    "symmetry_order and classifier-free guidance cannot be combined."
+                    "inference temperature schedules do not support symmetry folding"
+                )
+            if h_uncond is not None or local_mixture is not None:
+                raise NotImplementedError(
+                    "symmetry_order cannot be combined with a second Potts branch."
                 )
             h, J, edge_idx, mask_i, mask_ij = fold_symmetry(
                 symmetry_order, h, J, edge_idx, mask_i, mask_ij
@@ -561,7 +539,7 @@ class GraphPotts(nn.Module):
             if mask_sample is not None:
                 mask_sample = mask_sample[:, : (N // symmetry_order)]
 
-        S_sample, U_sample = sample_potts(
+        sample_output = sample_potts(
             h,
             J,
             edge_idx,
@@ -576,6 +554,7 @@ class GraphPotts(nn.Module):
             differentiable_penalty=differentiable_penalty,
             rejection_step=rejection_step,
             proposal=proposal,
+            dlmc_dt=dlmc_dt,
             verbose=verbose,
             edge_idx_coloring=edge_idx_coloring,
             mask_ij_coloring=mask_ij_coloring,
@@ -584,13 +563,28 @@ class GraphPotts(nn.Module):
             edge_idx_uncond=edge_idx_uncond,
             gamma=gamma,
             gamma_schedule_cfg=gamma_schedule_cfg,
+            local_mixture=local_mixture,
+            temperature_schedule_cfg=temperature_schedule_cfg,
+            temperature_schedule_override=temperature_schedule_override,
+            return_temperature_schedule=return_temperature_schedule,
+            return_mixing_diagnostics=return_mixing_diagnostics,
         )
+        if return_temperature_schedule:
+            S_sample, U_sample, temperature_schedule_trace = sample_output
+        elif return_mixing_diagnostics:
+            S_sample, U_sample, mixing_diagnostics = sample_output
+        else:
+            S_sample, U_sample = sample_output
 
         if symmetry_order is not None:
             assert N % symmetry_order == 0
             S_sample = (
                 S_sample[:, None, :].expand([-1, symmetry_order, -1]).reshape([B, N])
             )
+        if return_temperature_schedule:
+            return S_sample, U_sample, temperature_schedule_trace
+        if return_mixing_diagnostics:
+            return S_sample, U_sample, mixing_diagnostics
         return S_sample, U_sample
 
 
@@ -834,8 +828,19 @@ def sample_potts(
     edge_idx_uncond: Optional[torch.LongTensor] = None,
     gamma: float = 1.0,
     gamma_schedule_cfg: Optional[dict] = None,
+    local_mixture: Optional[
+        Union[PottsLocalMixture, PottsMultiObjectiveMixture]
+    ] = None,
+    temperature_schedule_cfg: Optional[dict] = None,
+    temperature_schedule_override: Optional[torch.Tensor] = None,
+    return_temperature_schedule: bool = False,
+    return_mixing_diagnostics: bool = False,
+    dlmc_dt: float = 0.1,
 ) -> Union[
     tuple[torch.LongTensor, torch.Tensor],
+    tuple[torch.LongTensor, torch.Tensor, InferenceScheduleTrace],
+    tuple[torch.LongTensor, torch.Tensor, PottsMixingDiagnostics],
+    tuple[torch.LongTensor, torch.Tensor, PottsMultiObjectiveDiagnostics],
     tuple[torch.LongTensor, torch.Tensor, list[torch.LongTensor], list[torch.Tensor]],
 ]:
     """Sample from Potts model with Chromatic Gibbs sampling.
@@ -876,6 +881,8 @@ def sample_potts(
                 proposals are `dlmc` for Discrete Langevin Monte Carlo [1] or `chromatic`
                 for Gibbs sampling with graph coloring.
                 [1] Sun et al. Discrete Langevin Sampler via Wasserstein Gradient Flow (2023).
+        dlmc_dt (float): Step size used by DLMC transition probabilities. Ignored
+            when ``proposal="chromatic"``.
         verbose (bool): If True print verbose output during sampling.
         return_trajectory (bool): If True, also output the sampling trajectories
             of `S` and `U`.
@@ -901,18 +908,86 @@ def sample_potts(
     """
     # Initialize masked proposals and mask h
     mask_S, mask_mutatable, S = init_sampling_masks(-h, mask_sample, S) # mask_mutatable is mask_S_1D
+    legal_state_mask = (
+        (mask_S > 0)
+        & (mask_mutatable[..., None] > 0)
+        & (mask_i[..., None] > 0)
+    )
     h_numerical_zero = h.max() + 1e3 * max(1.0, temperature) # Prohibit sampling tokens where mask_S > 0
     h = torch.where(mask_S > 0, h, h_numerical_zero * torch.ones_like(h))
 
     # Classifier-free-style guidance: if an uncond branch is provided, we
     # sample from a mix of the cond and uncond DLMC proposals at every sweep.
     use_guidance = h_uncond is not None
-    if use_guidance:
-        if proposal != "dlmc":
-            raise NotImplementedError(
-                "Potts guidance is only supported with the DLMC proposal; got "
-                f"proposal={proposal!r}."
+    use_local_mixture = local_mixture is not None
+    proposal_mode = resolve_potts_proposal_mode(
+        proposal,
+        has_guidance=use_guidance,
+        has_local_mixture=use_local_mixture,
+        rejection_step=rejection_step,
+    )
+    if return_mixing_diagnostics:
+        if local_mixture is None or local_mixture.mixing_scheme not in {
+            "pcebm",
+            "pcebm_multi",
+        }:
+            raise ValueError(
+                "return_mixing_diagnostics requires mixing_scheme='pcebm' "
+                "or 'pcebm_multi'"
             )
+        if return_temperature_schedule or return_trajectory:
+            raise NotImplementedError(
+                "pcEBM mixing diagnostics cannot be combined with temperature "
+                "schedule traces or state trajectories"
+            )
+    if use_local_mixture:
+        if isinstance(local_mixture, PottsMultiObjectiveMixture):
+            local_mixture = _validate_multi_objective_mixture(
+                local_mixture,
+                h,
+                mask_i,
+            )
+            masked_objectives = []
+            for objective in local_mixture.additional_objectives:
+                h_objective_numerical_zero = objective.h.max() + 1e3 * max(
+                    1.0, temperature
+                )
+                masked_objectives.append(
+                    PottsObjective(
+                        label=objective.label,
+                        h=torch.where(
+                            mask_S > 0,
+                            objective.h,
+                            h_objective_numerical_zero
+                            * torch.ones_like(objective.h),
+                        ),
+                        J=objective.J,
+                        edge_idx=objective.edge_idx,
+                        mask_i=objective.mask_i,
+                    )
+                )
+            local_mixture = PottsMultiObjectiveMixture(
+                primary_label=local_mixture.primary_label,
+                additional_objectives=tuple(masked_objectives),
+            )
+        else:
+            local_mixture = _validate_local_mixture(local_mixture, h, mask_i)
+            h_secondary_numerical_zero = local_mixture.h.max() + 1e3 * max(
+                1.0, temperature
+            )
+            local_mixture = PottsLocalMixture(
+                h=torch.where(
+                    mask_S > 0,
+                    local_mixture.h,
+                    h_secondary_numerical_zero * torch.ones_like(local_mixture.h),
+                ),
+                J=local_mixture.J,
+                edge_idx=local_mixture.edge_idx,
+                mask_i=local_mixture.mask_i,
+                alpha=local_mixture.alpha,
+                mixing_scheme=local_mixture.mixing_scheme,
+            )
+    if use_guidance:
         assert J_uncond is not None and edge_idx_uncond is not None, (
             "h_uncond was provided but J_uncond / edge_idx_uncond are missing."
         )
@@ -930,7 +1005,7 @@ def sample_potts(
         )
 
     # Block update schedule
-    if proposal == "chromatic":
+    if proposal_mode is PottsProposalMode.CHROMATIC:
         if edge_idx_coloring is None:
             edge_idx_coloring = edge_idx
         if mask_ij_coloring is None:
@@ -941,14 +1016,158 @@ def sample_potts(
     else:
         num_iterations = num_sweeps
 
-    num_iterations_annealing = int(annealing_fraction * num_iterations)
-    temperatures = np.linspace(
-        temperature_init, temperature, num_iterations_annealing
-    ).tolist() + [temperature] * (num_iterations - num_iterations_annealing)
+    temperature_schedule_trace = None
+    schedule_enabled = bool(temperature_schedule_cfg) and bool(
+        temperature_schedule_cfg.get("enabled", True)
+    )
+    if temperature_schedule_override is not None and not schedule_enabled:
+        raise ValueError(
+            "temperature_schedule_override requires an enabled temperature schedule"
+        )
+    if schedule_enabled:
+        use_mean_energy_mixture_schedule = (
+            proposal_mode is PottsProposalMode.LOCAL_MIXTURE_DLMC
+            and local_mixture is not None
+            and local_mixture.mixing_scheme == "mean_energy"
+        )
+        if (
+            proposal_mode is not PottsProposalMode.DLMC
+            and not use_mean_energy_mixture_schedule
+        ):
+            raise NotImplementedError(
+                "inference temperature schedules currently require proposal='dlmc' "
+                "without guidance; local transition mixing is supported only for "
+                "mixing_scheme='mean_energy'"
+            )
+        if rejection_step:
+            raise NotImplementedError(
+                "per-observation inference temperature schedules do not support "
+                "a rejection step"
+            )
+        if temperature_schedule_override is None:
+            if use_mean_energy_mixture_schedule:
+                assert local_mixture is not None
+                _, frozen_local_energy = _compute_mean_energy_local_energy(
+                    S,
+                    h,
+                    J,
+                    edge_idx,
+                    local_mixture,
+                    penalty_func=penalty_func,
+                    differentiable_penalty=differentiable_penalty,
+                )
+            else:
+                _, frozen_local_energy = _compute_dlmc_local_energy(
+                    S,
+                    h,
+                    J,
+                    edge_idx,
+                    penalty_func=penalty_func,
+                    differentiable_penalty=differentiable_penalty,
+                )
+            scheduled_site_mask = (mask_mutatable > 0) & (mask_i > 0)
+            temperature_schedule_trace = build_inference_schedule_trace(
+                str(temperature_schedule_cfg["name"]),
+                local_energy=frozen_local_energy.detach(),
+                legal_state_mask=mask_S > 0,
+                site_mask=scheduled_site_mask,
+                start_temperature=float(temperature_init),
+                end_temperature=float(temperature),
+                total_steps=int(num_iterations),
+                end_hold_steps=int(
+                    temperature_schedule_cfg.get("end_hold_steps", 50)
+                ),
+                variance_floor=float(
+                    temperature_schedule_cfg.get("variance_floor", 1e-12)
+                ),
+                bisection_iterations=int(
+                    temperature_schedule_cfg.get("bisection_iterations", 48)
+                ),
+            )
+            temperatures = temperature_schedule_trace.temperatures
+        else:
+            temperatures = torch.as_tensor(
+                temperature_schedule_override,
+                device=h.device,
+                dtype=torch.float32,
+            )
+            expected_shape = (num_iterations, h.shape[0])
+            if temperatures.shape != expected_shape:
+                raise ValueError(
+                    "temperature_schedule_override must have shape "
+                    f"{expected_shape}, got {tuple(temperatures.shape)}"
+                )
+            if not bool(torch.isfinite(temperatures).all()) or bool(
+                (temperatures <= 0).any()
+            ):
+                raise ValueError(
+                    "temperature_schedule_override must be positive and finite"
+                )
+    else:
+        if return_temperature_schedule:
+            raise ValueError(
+                "return_temperature_schedule requires an enabled temperature schedule"
+            )
+        num_iterations_annealing = int(annealing_fraction * num_iterations)
+        temperatures = np.linspace(
+            temperature_init, temperature, num_iterations_annealing
+        ).tolist() + [temperature] * (num_iterations - num_iterations_annealing)
 
-    if use_guidance:
+    proposal_lambda_pocket: list[torch.Tensor] = []
+    proposal_objective_weights: list[torch.Tensor] = []
+    if proposal_mode is PottsProposalMode.LOCAL_MIXTURE_DLMC:
+        assert local_mixture is not None
+
+        if isinstance(local_mixture, PottsMultiObjectiveMixture):
+
+            def _energy_proposal(_S, _T, _gamma=None):
+                U_local, logp_local, objective_weights = (
+                    _potts_proposal_dlmc_multiobjective(
+                        _S,
+                        h,
+                        J,
+                        edge_idx,
+                        local_mixture,
+                        legal_state_mask=legal_state_mask,
+                        T=_T,
+                        penalty_func=penalty_func,
+                        differentiable_penalty=differentiable_penalty,
+                        dt=dlmc_dt,
+                    )
+                )
+                return _PottsProposalResult(
+                    energy=U_local,
+                    log_probs=logp_local,
+                    objective_weights=objective_weights,
+                )
+
+        else:
+
+            def _energy_proposal(_S, _T, _gamma=None):
+                U_local, logp_local, lambda_pocket = (
+                    _potts_proposal_dlmc_local_mixture(
+                        _S,
+                        h,
+                        J,
+                        edge_idx,
+                        local_mixture,
+                        legal_state_mask=legal_state_mask,
+                        T=_T,
+                        penalty_func=penalty_func,
+                        differentiable_penalty=differentiable_penalty,
+                        dt=dlmc_dt,
+                    )
+                )
+                return _PottsProposalResult(
+                    energy=U_local,
+                    log_probs=logp_local,
+                    lambda_pocket=lambda_pocket,
+                )
+
+    elif proposal_mode is PottsProposalMode.GUIDED_DLMC:
+
         def _energy_proposal(_S, _T, _gamma):
-            return _potts_proposal_dlmc_guidance_energy(
+            U_local, logp_local = _potts_proposal_dlmc_guidance_energy(
                 _S,
                 h,
                 J,
@@ -960,10 +1179,14 @@ def sample_potts(
                 T=_T,
                 penalty_func=penalty_func,
                 differentiable_penalty=differentiable_penalty,
+                dt=dlmc_dt,
             )
-    elif proposal == "chromatic":
+            return _PottsProposalResult(energy=U_local, log_probs=logp_local)
+
+    elif proposal_mode is PottsProposalMode.CHROMATIC:
+
         def _energy_proposal(_S, _T, _gamma=None):
-            return _potts_proposal_gibbs(
+            U_local, logp_local = _potts_proposal_gibbs(
                 _S,
                 h,
                 J,
@@ -972,9 +1195,12 @@ def sample_potts(
                 penalty_func=penalty_func,
                 differentiable_penalty=differentiable_penalty,
             )
-    elif proposal == "dlmc":
+            return _PottsProposalResult(energy=U_local, log_probs=logp_local)
+
+    elif proposal_mode is PottsProposalMode.DLMC:
+
         def _energy_proposal(_S, _T, _gamma=None):
-            return _potts_proposal_dlmc(
+            U_local, logp_local = _potts_proposal_dlmc(
                 _S,
                 h,
                 J,
@@ -982,7 +1208,9 @@ def sample_potts(
                 T=_T,
                 penalty_func=penalty_func,
                 differentiable_penalty=differentiable_penalty,
+                dt=dlmc_dt,
             )
+            return _PottsProposalResult(energy=U_local, log_probs=logp_local)
     else:
         raise NotImplementedError
 
@@ -1003,9 +1231,13 @@ def sample_potts(
         S_trajectory = []
         U_trajectory = []
     for i, T_i in enumerate(tqdm(temperatures, desc="Potts Sampling", leave=False)):
+        if isinstance(T_i, torch.Tensor):
+            T_proposal = T_i[:, None, None]
+        else:
+            T_proposal = T_i
         g_i = gammas_per_step[i]
         # Cycle through Gibbs updates random sites to the update with fixed prob
-        if proposal == "chromatic":
+        if proposal_mode is PottsProposalMode.CHROMATIC:
             mask_update = schedule.eq(i % num_colors)
         else:
             mask_update = torch.ones_like(S) > 0
@@ -1013,7 +1245,20 @@ def sample_potts(
             mask_update = mask_update * (mask_mutatable > 0)
 
         # Compute current energy and local conditionals
-        U, logp = _energy_proposal(S, T_i, g_i)
+        proposal_result = _energy_proposal(S, T_proposal, g_i)
+        U = proposal_result.energy
+        logp = proposal_result.log_probs
+        if return_mixing_diagnostics:
+            if isinstance(local_mixture, PottsMultiObjectiveMixture):
+                assert proposal_result.objective_weights is not None
+                proposal_objective_weights.append(
+                    proposal_result.objective_weights.detach()
+                )
+            else:
+                assert proposal_result.lambda_pocket is not None
+                proposal_lambda_pocket.append(
+                    proposal_result.lambda_pocket.detach()
+                )
 
         # Propose
         S_new = torch.distributions.categorical.Categorical(logits=logp).sample()
@@ -1029,7 +1274,9 @@ def sample_potts(
                 flux = -_U / T_i + _logp_ij
                 return flux
 
-            U_new, logp_new = _energy_proposal(S_new, T_i, g_i)
+            new_proposal_result = _energy_proposal(S_new, T_proposal, g_i)
+            U_new = new_proposal_result.energy
+            logp_new = new_proposal_result.log_probs
 
             _flux_backward = _flux(U_new, logp_new, S)
             _flux_forward = _flux(U, logp, S_new)
@@ -1051,19 +1298,87 @@ def sample_potts(
             S_trajectory.append(S)
             U_trajectory.append(U)
 
-        if use_guidance:
-            # Keep the reported U consistent with the mixed distribution
-            # we are actually sampling from (penalty-free; raw physical Potts
-            # energies on both branches, mixed with the terminal γ).
-            g_final = gammas_per_step[-1] if gammas_per_step else float(gamma)
-            U_cond_final, _ = compute_potts_energy(S, h, J, edge_idx)
-            U_uncond_final, _ = compute_potts_energy(S, h_uncond, J_uncond, edge_idx_uncond)
-            U = g_final * U_cond_final + (1.0 - g_final) * U_uncond_final
+    terminal_objective_weights = None
+    if proposal_mode is PottsProposalMode.LOCAL_MIXTURE_DLMC:
+        assert local_mixture is not None
+        if isinstance(local_mixture, PottsMultiObjectiveMixture):
+            U, terminal_objective_weights = _potts_multiobjective_total_energy(
+                S,
+                h,
+                J,
+                edge_idx,
+                local_mixture,
+                legal_state_mask=legal_state_mask,
+                penalty_func=penalty_func,
+                differentiable_penalty=differentiable_penalty,
+            )
         else:
-            U, _ = compute_potts_energy(S, h, J, edge_idx)
+            U = _potts_local_mixture_total_energy(
+                S,
+                h,
+                J,
+                edge_idx,
+                local_mixture,
+                legal_state_mask=legal_state_mask,
+                penalty_func=penalty_func,
+                differentiable_penalty=differentiable_penalty,
+            )
+    elif proposal_mode is PottsProposalMode.GUIDED_DLMC:
+        # Keep the reported U consistent with the mixed distribution
+        # we are actually sampling from (penalty-free; raw physical Potts
+        # energies on both branches, mixed with the terminal γ).
+        g_final = gammas_per_step[-1] if gammas_per_step else float(gamma)
+        U_cond_final, _ = compute_potts_energy(S, h, J, edge_idx)
+        U_uncond_final, _ = compute_potts_energy(
+            S, h_uncond, J_uncond, edge_idx_uncond
+        )
+        U = g_final * U_cond_final + (1.0 - g_final) * U_uncond_final
+    else:
+        U, _ = compute_potts_energy(S, h, J, edge_idx)
 
     if verbose:
         print(f"Effective number of sweeps: {cumulative_sweeps}")
+    if return_temperature_schedule:
+        if return_trajectory:
+            raise NotImplementedError(
+                "temperature schedule traces cannot be combined with state trajectories"
+            )
+        assert temperature_schedule_trace is not None
+        return S, U, temperature_schedule_trace
+    if return_mixing_diagnostics:
+        if isinstance(local_mixture, PottsMultiObjectiveMixture):
+            if not proposal_objective_weights:
+                raise RuntimeError(
+                    "multi-objective pcEBM sampling produced no mixing weights"
+                )
+            assert terminal_objective_weights is not None
+            weight_trace = torch.stack(proposal_objective_weights, dim=0)
+            objective_labels = (
+                local_mixture.primary_label,
+                *(
+                    objective.label
+                    for objective in local_mixture.additional_objectives
+                ),
+            )
+            mixing_diagnostics = PottsMultiObjectiveDiagnostics(
+                objective_labels=objective_labels,
+                objective_weights_last_proposal=weight_trace[-1],
+                objective_weights_terminal=terminal_objective_weights,
+                objective_weights_min=weight_trace.min(dim=0).values,
+                objective_weights_max=weight_trace.max(dim=0).values,
+                objective_weights_mean=weight_trace.mean(dim=0),
+            )
+            return S, U, mixing_diagnostics
+        if not proposal_lambda_pocket:
+            raise RuntimeError("pcEBM sampling produced no mixing weights")
+        lambda_trace = torch.stack(proposal_lambda_pocket, dim=0)
+        mixing_diagnostics = PottsMixingDiagnostics(
+            lambda_pocket_final=lambda_trace[-1],
+            lambda_pocket_min=lambda_trace.min(dim=0).values,
+            lambda_pocket_max=lambda_trace.max(dim=0).values,
+            lambda_pocket_mean=lambda_trace.mean(dim=0),
+        )
+        return S, U, mixing_diagnostics
     if return_trajectory:
         return S, U, S_trajectory, U_trajectory
     else:
@@ -1189,22 +1504,17 @@ def _potts_proposal_gibbs(
     return U, logp_i
 
 
-def _potts_proposal_dlmc(
+def _compute_dlmc_local_energy(
     S,
     h,
     J,
     edge_idx,
-    T=1.0,
     penalty_func=None,
     differentiable_penalty=True,
-    dt=0.1,
-    autoscale=True,
-    balancing_func="sigmoid",
 ):
-    # Compute energy gap
+    """Compute the exact local energies consumed by the DLMC conditional."""
+
     U, U_i = compute_potts_energy(S, h, J, edge_idx)
-    # print(U)
-    U_i = U_i
     if penalty_func is not None:
         O = F.one_hot(S, h.shape[0 - 1]).float()
         if differentiable_penalty:
@@ -1224,12 +1534,67 @@ def _potts_proposal_dlmc(
         else:
             U_penalty = penalty_func(O)
         U = U + U_penalty
+    return U, U_i
+
+
+def _potts_proposal_dlmc(
+    S,
+    h,
+    J,
+    edge_idx,
+    T=1.0,
+    penalty_func=None,
+    differentiable_penalty=True,
+    dt=0.1,
+    autoscale=True,
+    balancing_func="sigmoid",
+):
+    U, U_i = _compute_dlmc_local_energy(
+        S,
+        h,
+        J,
+        edge_idx,
+        penalty_func=penalty_func,
+        differentiable_penalty=differentiable_penalty,
+    )
 
     # Compute local equilibrium distribution
     logP_j = F.log_softmax(-U_i / T, dim=-1)
 
-    # Compute transition log probabilities
-    O = F.one_hot(S, h.shape[0 - 1]).float()
+    return U, _dlmc_transition_log_probs(
+        S,
+        logP_j,
+        dt=dt,
+        balancing_func=balancing_func,
+    )
+
+
+def _dlmc_transition_log_probs(
+    S: torch.LongTensor,
+    logP_j: torch.Tensor,
+    *,
+    dt: float | torch.Tensor = 0.1,
+    balancing_func: str = "sigmoid",
+) -> torch.Tensor:
+    """Convert local equilibrium log-probabilities into DLMC transitions."""
+    if S.shape != logP_j.shape[:-1]:
+        raise ValueError("S and logP_j batch/token axes must match")
+    if isinstance(dt, torch.Tensor):
+        if dt.shape == S.shape:
+            dt = dt.unsqueeze(-1)
+        elif dt.shape != (*S.shape, 1):
+            raise ValueError(
+                "tensor dt must have shape [B,N] or [B,N,1], got "
+                f"{tuple(dt.shape)}"
+            )
+        dt = dt.to(device=logP_j.device, dtype=logP_j.dtype)
+        if not bool(torch.isfinite(dt).all()) or bool((dt < 0.0).any()):
+            raise ValueError("dt must be finite and nonnegative")
+    else:
+        dt = float(dt)
+        if not np.isfinite(dt) or dt < 0.0:
+            raise ValueError("dt must be finite and nonnegative")
+    O = F.one_hot(S, logP_j.shape[-1]).float()
     logP_i = torch.gather(logP_j, -1, S[..., None])
     # log probability of the current state
     if balancing_func == "sqrt":
@@ -1250,8 +1615,838 @@ def _potts_proposal_dlmc(
     # print(f" ->Flux is {flux.item():0.2f}, FlipProb is {p_flip.mean():0.2f}")
 
     logP_ii = (1.0 - p_flip).clamp(1e-5).log()
-    logP_ij = (1.0 - O) * logP_ij + O * logP_ii
-    return U, logP_ij
+    logP_ij = torch.where(O.bool(), logP_ii, logP_ij)
+    return logP_ij
+
+
+def _validate_local_mixture(
+    mixture: PottsLocalMixture,
+    primary_h: torch.Tensor,
+    primary_mask_i: torch.Tensor,
+) -> PottsLocalMixture:
+    if mixture.mixing_scheme not in POTTS_MIXING_SCHEMES:
+        raise ValueError(
+            f"mixing_scheme must be one of {sorted(POTTS_MIXING_SCHEMES)}, got "
+            f"{mixture.mixing_scheme!r}"
+        )
+    if mixture.h.shape != primary_h.shape:
+        raise ValueError(
+            "Pocket/scaffold h shape mismatch: "
+            f"{tuple(primary_h.shape)} vs {tuple(mixture.h.shape)}"
+        )
+    batch_size, num_nodes, num_states = primary_h.shape
+    if mixture.J.ndim != 5:
+        raise ValueError(
+            "Scaffold J must have shape [B,N,K,C,C], got "
+            f"{tuple(mixture.J.shape)}"
+        )
+    if (
+        mixture.J.shape[:2] != (batch_size, num_nodes)
+        or mixture.J.shape[-2:] != (num_states, num_states)
+    ):
+        raise ValueError(
+            "Pocket/scaffold J graph or alphabet mismatch: "
+            f"h={tuple(primary_h.shape)}, scaffold_J={tuple(mixture.J.shape)}"
+        )
+    if mixture.edge_idx.shape != mixture.J.shape[:3]:
+        raise ValueError(
+            "Scaffold edge_idx must match J's [B,N,K] axes: "
+            f"edge_idx={tuple(mixture.edge_idx.shape)}, J={tuple(mixture.J.shape)}"
+        )
+    if mixture.mask_i.shape != primary_mask_i.shape:
+        raise ValueError(
+            "Pocket/scaffold mask_i shape mismatch: "
+            f"{tuple(primary_mask_i.shape)} vs {tuple(mixture.mask_i.shape)}"
+        )
+    if not torch.equal(mixture.mask_i.bool(), primary_mask_i.bool()):
+        raise ValueError("Pocket/scaffold protein residue masks do not match")
+    alpha = mixture.alpha
+    if mixture.mixing_scheme in SPATIAL_POTTS_MIXING_SCHEMES:
+        if alpha is None:
+            raise ValueError(
+                f"alpha is required for {mixture.mixing_scheme!r} mixing"
+            )
+        if alpha.ndim == primary_h.ndim - 1:
+            alpha = alpha.unsqueeze(-1)
+        if alpha.shape != primary_h.shape[:-1] + (1,):
+            raise ValueError(
+                "alpha must have shape [B,N] or [B,N,1] matching h; got "
+                f"alpha={tuple(mixture.alpha.shape)}, h={tuple(primary_h.shape)}"
+            )
+        if not bool(torch.isfinite(alpha).all()):
+            raise ValueError("alpha contains non-finite values")
+        if bool(((alpha < 0.0) | (alpha > 1.0)).any()):
+            raise ValueError("alpha values must be within [0, 1]")
+    elif alpha is not None:
+        raise ValueError(
+            f"alpha must be omitted for {mixture.mixing_scheme!r} mixing"
+        )
+    return PottsLocalMixture(
+        h=mixture.h,
+        J=mixture.J,
+        edge_idx=mixture.edge_idx,
+        mask_i=mixture.mask_i,
+        alpha=alpha,
+        mixing_scheme=mixture.mixing_scheme,
+    )
+
+
+def _validate_multi_objective_mixture(
+    mixture: PottsMultiObjectiveMixture,
+    primary_h: torch.Tensor,
+    primary_mask_i: torch.Tensor,
+) -> PottsMultiObjectiveMixture:
+    if mixture.mixing_scheme != "pcebm_multi":
+        raise ValueError(
+            "multi-objective Potts mixing requires mixing_scheme='pcebm_multi'"
+        )
+    if not mixture.primary_label:
+        raise ValueError("multi-objective pcEBM primary label must be non-empty")
+    if not mixture.additional_objectives:
+        raise ValueError(
+            "multi-objective pcEBM requires at least one additional objective"
+        )
+
+    labels = [
+        mixture.primary_label,
+        *(objective.label for objective in mixture.additional_objectives),
+    ]
+    if any(not label for label in labels):
+        raise ValueError("multi-objective pcEBM labels must be non-empty")
+    if len(set(labels)) != len(labels):
+        raise ValueError(f"multi-objective pcEBM labels must be unique: {labels}")
+
+    batch_size, num_nodes, num_states = primary_h.shape
+    for objective in mixture.additional_objectives:
+        if objective.h.shape != primary_h.shape:
+            raise ValueError(
+                f"Objective {objective.label!r} h shape mismatch: "
+                f"{tuple(objective.h.shape)} != {tuple(primary_h.shape)}"
+            )
+        if objective.J.ndim != 5 or (
+            objective.J.shape[:2] != (batch_size, num_nodes)
+            or objective.J.shape[-2:] != (num_states, num_states)
+        ):
+            raise ValueError(
+                f"Objective {objective.label!r} J must have compatible "
+                f"[B,N,K,C,C] axes, got {tuple(objective.J.shape)}"
+            )
+        if objective.edge_idx.shape != objective.J.shape[:3]:
+            raise ValueError(
+                f"Objective {objective.label!r} edge_idx must match J's "
+                f"[B,N,K] axes: edge_idx={tuple(objective.edge_idx.shape)}, "
+                f"J={tuple(objective.J.shape)}"
+            )
+        if objective.mask_i.shape != primary_mask_i.shape or not torch.equal(
+            objective.mask_i.bool(),
+            primary_mask_i.bool(),
+        ):
+            raise ValueError(
+                f"Objective {objective.label!r} protein residue mask does not "
+                "match the primary objective"
+            )
+        if not bool(torch.isfinite(objective.h).all()) or not bool(
+            torch.isfinite(objective.J).all()
+        ):
+            raise ValueError(
+                f"Objective {objective.label!r} Potts parameters must be finite"
+            )
+    return mixture
+
+
+def _dlmc_penalty_terms(
+    S: torch.LongTensor,
+    *,
+    num_states: int,
+    penalty_func: Optional[Callable],
+    differentiable_penalty: bool,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    if penalty_func is None:
+        return None, None
+    O = F.one_hot(S, num_states).float()
+    if not differentiable_penalty:
+        return penalty_func(O), None
+    with torch.enable_grad():
+        O.requires_grad = True
+        U_penalty = penalty_func(O)
+        adjustment = torch.autograd.grad(U_penalty.sum(), [O])[0].detach()
+        U_penalty = U_penalty.detach()
+    adjustment = adjustment - torch.gather(adjustment, -1, S[..., None])
+    return U_penalty, adjustment
+
+
+def _dlmc_penalty_energy(
+    S: torch.LongTensor,
+    *,
+    num_states: int,
+    penalty_func: Optional[Callable],
+    differentiable_penalty: bool,
+) -> torch.Tensor | None:
+    """Evaluate only the terminal penalty energy, without its local gradient."""
+
+    if penalty_func is None:
+        return None
+    O = F.one_hot(S, num_states).float()
+    if not differentiable_penalty:
+        return penalty_func(O)
+    with torch.enable_grad():
+        O.requires_grad = True
+        return penalty_func(O).detach()
+
+
+def _mix_local_log_probabilities(
+    pocket_U_i: torch.Tensor,
+    scaffold_U_i: torch.Tensor,
+    alpha: torch.Tensor,
+    *,
+    mixing_scheme: str,
+    temperature: float,
+    energy_adjustment: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return local equilibrium log-p_i for probability or energy mixing."""
+    if mixing_scheme == "energy":
+        mixed_U_i = alpha * pocket_U_i + (1.0 - alpha) * scaffold_U_i
+        if energy_adjustment is not None:
+            mixed_U_i = mixed_U_i + energy_adjustment
+        return F.log_softmax(-mixed_U_i / temperature, dim=-1)
+    if mixing_scheme != "probability":
+        raise ValueError(f"Unknown local Potts mixing scheme: {mixing_scheme!r}")
+    if energy_adjustment is not None:
+        pocket_U_i = pocket_U_i + energy_adjustment
+        scaffold_U_i = scaffold_U_i + energy_adjustment
+    pocket_logp = F.log_softmax(-pocket_U_i / temperature, dim=-1)
+    scaffold_logp = F.log_softmax(-scaffold_U_i / temperature, dim=-1)
+    neg_inf = torch.full_like(alpha, -torch.inf)
+    log_alpha = torch.where(alpha > 0.0, alpha.log(), neg_inf)
+    one_minus_alpha = 1.0 - alpha
+    log_one_minus_alpha = torch.where(
+        one_minus_alpha > 0.0,
+        one_minus_alpha.log(),
+        neg_inf,
+    )
+    return torch.logaddexp(
+        log_alpha + pocket_logp,
+        log_one_minus_alpha + scaffold_logp,
+    )
+
+
+def _simplex_centered_local_energy_gradient(
+    local_energy: torch.Tensor,
+    legal_state_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Project local one-hot gradients onto each legal categorical simplex."""
+    if legal_state_mask.shape != local_energy.shape:
+        raise ValueError("legal state mask must match the local energy field")
+    legal_state_mask = legal_state_mask.bool()
+    legal_count = legal_state_mask.sum(dim=-1, keepdim=True)
+    safe_count = legal_count.clamp_min(1).to(dtype=local_energy.dtype)
+    legal_sum = torch.where(
+        legal_state_mask,
+        local_energy,
+        torch.zeros((), dtype=local_energy.dtype, device=local_energy.device),
+    ).sum(dim=-1, keepdim=True)
+    legal_mean = legal_sum / safe_count
+    return torch.where(
+        legal_state_mask,
+        local_energy - legal_mean,
+        torch.zeros((), dtype=local_energy.dtype, device=local_energy.device),
+    )
+
+
+def _pcebm_pocket_weight(
+    pocket_gradient: torch.Tensor,
+    scaffold_gradient: torch.Tensor,
+    active_state_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Solve the two-objective minimum-norm pcEBM weight per batch item."""
+    if pocket_gradient.shape != scaffold_gradient.shape:
+        raise ValueError("pcEBM pocket/scaffold gradients must have equal shapes")
+    if active_state_mask.shape != pocket_gradient.shape:
+        raise ValueError("pcEBM active state mask must match the gradient fields")
+    active_state_mask = active_state_mask.bool()
+    legal_pocket = pocket_gradient.masked_select(active_state_mask)
+    legal_scaffold = scaffold_gradient.masked_select(active_state_mask)
+    if not bool(torch.isfinite(legal_pocket).all()) or not bool(
+        torch.isfinite(legal_scaffold).all()
+    ):
+        raise ValueError("pcEBM active centered gradients must be finite")
+
+    work_dtype = torch.promote_types(
+        torch.promote_types(pocket_gradient.dtype, scaffold_gradient.dtype),
+        torch.float32,
+    )
+    pocket = torch.where(
+        active_state_mask,
+        pocket_gradient.to(work_dtype),
+        torch.zeros((), dtype=work_dtype, device=pocket_gradient.device),
+    )
+    scaffold = torch.where(
+        active_state_mask,
+        scaffold_gradient.to(work_dtype),
+        torch.zeros((), dtype=work_dtype, device=scaffold_gradient.device),
+    )
+    difference = pocket - scaffold
+    reduce_dims = tuple(range(1, difference.ndim))
+    denominator = difference.square().sum(dim=reduce_dims)
+    numerator = -(scaffold * difference).sum(dim=reduce_dims)
+
+    degenerate = denominator == 0.0
+    safe_denominator = torch.where(
+        degenerate,
+        torch.ones_like(denominator),
+        denominator,
+    )
+    lambda_pocket = numerator / safe_denominator
+    lambda_pocket = lambda_pocket.clamp(0.0, 1.0)
+    lambda_pocket = torch.where(
+        degenerate,
+        torch.full_like(lambda_pocket, 0.5),
+        lambda_pocket,
+    )
+    return lambda_pocket.to(dtype=pocket_gradient.dtype)
+
+
+def _pcebm_multiobjective_weights(
+    centered_gradients: torch.Tensor,
+    active_state_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Solve the minimum-norm convex combination of two or more gradients.
+
+    The objective count is intentionally small for Potts branch mixing.  We
+    enumerate every non-empty simplex face, solve its equality-constrained
+    quadratic problem in one batched pseudoinverse, and select the feasible
+    minimum.  Enumerating larger faces first gives deterministic maximum-support
+    tie breaking for degenerate objectives.
+    """
+
+    if centered_gradients.ndim < 3:
+        raise ValueError(
+            "multi-objective pcEBM gradients must have shape [B,K,...]"
+        )
+    batch_size, num_objectives = centered_gradients.shape[:2]
+    if num_objectives < 2:
+        raise ValueError("multi-objective pcEBM requires at least two objectives")
+    if active_state_mask.shape != (
+        batch_size,
+        *centered_gradients.shape[2:],
+    ):
+        raise ValueError(
+            "multi-objective pcEBM active state mask must match each gradient"
+        )
+
+    active_state_mask = active_state_mask.bool()
+    expanded_mask = active_state_mask[:, None].expand_as(centered_gradients)
+    legal_gradients = centered_gradients.masked_select(expanded_mask)
+    if not bool(torch.isfinite(legal_gradients).all()):
+        raise ValueError(
+            "multi-objective pcEBM active centered gradients must be finite"
+        )
+
+    work_dtype = torch.float64
+    gradients = torch.where(
+        expanded_mask,
+        centered_gradients.to(work_dtype),
+        torch.zeros(
+            (),
+            dtype=work_dtype,
+            device=centered_gradients.device,
+        ),
+    ).reshape(batch_size, num_objectives, -1)
+    gram = torch.einsum("bkd,bld->bkl", gradients, gradients)
+
+    face_members = [
+        tuple(bool(bits & (1 << objective)) for objective in range(num_objectives))
+        for cardinality in range(num_objectives, 0, -1)
+        for bits in range(1, 1 << num_objectives)
+        if bits.bit_count() == cardinality
+    ]
+    faces = torch.tensor(
+        face_members,
+        dtype=torch.bool,
+        device=centered_gradients.device,
+    )
+    face_values = faces.to(work_dtype)
+    face_outer = face_values[:, :, None] * face_values[:, None, :]
+    num_faces = faces.shape[0]
+
+    systems = torch.zeros(
+        batch_size,
+        num_faces,
+        num_objectives + 1,
+        num_objectives + 1,
+        dtype=work_dtype,
+        device=centered_gradients.device,
+    )
+    systems[..., :num_objectives, :num_objectives] = (
+        gram[:, None] * face_outer[None]
+        + torch.diag_embed((~faces).to(work_dtype))[None]
+    )
+    systems[..., :num_objectives, num_objectives] = face_values[None]
+    systems[..., num_objectives, :num_objectives] = face_values[None]
+    rhs = torch.zeros(
+        batch_size,
+        num_faces,
+        num_objectives + 1,
+        1,
+        dtype=work_dtype,
+        device=centered_gradients.device,
+    )
+    rhs[..., num_objectives, 0] = 1.0
+
+    solutions = torch.linalg.pinv(systems, hermitian=True) @ rhs
+    candidates = solutions[..., :num_objectives, 0]
+    feasibility_tolerance = 1.0e-7
+    valid = (
+        torch.isfinite(candidates).all(dim=-1)
+        & (candidates >= -feasibility_tolerance).all(dim=-1)
+        & (
+            (candidates.sum(dim=-1) - 1.0).abs()
+            <= feasibility_tolerance
+        )
+    )
+    candidates = candidates.clamp_min(0.0)
+    candidates = candidates / candidates.sum(dim=-1, keepdim=True).clamp_min(
+        torch.finfo(work_dtype).tiny
+    )
+    objectives = torch.einsum(
+        "bfk,bkl,bfl->bf",
+        candidates,
+        gram,
+        candidates,
+    )
+    objectives = torch.where(
+        valid,
+        objectives,
+        torch.full_like(objectives, torch.inf),
+    )
+    if bool(torch.isinf(objectives).all(dim=1).any()):
+        raise RuntimeError(
+            "multi-objective pcEBM failed to find a feasible simplex weight"
+        )
+
+    minimum = objectives.min(dim=1, keepdim=True).values
+    scale = gram.abs().amax(dim=(1, 2), keepdim=False).clamp_min(1.0)
+    tie_tolerance = (
+        1024.0 * torch.finfo(work_dtype).eps * scale[:, None]
+    )
+    tied_minima = objectives <= minimum + tie_tolerance
+    best_face = tied_minima.to(torch.int64).argmax(dim=1)
+    weights = candidates[
+        torch.arange(batch_size, device=centered_gradients.device),
+        best_face,
+    ]
+    return weights.to(dtype=centered_gradients.dtype)
+
+
+def _combine_multiobjective_local_energies(
+    local_energies: torch.Tensor,
+    *,
+    legal_state_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Combine raw local fields using multi-objective pcEBM weights."""
+
+    if local_energies.ndim != 4:
+        raise ValueError(
+            "multi-objective local energies must have shape [B,K,N,C]"
+        )
+    centered_gradients = torch.stack(
+        [
+            _simplex_centered_local_energy_gradient(
+                local_energies[:, objective_index],
+                legal_state_mask,
+            )
+            for objective_index in range(local_energies.shape[1])
+        ],
+        dim=1,
+    )
+    weights = _pcebm_multiobjective_weights(
+        centered_gradients,
+        legal_state_mask,
+    )
+    mixed_local_energy = torch.einsum(
+        "bk,bknc->bnc",
+        weights,
+        local_energies,
+    )
+    return mixed_local_energy, weights
+
+
+def _combine_global_local_energies(
+    pocket_U_i: torch.Tensor,
+    scaffold_U_i: torch.Tensor,
+    *,
+    mixing_scheme: str,
+    legal_state_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Combine raw local energies, using centered gradients only for pcEBM weights."""
+
+    lambda_pocket = None
+    if mixing_scheme == "mean_energy":
+        mixed_U_i = 0.5 * (pocket_U_i + scaffold_U_i)
+    elif mixing_scheme == "pcebm":
+        pocket_gradient = _simplex_centered_local_energy_gradient(
+            pocket_U_i,
+            legal_state_mask,
+        )
+        scaffold_gradient = _simplex_centered_local_energy_gradient(
+            scaffold_U_i,
+            legal_state_mask,
+        )
+        lambda_pocket = _pcebm_pocket_weight(
+            pocket_gradient,
+            scaffold_gradient,
+            legal_state_mask,
+        )
+        pocket_weight = lambda_pocket[:, None, None]
+        mixed_U_i = (
+            pocket_weight * pocket_U_i
+            + (1.0 - pocket_weight) * scaffold_U_i
+        )
+    else:
+        raise ValueError(f"Unknown global Potts mixing scheme: {mixing_scheme!r}")
+    return mixed_U_i, lambda_pocket
+
+
+def _mix_global_local_energies(
+    pocket_U_i: torch.Tensor,
+    scaffold_U_i: torch.Tensor,
+    *,
+    mixing_scheme: str,
+    legal_state_mask: torch.Tensor,
+    temperature: float | torch.Tensor,
+    energy_adjustment: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Build one equilibrium distribution from mean-energy or pcEBM local energy."""
+
+    mixed_U_i, lambda_pocket = _combine_global_local_energies(
+        pocket_U_i,
+        scaffold_U_i,
+        mixing_scheme=mixing_scheme,
+        legal_state_mask=legal_state_mask,
+    )
+    if energy_adjustment is not None:
+        mixed_U_i = mixed_U_i + energy_adjustment
+    return F.log_softmax(-mixed_U_i / temperature, dim=-1), lambda_pocket
+
+
+def _compute_mean_energy_local_energy(
+    S: torch.LongTensor,
+    pocket_h: torch.Tensor,
+    pocket_J: torch.Tensor,
+    pocket_edge_idx: torch.LongTensor,
+    mixture: PottsLocalMixture,
+    *,
+    penalty_func: Optional[Callable] = None,
+    differentiable_penalty: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the scalar and local fields of the fixed 0.5/0.5 composition."""
+
+    if mixture.mixing_scheme != "mean_energy":
+        raise ValueError(
+            "mean-energy local fields require mixing_scheme='mean_energy', got "
+            f"{mixture.mixing_scheme!r}"
+        )
+    pocket_U, pocket_U_i = compute_potts_energy(
+        S, pocket_h, pocket_J, pocket_edge_idx
+    )
+    scaffold_U, scaffold_U_i = compute_potts_energy(
+        S, mixture.h, mixture.J, mixture.edge_idx
+    )
+    U_penalty, energy_adjustment = _dlmc_penalty_terms(
+        S,
+        num_states=pocket_h.shape[-1],
+        penalty_func=penalty_func,
+        differentiable_penalty=differentiable_penalty,
+    )
+    mixed_U_i = 0.5 * (pocket_U_i + scaffold_U_i)
+    if energy_adjustment is not None:
+        mixed_U_i = mixed_U_i + energy_adjustment
+    U = 0.5 * (pocket_U + scaffold_U)
+    if U_penalty is not None:
+        U = U + U_penalty
+    return U, mixed_U_i
+
+
+def _local_mixture_total_energy_from_branches(
+    S: torch.LongTensor,
+    pocket_U: torch.Tensor,
+    pocket_U_i: torch.Tensor,
+    scaffold_U: torch.Tensor,
+    scaffold_U_i: torch.Tensor,
+    mixture: PottsLocalMixture,
+    lambda_pocket: torch.Tensor | None,
+) -> torch.Tensor:
+    """Combine already-computed branch energies using the proposal semantics."""
+
+    if mixture.mixing_scheme in SPATIAL_POTTS_MIXING_SCHEMES:
+        assert mixture.alpha is not None
+        pocket_current = torch.gather(pocket_U_i, -1, S[..., None])[..., 0]
+        scaffold_current = torch.gather(scaffold_U_i, -1, S[..., None])[..., 0]
+        alpha_per_residue = mixture.alpha[..., 0]
+        # Spatial probability/energy mixing does not generally define a global
+        # potential, so preserve its existing per-residue diagnostic.
+        return (
+            alpha_per_residue * pocket_current
+            + (1.0 - alpha_per_residue) * scaffold_current
+        ).sum(dim=-1)
+    if mixture.mixing_scheme == "mean_energy":
+        return 0.5 * (pocket_U + scaffold_U)
+    if mixture.mixing_scheme == "pcebm":
+        assert lambda_pocket is not None
+        return lambda_pocket * pocket_U + (1.0 - lambda_pocket) * scaffold_U
+    raise ValueError(f"Unknown Potts mixing scheme: {mixture.mixing_scheme!r}")
+
+
+def _potts_local_mixture_total_energy(
+    S: torch.LongTensor,
+    pocket_h: torch.Tensor,
+    pocket_J: torch.Tensor,
+    pocket_edge_idx: torch.LongTensor,
+    mixture: PottsLocalMixture,
+    *,
+    legal_state_mask: torch.Tensor,
+    penalty_func: Optional[Callable] = None,
+    differentiable_penalty: bool = True,
+) -> torch.Tensor:
+    """Evaluate terminal mixed energy without constructing another transition."""
+
+    pocket_U, pocket_U_i = compute_potts_energy(
+        S, pocket_h, pocket_J, pocket_edge_idx
+    )
+    scaffold_U, scaffold_U_i = compute_potts_energy(
+        S, mixture.h, mixture.J, mixture.edge_idx
+    )
+    lambda_pocket = None
+    if mixture.mixing_scheme == "pcebm":
+        _, lambda_pocket = _combine_global_local_energies(
+            pocket_U_i,
+            scaffold_U_i,
+            mixing_scheme="pcebm",
+            legal_state_mask=legal_state_mask,
+        )
+    U = _local_mixture_total_energy_from_branches(
+        S,
+        pocket_U,
+        pocket_U_i,
+        scaffold_U,
+        scaffold_U_i,
+        mixture,
+        lambda_pocket,
+    )
+    U_penalty = _dlmc_penalty_energy(
+        S,
+        num_states=pocket_h.shape[-1],
+        penalty_func=penalty_func,
+        differentiable_penalty=differentiable_penalty,
+    )
+    if U_penalty is not None:
+        U = U + U_penalty
+    return U
+
+
+def _compute_multiobjective_branch_energies(
+    S: torch.LongTensor,
+    primary_h: torch.Tensor,
+    primary_J: torch.Tensor,
+    primary_edge_idx: torch.LongTensor,
+    mixture: PottsMultiObjectiveMixture,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    branch_outputs = [
+        compute_potts_energy(S, primary_h, primary_J, primary_edge_idx),
+        *(
+            compute_potts_energy(
+                S,
+                objective.h,
+                objective.J,
+                objective.edge_idx,
+            )
+            for objective in mixture.additional_objectives
+        ),
+    ]
+    scalar_energies = torch.stack(
+        [branch_energy for branch_energy, _ in branch_outputs],
+        dim=1,
+    )
+    local_energies = torch.stack(
+        [local_energy for _, local_energy in branch_outputs],
+        dim=1,
+    )
+    return scalar_energies, local_energies
+
+
+def _potts_multiobjective_total_energy(
+    S: torch.LongTensor,
+    primary_h: torch.Tensor,
+    primary_J: torch.Tensor,
+    primary_edge_idx: torch.LongTensor,
+    mixture: PottsMultiObjectiveMixture,
+    *,
+    legal_state_mask: torch.Tensor,
+    penalty_func: Optional[Callable] = None,
+    differentiable_penalty: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Evaluate terminal multi-objective energy and terminal simplex weights."""
+
+    scalar_energies, local_energies = _compute_multiobjective_branch_energies(
+        S,
+        primary_h,
+        primary_J,
+        primary_edge_idx,
+        mixture,
+    )
+    _, weights = _combine_multiobjective_local_energies(
+        local_energies,
+        legal_state_mask=legal_state_mask,
+    )
+    U = (weights * scalar_energies).sum(dim=1)
+    U_penalty = _dlmc_penalty_energy(
+        S,
+        num_states=primary_h.shape[-1],
+        penalty_func=penalty_func,
+        differentiable_penalty=differentiable_penalty,
+    )
+    if U_penalty is not None:
+        U = U + U_penalty
+    return U, weights
+
+
+def _potts_proposal_dlmc_multiobjective(
+    S: torch.LongTensor,
+    primary_h: torch.Tensor,
+    primary_J: torch.Tensor,
+    primary_edge_idx: torch.LongTensor,
+    mixture: PottsMultiObjectiveMixture,
+    *,
+    legal_state_mask: torch.Tensor,
+    T: float = 1.0,
+    penalty_func: Optional[Callable] = None,
+    differentiable_penalty: bool = True,
+    dt: float = 0.1,
+    balancing_func: str = "sigmoid",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    scalar_energies, local_energies = _compute_multiobjective_branch_energies(
+        S,
+        primary_h,
+        primary_J,
+        primary_edge_idx,
+        mixture,
+    )
+    U_penalty, energy_adjustment = _dlmc_penalty_terms(
+        S,
+        num_states=primary_h.shape[-1],
+        penalty_func=penalty_func,
+        differentiable_penalty=differentiable_penalty,
+    )
+    mixed_local_energy, weights = _combine_multiobjective_local_energies(
+        local_energies,
+        legal_state_mask=legal_state_mask,
+    )
+    if energy_adjustment is not None:
+        mixed_local_energy = mixed_local_energy + energy_adjustment
+    U = (weights * scalar_energies).sum(dim=1)
+    if U_penalty is not None:
+        U = U + U_penalty
+    logP_j = F.log_softmax(-mixed_local_energy / T, dim=-1)
+    return (
+        U,
+        _dlmc_transition_log_probs(
+            S,
+            logP_j,
+            dt=dt,
+            balancing_func=balancing_func,
+        ),
+        weights,
+    )
+
+
+def _potts_proposal_dlmc_local_mixture(
+    S: torch.LongTensor,
+    pocket_h: torch.Tensor,
+    pocket_J: torch.Tensor,
+    pocket_edge_idx: torch.LongTensor,
+    mixture: PottsLocalMixture,
+    *,
+    legal_state_mask: torch.Tensor,
+    T: float = 1.0,
+    penalty_func: Optional[Callable] = None,
+    differentiable_penalty: bool = True,
+    dt: float = 0.1,
+    balancing_func: str = "sigmoid",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    if mixture.mixing_scheme == "mean_energy":
+        U, mixed_U_i = _compute_mean_energy_local_energy(
+            S,
+            pocket_h,
+            pocket_J,
+            pocket_edge_idx,
+            mixture,
+            penalty_func=penalty_func,
+            differentiable_penalty=differentiable_penalty,
+        )
+        return (
+            U,
+            _dlmc_transition_log_probs(
+                S,
+                F.log_softmax(-mixed_U_i / T, dim=-1),
+                dt=dt,
+                balancing_func=balancing_func,
+            ),
+            None,
+        )
+
+    pocket_U, pocket_U_i = compute_potts_energy(
+        S, pocket_h, pocket_J, pocket_edge_idx
+    )
+    scaffold_U, scaffold_U_i = compute_potts_energy(
+        S, mixture.h, mixture.J, mixture.edge_idx
+    )
+    U_penalty, energy_adjustment = _dlmc_penalty_terms(
+        S,
+        num_states=pocket_h.shape[-1],
+        penalty_func=penalty_func,
+        differentiable_penalty=differentiable_penalty,
+    )
+    lambda_pocket = None
+    if mixture.mixing_scheme in SPATIAL_POTTS_MIXING_SCHEMES:
+        assert mixture.alpha is not None
+        logP_j = _mix_local_log_probabilities(
+            pocket_U_i,
+            scaffold_U_i,
+            mixture.alpha,
+            mixing_scheme=mixture.mixing_scheme,
+            temperature=T,
+            energy_adjustment=energy_adjustment,
+        )
+    else:
+        logP_j, lambda_pocket = _mix_global_local_energies(
+            pocket_U_i,
+            scaffold_U_i,
+            mixing_scheme=mixture.mixing_scheme,
+            legal_state_mask=legal_state_mask,
+            temperature=T,
+            energy_adjustment=energy_adjustment,
+        )
+    U = _local_mixture_total_energy_from_branches(
+        S,
+        pocket_U,
+        pocket_U_i,
+        scaffold_U,
+        scaffold_U_i,
+        mixture,
+        lambda_pocket,
+    )
+    if U_penalty is not None:
+        U = U + U_penalty
+    return (
+        U,
+        _dlmc_transition_log_probs(
+            S,
+            logP_j,
+            dt=dt,
+            balancing_func=balancing_func,
+        ),
+        lambda_pocket,
+    )
 
 
 def _potts_proposal_dlmc_guidance_energy(
@@ -1333,6 +2528,20 @@ def _mask_J(edge_idx, mask_i, mask_ij):
     if mask_ij is not None:
         mask_J = mask_ij * mask_J
     return mask_J
+
+
+def build_coupling_mask(
+    edge_idx: torch.LongTensor,
+    mask_i: torch.Tensor,
+    mask_ij: torch.Tensor | None,
+    *,
+    require_reciprocal: bool,
+) -> torch.Tensor:
+    """Return the support of couplings that can be nonzero in the Potts graph."""
+    coupling_mask = _mask_J(edge_idx, mask_i, mask_ij)
+    if require_reciprocal:
+        _, coupling_mask = graph.transpose_edge_idx(edge_idx, coupling_mask)
+    return coupling_mask
 
 
 def pseudolikelihood(

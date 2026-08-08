@@ -1,10 +1,8 @@
 """Lightning DataModule, collator and worker init for the SD dataset."""
 
-import random
-
 import lightning as L
-import numpy as np
 import torch
+from lightning.fabric.utilities.seed import pl_worker_init_function
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 
@@ -22,8 +20,18 @@ class AtomworksSDDataModule(L.LightningDataModule):
         self._train_set = AtomworksSDDataset(cfg, phase="train")
         self._val_set = AtomworksSDDataset(cfg, phase="val")
 
+    def setup(self, stage: str | None = None) -> None:
+        num_workers = self.cfg.get("num_workers", 0)
+        world_size = self.trainer.world_size if self.trainer is not None else 1
+        if world_size > 1 and num_workers == 0:
+            raise ValueError(
+                "DDP training requires data.num_workers > 0 so each rank receives "
+                "an independent, rank-aware training sample stream."
+            )
+
     def train_dataloader(self) -> DataLoader:
         num_workers = self.cfg.get("num_workers", 0)
+        prefetch_factor = self.cfg.get("prefetch_factor", 4)
         train_loader = DataLoader(
             dataset=self._train_set,
             batch_size=self.cfg.batch_size,
@@ -33,24 +41,23 @@ class AtomworksSDDataModule(L.LightningDataModule):
             drop_last=True,
             collate_fn=sd_collator,
             persistent_workers=num_workers > 0,
-            prefetch_factor=4 if num_workers > 0 else None,
-            worker_init_fn=worker_init_fn,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
         )
         return train_loader
 
     def val_dataloader(self) -> DataLoader:
         num_workers = self.cfg.get("num_workers", 0)
+        prefetch_factor = self.cfg.get("prefetch_factor", 4)
         val_loader = DataLoader(
             dataset=self._val_set,
-            batch_size=self.cfg.batch_size,
+            batch_size=self.cfg.get("val_batch_size", 1),
             num_workers=num_workers,
             shuffle=False,
             pin_memory=True,
             drop_last=False,
             collate_fn=sd_collator,
             persistent_workers=num_workers > 0,
-            prefetch_factor=4 if num_workers > 0 else None,
-            worker_init_fn=worker_init_fn,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
         )
         return val_loader
 
@@ -70,7 +77,6 @@ def sd_collator(data: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
     return collated
 
 
-def worker_init_fn(_):
-    worker_seed = torch.initial_seed() % 2**32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
+def worker_init_fn(worker_id: int) -> None:
+    """Initialize a worker using Lightning's rank-aware seeding policy."""
+    pl_worker_init_function(worker_id)

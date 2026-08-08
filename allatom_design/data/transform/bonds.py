@@ -377,6 +377,7 @@ def get_ligand_bond_order_features(atom_array: AtomArray) -> np.ndarray:
         bond_order[atom_i, atom_j] = encoded_type
         bond_order[atom_j, atom_i] = encoded_type
 
+    np.fill_diagonal(bond_order, LIGAND_NO_BOND)
     return bond_order
 
 

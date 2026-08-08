@@ -123,6 +123,57 @@ class AF3SequenceEncoding:
 
 AF3_ENCODING: Final[AF3SequenceEncoding] = AF3SequenceEncoding()
 
+AF3_ATOM_NAME_NUM_CHARS: Final[int] = 4
+AF3_ATOM_NAME_VOCAB_SIZE: Final[int] = 64
+
+# Standard heavy-atom sidechain chi definitions. These intentionally omit the
+# rotatable hydrogen chis because the Elix featurizers commonly remove hydrogen
+# atoms.
+STANDARD_AA_HEAVY_CHI_ATOMS: Final[
+    dict[str, tuple[tuple[str, str, str, str], ...]]
+] = {
+    "ARG": (
+        ("N", "CA", "CB", "CG"),
+        ("CA", "CB", "CG", "CD"),
+        ("CB", "CG", "CD", "NE"),
+        ("CG", "CD", "NE", "CZ"),
+    ),
+    "ASN": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "OD1")),
+    "ASP": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "OD1")),
+    "CYS": (("N", "CA", "CB", "SG"),),
+    "GLN": (
+        ("N", "CA", "CB", "CG"),
+        ("CA", "CB", "CG", "CD"),
+        ("CB", "CG", "CD", "OE1"),
+    ),
+    "GLU": (
+        ("N", "CA", "CB", "CG"),
+        ("CA", "CB", "CG", "CD"),
+        ("CB", "CG", "CD", "OE1"),
+    ),
+    "HIS": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "ND1")),
+    "ILE": (("N", "CA", "CB", "CG1"), ("CA", "CB", "CG1", "CD1")),
+    "LEU": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")),
+    "LYS": (
+        ("N", "CA", "CB", "CG"),
+        ("CA", "CB", "CG", "CD"),
+        ("CB", "CG", "CD", "CE"),
+        ("CG", "CD", "CE", "NZ"),
+    ),
+    "MET": (
+        ("N", "CA", "CB", "CG"),
+        ("CA", "CB", "CG", "SD"),
+        ("CB", "CG", "SD", "CE"),
+    ),
+    "PHE": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")),
+    "PRO": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD")),
+    "SER": (("N", "CA", "CB", "OG"),),
+    "THR": (("N", "CA", "CB", "OG1"),),
+    "TRP": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")),
+    "TYR": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")),
+    "VAL": (("N", "CA", "CB", "CG1"),),
+}
+
 MAX_NUM_ATOMS: Final[int] = 23
 PROT_BB_ATOMS: Final[list[str]] = ["N", "CA", "C", "O"]
 PROT_LETTER_TO_TOKEN: Final[dict[str, str]] = {**aw_sequence.aa_chem_comp_1to3(), "X": "UNK"}  # include "X" for unknown amino acids

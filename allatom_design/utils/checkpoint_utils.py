@@ -18,6 +18,21 @@ _ELIX_MPNN_CONFIG_RENAMES = (
     ("atom_mpnn", "elix_mpnn"),
 )
 
+_STEP_TRAINING_CHECKPOINT_PATTERN = re.compile(
+    r"^sd-step(?P<step>\d+)-epoch(?P<epoch>\d+)(?:-v(?P<version>\d+))?\.ckpt$"
+)
+_EPOCH_TRAINING_CHECKPOINT_PATTERN = re.compile(
+    r"^sd-epoch(?P<epoch>\d+)(?:-v(?P<version>\d+))?\.ckpt$"
+)
+_FULL_TRAINING_CHECKPOINT_KEYS = {
+    "epoch",
+    "global_step",
+    "loops",
+    "lr_schedulers",
+    "optimizer_states",
+    "state_dict",
+}
+
 _NEW_ELIX_FEATURE_PROJECTION_KEYS = frozenset(
     {
         "model.denoiser.elix_mpnn.token_features.ligand_f_block_node_linear.weight",

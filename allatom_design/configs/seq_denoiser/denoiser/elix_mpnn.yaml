@@ -11,6 +11,9 @@ mpnn:
   num_encoder_layers: 3
   num_decoder_layers: 3
   use_mpnn_decoder: true
+  decoder_input_mode: "legacy_node_add"
+  # Legacy and existing checkpoints skip only the final encoder edge update.
+  update_final_encoder_edge: false
   use_potts_encoding: false  # false preserves legacy AF3-width sequence logits/checkpoints.
   dropout_p: 0.1
   ligand_conditioning: true
@@ -25,6 +28,21 @@ mpnn:
     num_context_feature_aggregator_layers: 2
     # Controls edge update inside ContextModule (ligand context branch).
     context_edge_update: false
+    # Preserve existing context-edge-update checkpoints by default. New runs may
+    # disable only the final processor edge update because its edge is not consumed.
+    update_final_context_processor_edge: true
+    # The final PC edge was historically terminal. Keep it off unless a
+    # downstream shared-atom triangle consumes the returned PC representation.
+    update_final_context_aggregator_edge: false
+  shared_atom_triangle:
+    hidden_dim: 128
+    edge_chunk_size: 4
+    mixing_encoder_layers: []
+
+  protein_pair_triangle:
+    hidden_dim: 128
+    target_chunk_size: 4
+    mixing_encoder_layers: []
 
   token_features:
     num_rbf: 16
@@ -43,7 +61,6 @@ mpnn:
     # Ligand atom/context features; omitted optional flags stay disabled in saved legacy configs.
     use_ligand_aromatic_atom_feature: false
     use_ligand_aromatic_edge_feature: false
-    use_ligand_chirality_tag: false
     use_ligand_f_block_features: false
     use_ligand_asinh_formal_charge: true
     use_ligand_cached_rdkit_chirality: false
@@ -59,12 +76,12 @@ mpnn:
     use_potts: true
     norm_potts_inputs: false  # LayerNorm h_V/h_E before the Potts head
     parameterization: "factor"
-    num_factors: null
     symmetric_J: true
     multi_head:
-      dim_multi_head: 128 # dimension of the multi-head factor Potts model, must be divisible by num_heads
-      reduce: "mean" # "mean", "sqrt"
+      reduce: "mean"
       num_heads: 4
+      adapter_hidden_dim: 640
+      shared_edge_dim: null
 
   sidechain_prediction:
     enabled: false
@@ -74,4 +91,5 @@ mpnn:
     dropout_p: ${denoiser.mpnn.dropout_p}
     use_node_norm: true
 
-  expansion_mode: "node_concat" # null, node_concat, node_concat_context_skip, multi_head_factor, node_concat_multi_head
+  # `null` is reserved for `caliby_concat`.
+  expansion_mode: "node_concat" # node_concat or edge_node_context_concat_multi_head_gate_nonlinear

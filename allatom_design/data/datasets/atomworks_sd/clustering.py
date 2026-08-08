@@ -7,17 +7,22 @@ context only to the featurizer query (never to the sampling cluster).
 """
 
 from collections import Counter
+import hashlib
+import json
 import logging
 import math
+from pathlib import Path
 from typing import Any
 
 import networkx as nx
+import numpy as np
 import pandas as pd
 from atomworks.ml.example_id import generate_example_id
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from allatom_design.data.datasets.atomworks_sd.bml_context import (
     BMLPolicy,
+    BML_ANNOTATION_COLUMNS,
     BML_CENTER_METAL_COL,
     BML_CENTER_SMALL_MOLECULE_COL,
     CONTEXT_HALIDE_COL,
@@ -36,6 +41,12 @@ from allatom_design.data.utils.pn_unit import (
 )
 
 logger = logging.getLogger(__name__)
+
+PRECOMPUTED_LIGAND_GROUP_COLUMN = "q_pn_unit_ligand_group_records"
+PRECOMPUTED_LIGAND_GROUP_SCHEMA_VERSION = "1"
+_ATTR_SCHEMA_VERSION = "allatom_design.ligand_grouping.schema_version"
+_ATTR_CONFIG_SHA256 = "allatom_design.ligand_grouping.config_sha256"
+_ATTR_VALIDATION_IDS_SHA256 = "allatom_design.ligand_grouping.validation_ids_sha256"
 
 GROUPING_PER_CENTER = "per_center"
 GROUPING_MAXIMAL_CENTER_CLIQUE = "maximal_center_clique"
@@ -83,6 +94,107 @@ _GROUPED_ROW_COLUMNS = (
 )
 
 
+def ligand_grouping_semantic_payload(cfg: dict | DictConfig) -> dict[str, Any]:
+    """Return the config subset that determines precomputed group membership."""
+
+    def plain(value: Any) -> Any:
+        if OmegaConf.is_config(value):
+            return OmegaConf.to_container(value, resolve=True)
+        return value
+
+    clustering_cfg = (cfg or {}).get("clustering", {}) or {}
+    train_filters = (cfg or {}).get("train_filters", {}) or {}
+    interface_filters = train_filters.get("interface_filter", {}) or {}
+    return {
+        "debug": bool((cfg or {}).get("debug", False)),
+        "cluster_id_col": (cfg or {}).get("cluster_id_col"),
+        "val_exclusion_cluster_id_col": (cfg or {}).get(
+            "val_exclusion_cluster_id_col"
+        ),
+        "query_pn_unit_iids_only": bool(
+            (cfg or {}).get("query_pn_unit_iids_only", False)
+        ),
+        "bml_center": plain((cfg or {}).get("bml_center", {})),
+        "bml_context": plain((cfg or {}).get("bml_context", {})),
+        "metadata_filter": plain(train_filters.get("metadata_filter", [])),
+        "protein_monomer_chain_filter": plain(
+            train_filters.get("protein_monomer_chain_filter", [])
+        ),
+        "interface_prefilter": plain(interface_filters.get("1", [])),
+        "interface_grouping_scheme": clustering_cfg.get(
+            "interface_grouping_scheme", GROUPING_PER_CENTER
+        ),
+        "center_clique_distance_cutoff": clustering_cfg.get(
+            "center_clique_distance_cutoff"
+        ),
+        "max_cliques_per_assembly": clustering_cfg.get(
+            "max_cliques_per_assembly", 100_000
+        ),
+    }
+
+
+def ligand_grouping_config_sha256(cfg: dict | DictConfig) -> str:
+    payload = json.dumps(
+        ligand_grouping_semantic_payload(cfg),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def ligand_grouping_validation_ids_sha256(cfg: dict | DictConfig) -> str:
+    validation_ids_file = (cfg or {}).get("validation_ids_file")
+    if validation_ids_file in (None, ""):
+        return ""
+    path = Path(str(validation_ids_file))
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def ligand_grouping_artifact_attrs(cfg: dict | DictConfig) -> dict[str, str]:
+    return {
+        _ATTR_SCHEMA_VERSION: PRECOMPUTED_LIGAND_GROUP_SCHEMA_VERSION,
+        _ATTR_CONFIG_SHA256: ligand_grouping_config_sha256(cfg),
+        _ATTR_VALIDATION_IDS_SHA256: ligand_grouping_validation_ids_sha256(cfg),
+    }
+
+
+def validate_precomputed_ligand_grouping_metadata(
+    metadata_df: pd.DataFrame,
+    cfg: dict | DictConfig,
+) -> None:
+    """Fail fast when a present precomputed column is stale or malformed."""
+
+    if PRECOMPUTED_LIGAND_GROUP_COLUMN not in metadata_df.columns:
+        raise KeyError(
+            f"Precomputed ligand grouping requires column "
+            f"{PRECOMPUTED_LIGAND_GROUP_COLUMN!r}."
+        )
+    missing_annotations = [
+        column for column in BML_ANNOTATION_COLUMNS if column not in metadata_df.columns
+    ]
+    if missing_annotations:
+        raise KeyError(
+            "Precomputed ligand grouping is missing BML annotation columns: "
+            f"{missing_annotations}"
+        )
+
+    expected = ligand_grouping_artifact_attrs(cfg)
+    mismatches = {
+        key: {"expected": value, "actual": metadata_df.attrs.get(key)}
+        for key, value in expected.items()
+        if metadata_df.attrs.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(
+            "Precomputed ligand-grouping artifact metadata does not match the "
+            f"active data config: {mismatches}"
+        )
+
+
 def build_interface_df_for_clustering(
     metadata_df: pd.DataFrame,
     protein_df: pd.DataFrame,
@@ -113,6 +225,13 @@ def build_interface_df_for_clustering(
             "`maximal_center_clique` grouping requires "
             "`bml_context.scheme=iterative_context_refinement`."
         )
+    if PRECOMPUTED_LIGAND_GROUP_COLUMN in metadata_df.columns:
+        return build_precomputed_center_clique_interface_df(
+            metadata_df=metadata_df,
+            protein_df=protein_df,
+            dataset_name=dataset_name,
+            cfg=cfg,
+        )
     return build_center_clique_interface_df(
         metadata_df=metadata_df,
         protein_df=protein_df,
@@ -128,6 +247,23 @@ def build_center_clique_interface_df(
     cfg: dict | DictConfig,
 ) -> pd.DataFrame:
     """Build mixed-modality interface rows from maximal BML-center cliques."""
+
+    interface_df, _ = build_center_clique_interface_df_with_stats(
+        metadata_df=metadata_df,
+        protein_df=protein_df,
+        dataset_name=dataset_name,
+        cfg=cfg,
+    )
+    return interface_df
+
+
+def build_center_clique_interface_df_with_stats(
+    metadata_df: pd.DataFrame,
+    protein_df: pd.DataFrame,
+    dataset_name: str,
+    cfg: dict | DictConfig,
+) -> tuple[pd.DataFrame, Counter]:
+    """Build grouped interface rows and return deterministic build diagnostics."""
 
     policy = BMLPolicy.from_cfg(cfg)
     metadata_df = ensure_bml_context_annotations(metadata_df, cfg)
@@ -234,7 +370,235 @@ def build_center_clique_interface_df(
         "BML center-clique grouping stats: %s",
         dict(sorted(stats.items())),
     )
+    return _rows_to_grouped_interface_df(rows, metadata_df), stats
+
+
+def ligand_group_records_by_anchor(
+    interface_df: pd.DataFrame,
+) -> dict[tuple[str, str, str], list[dict[str, Any]]]:
+    """Serialize grouped-interface identity into one record list per anchor center."""
+
+    records_by_anchor: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    seen_group_ids: set[str] = set()
+    for row in interface_df.itertuples(index=False):
+        clique_iids = tuple(str(value) for value in row.center_clique_pn_unit_iids)
+        member_types = tuple(str(value) for value in row.center_clique_member_types)
+        if not clique_iids:
+            raise ValueError("Grouped interface row has an empty center clique.")
+        if len(clique_iids) != len(member_types):
+            raise ValueError(
+                "Grouped interface row has mismatched clique/member-type lengths: "
+                f"example_id={row.example_id!r}."
+            )
+
+        group_id = str(row.example_id)
+        if group_id in seen_group_ids:
+            raise ValueError(f"Duplicate ligand group ID: {group_id!r}.")
+        seen_group_ids.add(group_id)
+
+        anchor = (str(row.pdb_id), str(row.assembly_id), clique_iids[0])
+        records_by_anchor.setdefault(anchor, []).append(
+            {
+                "ligand_group_id": group_id,
+                "center_clique_pn_unit_iids": list(clique_iids),
+                "center_clique_member_types": list(member_types),
+                "protein_pn_unit_iids": [
+                    str(value) for value in row.protein_pn_unit_iids
+                ],
+                "expanded_context_pn_unit_iids": [
+                    str(value) for value in row.expanded_context_pn_unit_iids
+                ],
+            }
+        )
+
+    for records in records_by_anchor.values():
+        records.sort(key=lambda record: record["ligand_group_id"])
+    return records_by_anchor
+
+
+def build_precomputed_center_clique_interface_df(
+    metadata_df: pd.DataFrame,
+    protein_df: pd.DataFrame,
+    dataset_name: str,
+    cfg: dict | DictConfig,
+) -> pd.DataFrame:
+    """Materialize grouped interface rows from validated metadata records."""
+
+    validate_precomputed_ligand_grouping_metadata(metadata_df, cfg)
+    center_groups = _group_rows_by_assembly(_select_center_candidates(metadata_df))
+    protein_mask = metadata_df["q_pn_unit_is_protein"].fillna(False).astype(bool)
+    protein_columns = [
+        "pdb_id",
+        "assembly_id",
+        "q_pn_unit_iid",
+        "q_pn_unit_cluster_id",
+        "q_pn_unit_cluster_val_id",
+    ]
+    all_protein_groups = _group_rows_by_assembly(
+        metadata_df.loc[protein_mask, protein_columns]
+    )
+    designable_protein_groups = _group_iids_by_assembly(
+        protein_df[protein_df["q_pn_unit_is_protein"].fillna(False).astype(bool)]
+    )
+    available_iids_by_assembly = _group_iids_by_assembly(metadata_df)
+    serialized_record_count = sum(
+        len(_normalize_ligand_group_records(raw_records))
+        for raw_records in metadata_df[PRECOMPUTED_LIGAND_GROUP_COLUMN].array
+    )
+
+    rows: list[dict[str, Any]] = []
+    seen_group_ids: set[str] = set()
+    for assembly_key, assembly_centers in center_groups.items():
+        protein_rows = all_protein_groups.get(assembly_key, {})
+        designable_protein_iids = set(
+            designable_protein_groups.get(assembly_key, set())
+        )
+        available_iids = available_iids_by_assembly.get(assembly_key, set())
+
+        for anchor_iid, anchor in assembly_centers.items():
+            raw_records = getattr(anchor, PRECOMPUTED_LIGAND_GROUP_COLUMN, None)
+            for record in _normalize_ligand_group_records(raw_records):
+                group_id = _required_record_string(record, "ligand_group_id")
+                if group_id in seen_group_ids:
+                    raise ValueError(
+                        f"Duplicate precomputed ligand group ID: {group_id!r}."
+                    )
+
+                clique_iids = _required_record_strings(
+                    record, "center_clique_pn_unit_iids"
+                )
+                member_types = _required_record_strings(
+                    record, "center_clique_member_types"
+                )
+                protein_iids = _required_record_strings(
+                    record, "protein_pn_unit_iids"
+                )
+                expanded_context_iids = _required_record_strings(
+                    record, "expanded_context_pn_unit_iids"
+                )
+                if not clique_iids or clique_iids[0] != anchor_iid:
+                    raise ValueError(
+                        "Precomputed clique must be stored on its first canonical "
+                        f"center: group={group_id!r}, anchor={anchor_iid!r}, "
+                        f"clique={clique_iids}."
+                    )
+                if len(clique_iids) != len(member_types):
+                    raise ValueError(
+                        "Precomputed clique/member-type lengths differ for "
+                        f"group {group_id!r}."
+                    )
+
+                missing_centers = [
+                    iid for iid in clique_iids if iid not in assembly_centers
+                ]
+                missing_proteins = [
+                    iid for iid in protein_iids if iid not in protein_rows
+                ]
+                missing_context = [
+                    iid for iid in expanded_context_iids if iid not in available_iids
+                ]
+                if missing_centers or missing_proteins or missing_context:
+                    raise KeyError(
+                        "Precomputed ligand group references missing PN units: "
+                        f"group={group_id!r}, centers={missing_centers}, "
+                        f"proteins={missing_proteins}, context={missing_context}."
+                    )
+
+                clique_rows = [assembly_centers[iid] for iid in clique_iids]
+                actual_member_types = tuple(
+                    str(row.center_modality) for row in clique_rows
+                )
+                if actual_member_types != member_types:
+                    raise ValueError(
+                        "Precomputed member modalities do not match active metadata: "
+                        f"group={group_id!r}, stored={member_types}, "
+                        f"actual={actual_member_types}."
+                    )
+                for row, modality in zip(clique_rows, actual_member_types):
+                    if modality == MODALITY_SMALL_MOLECULE and bool(
+                        getattr(
+                            row,
+                            "q_pn_unit_is_maybe_covalently_linked_to_protein",
+                            False,
+                        )
+                    ):
+                        raise ValueError(
+                            "Maybe-covalently-linked small molecule appears in a "
+                            f"precomputed center clique: group={group_id!r}, "
+                            f"iid={row.q_pn_unit_iid!r}."
+                        )
+
+                built = _build_grouped_interface_row(
+                    clique_rows=clique_rows,
+                    clique_iids=clique_iids,
+                    protein_rows=[protein_rows[iid] for iid in protein_iids],
+                    protein_iids=protein_iids,
+                    designable_protein_iids=tuple(
+                        iid for iid in protein_iids if iid in designable_protein_iids
+                    ),
+                    expanded_context_iids=expanded_context_iids,
+                    dataset_name=dataset_name,
+                )
+                if built["example_id"] != group_id:
+                    raise ValueError(
+                        "Precomputed ligand group ID does not match the production "
+                        f"example-ID contract: stored={group_id!r}, "
+                        f"rebuilt={built['example_id']!r}."
+                    )
+                rows.append(built)
+                seen_group_ids.add(group_id)
+
+    if len(seen_group_ids) != serialized_record_count:
+        raise ValueError(
+            "Not every serialized ligand-group record was consumed from an eligible "
+            "canonical center row: "
+            f"stored={serialized_record_count}, consumed={len(seen_group_ids)}."
+        )
+    logger.info(
+        "Loaded %d precomputed ligand-group interface rows from metadata column %s.",
+        len(rows),
+        PRECOMPUTED_LIGAND_GROUP_COLUMN,
+    )
     return _rows_to_grouped_interface_df(rows, metadata_df)
+
+
+def _normalize_ligand_group_records(value: Any) -> list[dict[str, Any]]:
+    if value is None or (
+        not isinstance(value, (list, tuple, np.ndarray)) and pd.isna(value)
+    ):
+        return []
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(
+            "Precomputed ligand-group records must be a list of structs, got "
+            f"{type(value).__name__}."
+        )
+    records = list(value)
+    if not all(isinstance(record, dict) for record in records):
+        raise TypeError("Every precomputed ligand-group record must be a struct/dict.")
+    return records
+
+
+def _required_record_string(record: dict[str, Any], key: str) -> str:
+    value = record.get(key)
+    if value is None or str(value) == "":
+        raise ValueError(f"Precomputed ligand-group record is missing {key!r}.")
+    return str(value)
+
+
+def _required_record_strings(
+    record: dict[str, Any],
+    key: str,
+) -> tuple[str, ...]:
+    value = record.get(key)
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(
+            f"Precomputed ligand-group field {key!r} must be a list of strings."
+        )
+    return tuple(str(item) for item in value)
 
 
 def enumerate_maximal_center_cliques(
@@ -358,6 +722,25 @@ def _group_rows_by_assembly(df: pd.DataFrame) -> dict[tuple[str, str], dict[str,
     return grouped
 
 
+def _group_iids_by_assembly(df: pd.DataFrame) -> dict[tuple[str, str], set[str]]:
+    grouped: dict[tuple[str, str], set[str]] = {}
+    if df.empty:
+        return grouped
+    columns = ["pdb_id", "assembly_id", "q_pn_unit_iid"]
+    for (pdb_id, assembly_id), group in df[columns].groupby(
+        ["pdb_id", "assembly_id"], sort=False
+    ):
+        iids = group["q_pn_unit_iid"].astype(str).tolist()
+        iid_set = set(iids)
+        if len(iids) != len(iid_set):
+            raise ValueError(
+                "PN-unit IID must be unique within an assembly: "
+                f"pdb_id={pdb_id!r}, assembly_id={assembly_id!r}."
+            )
+        grouped[(str(pdb_id), str(assembly_id))] = iid_set
+    return grouped
+
+
 def _collect_contacted_iids(
     source_rows: list[Any],
     target_rows: dict[str, Any],
@@ -469,6 +852,7 @@ def _build_grouped_interface_row(
     crop_center_iids = tuple(dict.fromkeys([*clique_iids, *protein_iids]))
     row = center._asdict()
     row.pop("crop_center_pn_unit_iids", None)
+    row.pop(PRECOMPUTED_LIGAND_GROUP_COLUMN, None)
     row.update(
         {
             "query_pn_unit_iids": query_iids,

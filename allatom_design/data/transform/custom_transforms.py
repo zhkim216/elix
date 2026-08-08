@@ -88,31 +88,6 @@ _SHEPHERD_HBA_HBD_FDEF_PATH = (
 _NONPOLYMER_COVALENT_ATTACHMENT_ANNOTATION = "is_nonpolymer_covalent_attachment"
 
 
-# Standard heavy-atom sidechain chi definitions.  These intentionally omit the
-# rotatable hydrogen chis used by LASErMPNN because this featurizer commonly
-# removes hydrogens.
-_STANDARD_AA_HEAVY_CHI_ATOMS = {
-    "ARG": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD"), ("CB", "CG", "CD", "NE"), ("CG", "CD", "NE", "CZ")),
-    "ASN": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "OD1")),
-    "ASP": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "OD1")),
-    "CYS": (("N", "CA", "CB", "SG"),),
-    "GLN": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD"), ("CB", "CG", "CD", "OE1")),
-    "GLU": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD"), ("CB", "CG", "CD", "OE1")),
-    "HIS": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "ND1")),
-    "ILE": (("N", "CA", "CB", "CG1"), ("CA", "CB", "CG1", "CD1")),
-    "LEU": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")),
-    "LYS": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD"), ("CB", "CG", "CD", "CE"), ("CG", "CD", "CE", "NZ")),
-    "MET": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "SD"), ("CB", "CG", "SD", "CE")),
-    "PHE": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")),
-    "PRO": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD")),
-    "SER": (("N", "CA", "CB", "OG"),),
-    "THR": (("N", "CA", "CB", "OG1"),),
-    "TRP": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")),
-    "TYR": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")),
-    "VAL": (("N", "CA", "CB", "CG1"),),
-}
-
-
 def _encode_atom_chirality_tags(stereo_values: Sequence[Any] | np.ndarray) -> np.ndarray:
     encoded = np.zeros(len(stereo_values), dtype=np.int64)
     for idx, value in enumerate(stereo_values):
@@ -124,161 +99,10 @@ def _encode_atom_chirality_tags(stereo_values: Sequence[Any] | np.ndarray) -> np
     return encoded
 
 
-def _dihedral_degrees(coords: torch.Tensor) -> torch.Tensor:
-    """Compute dihedral angles in degrees for coords shaped [..., 4, 3]."""
-    b0 = coords[..., 0, :] - coords[..., 1, :]
-    b1 = coords[..., 1, :] - coords[..., 2, :]
-    b2 = coords[..., 2, :] - coords[..., 3, :]
-
-    n1 = torch.cross(b0, b1, dim=-1)
-    n2 = torch.cross(b1, b2, dim=-1)
-    b1_norm = torch.linalg.vector_norm(b1, dim=-1, keepdim=True).clamp(min=1e-8)
-    m1 = torch.cross(n1, b1 / b1_norm, dim=-1)
-    x = torch.sum(n1 * n2, dim=-1)
-    y = torch.sum(m1 * n2, dim=-1)
-    return torch.rad2deg(torch.atan2(y, x))
-
-
-def _compute_standard_aa_chi_targets(
-    atom_array: AtomArray,
-    atom_to_token_map: torch.Tensor,
-    n_tokens: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    chi_angles = torch.full((n_tokens, 4), torch.nan, dtype=torch.float32)
-    chi_mask = torch.zeros((n_tokens, 4), dtype=torch.float32)
-
-    atom_to_token_np = atom_to_token_map.detach().cpu().numpy()
-    atom_names = np.asarray(atom_array.atom_name).astype(str)
-    res_names = np.asarray(atom_array.res_name).astype(str)
-    occupancy = np.asarray(atom_array.occupancy)
-    coords = torch.as_tensor(atom_array.coord, dtype=torch.float32)
-
-    for token_idx in range(n_tokens):
-        atom_indices = np.flatnonzero(atom_to_token_np == token_idx)
-        if atom_indices.size == 0:
-            continue
-
-        chi_atom_defs = _STANDARD_AA_HEAVY_CHI_ATOMS.get(str(res_names[atom_indices[0]]))
-        if not chi_atom_defs:
-            continue
-
-        atom_idx_by_name = {}
-        for atom_idx in atom_indices:
-            if occupancy[atom_idx] <= 0:
-                continue
-            atom_name = atom_names[atom_idx].strip()
-            if atom_name not in atom_idx_by_name:
-                atom_idx_by_name[atom_name] = int(atom_idx)
-
-        for chi_idx, atom_name_tuple in enumerate(chi_atom_defs):
-            if not all(atom_name in atom_idx_by_name for atom_name in atom_name_tuple):
-                continue
-            coord_idxs = [atom_idx_by_name[atom_name] for atom_name in atom_name_tuple]
-            chi_coords = coords[coord_idxs]
-            if not torch.isfinite(chi_coords).all():
-                continue
-            chi_angles[token_idx, chi_idx] = _dihedral_degrees(chi_coords)
-            chi_mask[token_idx, chi_idx] = 1.0
-
-    return chi_angles, chi_mask
-
-
-# Keep track of the token/atom dimensions of the features for padding & cropping
-FEAT_TO_TOKEN_DIM = {
-    # Maps feature name to the token dimension
-    # token features
-    "residue_index": [0],
-    "token_index": [0],
-    "asym_id": [0],
-    "entity_id": [0],
-    "sym_id": [0],
-    "restype": [0],
-    "is_protein": [0],
-    "is_rna": [0],
-    "is_dna": [0],
-    "is_nuc": [0],
-    "is_ligand": [0],
-    "is_atomized": [0],
-    "token_resolved_mask": [0],
-    "token_pad_mask": [0],
-    "token_chain_type": [0],
-    "token_is_polymer": [0],
-    "token_is_hetero": [0],
-    "token_is_covalent_modification": [0],
-    "token_is_ligand_pocket": [0],
-    "token_is_protein_chain": [0],
-    "token_is_peptide_chain": [0],
-    "token_is_small_molecule_chain": [0],
-    "token_is_metal_chain": [0],
-    "token_is_nucleic_acid_chain": [0],
-    "token_to_center_atom": [0],
-    "tokenwise_atom_idxs": [0],
-    "tokenwise_atom_idxs_mask": [0],
-    "noised_ca_coords": [0],
-    "noised_n_coords": [0],
-    "noised_c_coords": [0],
-    "noised_o_coords": [0],
-    "noised_pseudo_cb_coords": [0],
-    "token_is_prot_std_aa": [0],
-    "chi_angles": [0],
-    "chi_mask": [0],
-    "token_bonds": [0, 1],
-
-    # optional features that might not be present
-    "seq_cond_mask": [0],
-    "token_exists_mask": [0],
-}
-
-FEAT_TO_ATOM_DIM = {
-    # Maps feature name to the atom dimension
-    # atom features
-    "coords": [0],
-    "noise": [0],
-    "noised_coords": [0],
-    "atom_to_token_map": [0],
-    "atom_resolved_mask": [0],
-    "atom_pad_mask": [0],
-    "atom_chain_type": [0],
-    "atom_is_polymer": [0],
-    "atom_is_hetero": [0],
-    "atomic_number": [0],
-    "atom_formal_charge": [0],
-    "atom_is_aromatic": [0],
-    "atom_chirality_tag": [0],
-    "atom_cached_rdkit_chirality_tag": [0],
-    "atom_cached_rdkit_chirality_mask": [0],
-    "atom_is_HBA": [0],
-    "atom_is_HBD": [0],
-    "atom_hydrogenbond_feature_mask": [0],
-    "atom_ligand_bond_order": [0, 1],
-    "atom_is_covalent_modification": [0],
-    "atom_is_ligand_pocket": [0],
-    "atom_is_protein_chain": [0],   
-    "atom_is_peptide_chain": [0], 
-    "atom_is_nucleic_acid_chain": [0],
-    "atom_is_metal_chain": [0],
-    "atom_is_small_molecule_chain": [0],
-    "prot_bb_atom_mask": [0],
-    "prot_scn_atom_mask": [0],
-    "prot_scn_wo_cb_atom_mask": [0],
-    "atom_is_atomized": [0],
-    "atom_is_prot_std_aa": [0],
-    "can_be_pseudo_ligand": [0],  # JH Changed 260415
-
-    # optional features that might not be present
-    "atom_cond_mask": [0],
-    "ref_pos": [0],
-    "ref_mask": [0],
-    "ref_element": [0],
-    "ref_charge": [0],
-    "ref_atom_name_chars": [0],
-    "ref_space_uid": [0],
-    "ref_is_atomized_atom_level": [0],
-}
-
 # Keep track of data dict keys only included at inference time
 # INFERENCE_ONLY_KEYS = ["crop_info", "atom_array", "feat_metadata"]
 INFERENCE_ONLY_KEYS = ["crop_info", "atom_array", "feat_metadata"]
+
 
 class CheckCoordinatesAreNan(Transform):
     """Check if the coordinates are nan."""
@@ -289,6 +113,90 @@ class CheckCoordinatesAreNan(Transform):
         if np.isnan(atom_array.coord).all(axis=1).all():
             raise ValueError(f"All coordinates are nan for {data['example_id']}")
         return data
+
+
+class AddAtomNameFeatures(Transform):
+    """Encode atom names with the AlphaFold 3 four-character vocabulary."""
+
+    @override
+    def forward(self, data: dict[str, Any]) -> dict[str, Any]:
+        atom_names = np.char.upper(
+            np.asarray(data["atom_array"].atom_name).astype(str)
+        )
+        atom_names = np.char.ljust(atom_names, const.AF3_ATOM_NAME_NUM_CHARS)
+        atom_name_bytes = atom_names.astype(f"|S{const.AF3_ATOM_NAME_NUM_CHARS}")
+        atom_name_chars = atom_name_bytes.view(np.uint8).reshape(
+            -1, const.AF3_ATOM_NAME_NUM_CHARS
+        )
+        data["feats"]["atom_name_chars"] = torch.from_numpy(
+            atom_name_chars.astype(np.int64) - ord(" ")
+        )
+        return data
+
+
+class AddStandardAAChiTargets(Transform):
+    """Add heavy-atom sidechain chi targets for standard amino acids."""
+
+    @staticmethod
+    def _dihedral_degrees(coords: torch.Tensor) -> torch.Tensor:
+        b0 = coords[..., 0, :] - coords[..., 1, :]
+        b1 = coords[..., 1, :] - coords[..., 2, :]
+        b2 = coords[..., 2, :] - coords[..., 3, :]
+
+        n1 = torch.cross(b0, b1, dim=-1)
+        n2 = torch.cross(b1, b2, dim=-1)
+        b1_norm = torch.linalg.vector_norm(b1, dim=-1, keepdim=True).clamp(
+            min=1e-8
+        )
+        m1 = torch.cross(n1, b1 / b1_norm, dim=-1)
+        x = torch.sum(n1 * n2, dim=-1)
+        y = torch.sum(m1 * n2, dim=-1)
+        return torch.rad2deg(torch.atan2(y, x))
+
+    @override
+    def forward(self, data: dict[str, Any]) -> dict[str, Any]:
+        atom_array = data["atom_array"]
+        feats = data["feats"]
+        n_tokens = feats["token_pad_mask"].shape[0]
+        chi_angles = torch.full((n_tokens, 4), torch.nan, dtype=torch.float32)
+        chi_mask = torch.zeros((n_tokens, 4), dtype=torch.float32)
+
+        atom_to_token = feats["atom_to_token_map"].detach().cpu().numpy()
+        atom_names = np.asarray(atom_array.atom_name).astype(str)
+        residue_names = np.asarray(atom_array.res_name).astype(str)
+        occupancy = np.asarray(atom_array.occupancy)
+        coords = torch.as_tensor(atom_array.coord, dtype=torch.float32)
+
+        for token_idx in range(n_tokens):
+            atom_indices = np.flatnonzero(atom_to_token == token_idx)
+            if atom_indices.size == 0:
+                continue
+
+            residue_name = str(residue_names[atom_indices[0]]).strip().upper()
+            chi_atom_names = const.STANDARD_AA_HEAVY_CHI_ATOMS.get(residue_name)
+            if chi_atom_names is None:
+                continue
+
+            atom_idx_by_name: dict[str, int] = {}
+            for atom_idx in atom_indices:
+                if occupancy[atom_idx] <= 0:
+                    continue
+                atom_name = atom_names[atom_idx].strip().upper()
+                atom_idx_by_name.setdefault(atom_name, int(atom_idx))
+
+            for chi_idx, chi_atoms in enumerate(chi_atom_names):
+                if not all(name in atom_idx_by_name for name in chi_atoms):
+                    continue
+                chi_coords = coords[[atom_idx_by_name[name] for name in chi_atoms]]
+                if not torch.isfinite(chi_coords).all():
+                    continue
+                chi_angles[token_idx, chi_idx] = self._dihedral_degrees(chi_coords)
+                chi_mask[token_idx, chi_idx] = 1.0
+
+        feats["chi_angles"] = chi_angles
+        feats["chi_mask"] = chi_mask
+        return data
+
 
 class FeaturizeCoordsAndMasks(Transform):
     """Add coordinates and atom masks to feats."""
@@ -428,18 +336,96 @@ class FeaturizeCoordsAndMasks(Transform):
         # Add protein_standard_residue mask
         feats["atom_is_prot_std_aa"] = feats["atom_is_protein_chain"] * (1 - feats["atom_is_atomized"])
         feats["token_is_prot_std_aa"] = feats["token_is_protein_chain"] * (1 - feats["is_atomized"].float())
-
-        feats["chi_angles"], feats["chi_mask"] = _compute_standard_aa_chi_targets(
-            atom_array=atom_array,
-            atom_to_token_map=feats["atom_to_token_map"],
-            n_tokens=N_tokens,
-        )
                 
         return data
 
 
 class PadSDFeats(Transform):
     """Pad the token and atom features to the maximum number of tokens and atoms."""
+
+    FEATURE_TO_TOKEN_DIMS: ClassVar[dict[str, list[int]]] = {
+        "residue_index": [0],
+        "token_index": [0],
+        "asym_id": [0],
+        "entity_id": [0],
+        "sym_id": [0],
+        "restype": [0],
+        "is_protein": [0],
+        "is_rna": [0],
+        "is_dna": [0],
+        "is_nuc": [0],
+        "is_ligand": [0],
+        "is_atomized": [0],
+        "token_resolved_mask": [0],
+        "token_pad_mask": [0],
+        "token_chain_type": [0],
+        "token_is_polymer": [0],
+        "token_is_hetero": [0],
+        "token_is_covalent_modification": [0],
+        "token_is_ligand_pocket": [0],
+        "token_is_protein_chain": [0],
+        "token_is_peptide_chain": [0],
+        "token_is_small_molecule_chain": [0],
+        "token_is_metal_chain": [0],
+        "token_is_nucleic_acid_chain": [0],
+        "token_to_center_atom": [0],
+        "tokenwise_atom_idxs": [0],
+        "tokenwise_atom_idxs_mask": [0],
+        "noised_ca_coords": [0],
+        "noised_n_coords": [0],
+        "noised_c_coords": [0],
+        "noised_o_coords": [0],
+        "noised_pseudo_cb_coords": [0],
+        "token_is_prot_std_aa": [0],
+        "chi_angles": [0],
+        "chi_mask": [0],
+        "token_bonds": [0, 1],
+        "seq_cond_mask": [0],
+        "token_exists_mask": [0],
+    }
+    FEATURE_TO_ATOM_DIMS: ClassVar[dict[str, list[int]]] = {
+        "coords": [0],
+        "noise": [0],
+        "noised_coords": [0],
+        "atom_to_token_map": [0],
+        "atom_resolved_mask": [0],
+        "atom_pad_mask": [0],
+        "atom_chain_type": [0],
+        "atom_is_polymer": [0],
+        "atom_is_hetero": [0],
+        "atomic_number": [0],
+        "atom_name_chars": [0],
+        "atom_formal_charge": [0],
+        "atom_is_aromatic": [0],
+        "atom_chirality_tag": [0],
+        "atom_cached_rdkit_chirality_tag": [0],
+        "atom_cached_rdkit_chirality_mask": [0],
+        "atom_is_HBA": [0],
+        "atom_is_HBD": [0],
+        "atom_hydrogenbond_feature_mask": [0],
+        "atom_ligand_bond_order": [0, 1],
+        "atom_is_covalent_modification": [0],
+        "atom_is_ligand_pocket": [0],
+        "atom_is_protein_chain": [0],
+        "atom_is_peptide_chain": [0],
+        "atom_is_nucleic_acid_chain": [0],
+        "atom_is_metal_chain": [0],
+        "atom_is_small_molecule_chain": [0],
+        "prot_bb_atom_mask": [0],
+        "prot_scn_atom_mask": [0],
+        "prot_scn_wo_cb_atom_mask": [0],
+        "atom_is_atomized": [0],
+        "atom_is_prot_std_aa": [0],
+        "can_be_pseudo_ligand": [0],
+        "atom_cond_mask": [0],
+        "ref_pos": [0],
+        "ref_mask": [0],
+        "ref_element": [0],
+        "ref_charge": [0],
+        "ref_atom_name_chars": [0],
+        "ref_space_uid": [0],
+        "ref_is_atomized_atom_level": [0],
+    }
 
     def __init__(self, max_tokens: int | None, max_atoms: int | None):
         self.max_tokens = max_tokens
@@ -455,7 +441,7 @@ class PadSDFeats(Transform):
         if self.max_tokens is not None:
             token_pad_len = self.max_tokens - len(feats["token_index"])
             if token_pad_len > 0:
-                for k, v in FEAT_TO_TOKEN_DIM.items():
+                for k, v in self.FEATURE_TO_TOKEN_DIMS.items():
                     if k not in feats:
                         continue
                     for dim_to_pad in v:
@@ -465,7 +451,7 @@ class PadSDFeats(Transform):
         if self.max_atoms is not None:
             atom_pad_len = self.max_atoms - len(feats["atom_resolved_mask"])
             if atom_pad_len > 0:
-                for k, v in FEAT_TO_ATOM_DIM.items():
+                for k, v in self.FEATURE_TO_ATOM_DIMS.items():
                     if k not in feats:
                         continue
                     for dim_to_pad in v:
@@ -751,6 +737,11 @@ class AddCachedRDKitFeatures(Transform):
             raise ValueError("At least one cached RDKit feature must be enabled")
 
         self.residue_cache_dir = Path(residue_cache_dir)
+        if not self.residue_cache_dir.is_dir():
+            raise ValueError(
+                "residue_cache_dir must be an existing directory when cached "
+                f"RDKit features are enabled: {self.residue_cache_dir}"
+            )
         self.add_chirality = add_chirality
         self.add_hydrogenbond_feature = add_hydrogenbond_feature
         self._residue_cache: dict[str, tuple[dict | None, str | None, str | None]] = {}
@@ -790,15 +781,16 @@ class AddCachedRDKitFeatures(Transform):
 
         path = self.residue_cache_dir / res_name / f"{res_name}.pt"
         if not path.exists():
-            result = (None, "missing_cache_file", str(path))
-        else:
-            try:
-                entry = torch.load(path, map_location="cpu", weights_only=False)
-            except Exception as exc:
-                result = (None, "cache_load_failed", str(exc))
-            else:
-                result = (entry, None, None) if entry is not None else (None, "empty_cache_entry", str(path))
+            return None, "missing_cache_file", str(path)
 
+        try:
+            entry = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as exc:
+            return None, "cache_load_failed", str(exc)
+        if entry is None:
+            return None, "empty_cache_entry", str(path)
+
+        result = (entry, None, None)
         self._residue_cache[res_name] = result
         return result
 

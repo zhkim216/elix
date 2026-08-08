@@ -3,6 +3,8 @@ wandb:
   project: "ligand_seq_des"
   wandb_id: "zhkim216"
   group: "training"
+  run_id: null
+  resume: never
 
 out_dir: "/scratch/users/zhkim216/out_dir"
 exp_name: null
@@ -93,6 +95,7 @@ mask_selector:
 
 eval:
   eval_timesteps: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  scn_context_ratio: 0.0
 
 loss:
   task: ${model.task}

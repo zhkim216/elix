@@ -6,6 +6,10 @@ task: ${model.task}
 dataset_impl: atomworks_sd
 pdb_path: /scratch/users/zhkim216/datasets/atomworks_pdb_full_v9
 train_metadata_path: /scratch/users/zhkim216/datasets/atomworks_pdb_full_v9/final/step2_annotate_metal_evidence/outputs/metadata_ligval_metalfixed_metal_evidence_seq_clustered_03.parquet
+# Full-data training is fail-closed without a config-matched Arrow index.
+# Build one explicitly with:
+# python -m allatom_design.data.datasets.atomworks_sd.build_runtime_index
+runtime_index_path: null
 
 validation_ids_file: null
 val_metadata_path: /scratch/users/zhkim216/datasets/evaluation_datasets/nativeval/metadata_for_training_nativeval.parquet
@@ -136,5 +140,7 @@ featurizer_cfg:
 
 samples_per_epoch: 1000
 batch_size: ${train.batch_size}
+val_batch_size: 1
 num_workers: ${num_workers}
+prefetch_factor: 4
 random_seed: ${train.seed}

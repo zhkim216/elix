@@ -21,8 +21,52 @@ from allatom_design.utils.tensor_utils import to
 from allatom_design.model.seq_denoiser.denoisers.denoiser import \
     BaseSeqDenoiser
 from allatom_design.model.seq_denoiser.denoisers.seq_design import complexity, frustration
+from allatom_design.model.seq_denoiser.denoisers.seq_design.inference_schedule import (
+    build_energy_density_schedule_trace,
+    build_heat_capacity_schedule_trace,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _sample_initial_sequence_probes(
+    *,
+    logits_init: torch.Tensor,
+    finalized_mask_sample: torch.Tensor,
+    sampling_sequence: torch.Tensor,
+    first_sequence: torch.Tensor,
+    num_sequences: int,
+) -> torch.Tensor:
+    """Draw distinct legal probes without changing generation starts."""
+
+    if num_sequences < 1:
+        raise ValueError("schedule calibration requires at least one probe sequence")
+    batch_size = first_sequence.shape[0]
+    selected = [[first_sequence[batch_index].clone()] for batch_index in range(batch_size)]
+    max_draws = max(256, 64 * num_sequences)
+    for _ in range(max_draws):
+        if all(len(batch_probes) == num_sequences for batch_probes in selected):
+            break
+        _, _, probe = potts.init_sampling_masks(
+            logits_init,
+            mask_sample=finalized_mask_sample,
+            S=sampling_sequence,
+        )
+        for batch_index, batch_probes in enumerate(selected):
+            if len(batch_probes) == num_sequences:
+                continue
+            candidate = probe[batch_index]
+            if all(not torch.equal(candidate, existing) for existing in batch_probes):
+                batch_probes.append(candidate.clone())
+    unique_counts = [len(batch_probes) for batch_probes in selected]
+    if any(count != num_sequences for count in unique_counts):
+        raise RuntimeError(
+            f"failed to draw {num_sequences} distinct calibration sequences; "
+            f"unique counts={unique_counts} after {max_draws} draws"
+        )
+    return torch.stack(
+        [torch.stack(batch_probes, dim=0) for batch_probes in selected], dim=1
+    )
 
 
 class ElixMPNNDenoiser(BaseSeqDenoiser):
@@ -34,9 +78,12 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
         self.use_potts_encoding = bool(cfg.mpnn.get("use_potts_encoding", False))
         self.sequence_encoding = potts_encoding.selected_sequence_encoding(self.use_potts_encoding)
 
-        # Sequence design model: ElixMPNN
-        from allatom_design.model.seq_denoiser.denoisers.seq_design.elix_mpnn import \
-            ElixMPNN
+        # Keep the historical attribute name because sampling and analysis
+        # consumers access ``elix_mpnn.decoder_S_potts`` directly.
+        from allatom_design.model.seq_denoiser.denoisers.seq_design.elix_mpnn import (
+            ElixMPNN,
+        )
+
         self.elix_mpnn = ElixMPNN(cfg.mpnn)
 
 
@@ -65,6 +112,10 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
             "seq_logits": seq_logits,
             "potts_decoder_aux": mpnn_feats.get("potts_decoder_aux", None),
             "sidechain_prediction_aux": mpnn_feats.get("sidechain_prediction_aux", None),
+            "pcp_shared_atom_count": mpnn_feats.get(
+                "pcp_shared_atom_count",
+                None,
+            ),
             "seq_cond_mask": batch["seq_cond_mask"],
             "atom_cond_mask": batch["atom_cond_mask"],
             "sidechain_context_token_mask": batch["sidechain_context_token_mask"],
@@ -463,6 +514,7 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
                     num_sweeps=potts_sampling_cfg["potts_sweeps"],
                     penalty_func=penalty_func,
                     proposal=potts_sampling_cfg["potts_proposal"],
+                    dlmc_dt=float(potts_sampling_cfg.get("dlmc_dt", 0.1)),
                     rejection_step=potts_sampling_cfg.get("rejection_step", False),
                     verbose=False,
                     h_uncond=negative_aux["h"],
@@ -611,6 +663,9 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
                      batch: dict[str, TensorType["b ..."]],
                      sampling_inputs: dict[str, Any],
                      potts_aux_provider: Callable | None = None,
+                     potts_mixing_provider: Callable | None = None,
+                     mixing_scaffold_batch: dict[str, TensorType["b ..."]] | None = None,
+                     mixing_scaffold_sampling_inputs: dict[str, Any] | None = None,
                      ) -> tuple[dict[str, list[AtomArray]], dict[str, Any]]:
         """
         Potts sampling for sequence design.
@@ -633,6 +688,18 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
             output_feats: list[dict[str, TensorType["b ..."]]]: list of length (n_samples_per_pdb) of output features for each sample
             aux: dict[str, Any]: auxiliary outputs
         """
+        # Preserve scaffold conditioning before the primary checkpoint applies
+        # its own ``potts_only_cond`` policy or ensemble aggregation.
+        mixing_source_batch = None
+        if potts_mixing_provider is not None:
+            mixing_source_batch = dict(mixing_scaffold_batch or batch)
+            mixing_source_batch["seq_cond_mask"] = mixing_source_batch[
+                "seq_cond_mask"
+            ].clone()
+            mixing_source_batch["seq_cond_mask_potts"] = mixing_source_batch[
+                "seq_cond_mask"
+            ].clone()
+
         # If specified, condition on sequence only in the potts model
         batch["seq_cond_mask_potts"] = batch["seq_cond_mask"].clone()
         if sampling_inputs["potts_sampling_cfg"].get("potts_only_cond", False):
@@ -654,6 +721,15 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
             raise NotImplementedError(
                 "A custom Potts aux provider cannot be combined with Potts guidance."
             )
+        if potts_mixing_provider is not None:
+            if use_guidance:
+                raise NotImplementedError(
+                    "Potts-model mixing cannot be combined with guidance."
+                )
+            if use_frustration:
+                raise NotImplementedError(
+                    "Potts-model mixing cannot be combined with frustration."
+                )
         if use_guidance and str(guidance_cfg.get("mode", "cond_uncond")) == "selectivity":
             return self._potts_sample_selectivity_pair(
                 batch=batch,
@@ -699,13 +775,22 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
         self._validate_potts_aux_alphabet(potts_decoder_aux)
         self._validate_restype_alphabet(batch)
 
+        local_mixture = None
+        if potts_mixing_provider is not None:
+            local_mixture = potts_mixing_provider(
+                primary_batch=batch,
+                scaffold_batch=mixing_source_batch,
+                primary_potts_aux=potts_decoder_aux,
+                scaffold_sampling_inputs=mixing_scaffold_sampling_inputs,
+            )
+
         # Apply the sampling-only transform after any tied/ensemble aggregation
         # has produced the final sparse Potts coupling tensor. The Potts head,
         # training losses, and standalone scoring path continue to use raw J.
         if use_frustration:
             potts_decoder_aux["J"] = frustration.mix_pairwise_couplings(
                 potts_decoder_aux["J"],
-                potts_decoder_aux["mask_ij"],
+                potts_decoder_aux["coupling_mask"],
                 alpha=float(frustration_cfg["alpha"]),
                 beta=float(frustration_cfg["beta"]),
             )
@@ -730,6 +815,13 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
         potts_sweeps = potts_sampling_cfg["potts_sweeps"]
         potts_proposal = potts_sampling_cfg["potts_proposal"]
         potts_temperature = potts_sampling_cfg["potts_temperature"]
+        dlmc_dt = float(potts_sampling_cfg.get("dlmc_dt", 0.1))
+        temperature_schedule_cfg = potts_sampling_cfg.get(
+            "temperature_schedule", None
+        )
+        use_temperature_schedule = bool(temperature_schedule_cfg) and bool(
+            temperature_schedule_cfg.get("enabled", False)
+        )
         rejection_step = potts_sampling_cfg.get("rejection_step", potts_proposal == "chromatic")
 
         B, N, C = batch["restype"].shape
@@ -748,10 +840,26 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
             sampling_inputs.get("pos_restrict_aatype", None)
         )
 
+        # ``potts_only_cond`` intentionally clears the model-facing sequence
+        # conditioning mask before the forward pass.  With compact Potts
+        # encoding that turns every standard-AA model input into ``<M>``.
+        # Fixed sampler positions must still start from their unmasked target
+        # identities, otherwise the fixed state (and its pairwise energies)
+        # incorrectly remains the mask token.
+        sampling_sequence = batch.get("target_restype")
+        if sampling_sequence is None:
+            sampling_sequence = batch["restype"].argmax(dim=-1)
+        if sampling_sequence.shape != batch["restype"].shape[:-1]:
+            raise ValueError(
+                "Potts sampling target/restype shape mismatch: "
+                f"target={tuple(sampling_sequence.shape)}, "
+                f"restype={tuple(batch['restype'].shape)}"
+            )
+
         mask_sample, _, S_init = potts.init_sampling_masks(
             logits_init,
             mask_sample=mask_sample,
-            S=batch["restype"].argmax(dim=-1),
+            S=sampling_sequence,
             ban_S=ban_S,
             pos_restrict_aatype=pos_restrict_aatype,
         )
@@ -767,6 +875,194 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
             # mask out i) non-protein chains, ii) pad tokens, iii) tokens that don't exist in the graph
             # complexity is only calculated for the residues where C_complexity > 0
             penalty_func = lambda _S: complexity.complexity_lcp(_S, C_complexity)
+
+        precomputed_temperature_schedule_trace = None
+        endpoint_mode = "fixed"
+        schedule_name = None
+        if use_temperature_schedule:
+            endpoint_mode = str(temperature_schedule_cfg.get("endpoint_mode", "fixed"))
+            schedule_name = str(temperature_schedule_cfg["name"])
+        if schedule_name == "heat_capacity":
+            if endpoint_mode != "fixed":
+                raise ValueError(
+                    "heat_capacity requires fixed start/end temperature endpoints"
+                )
+            if potts_proposal != "dlmc" or rejection_step:
+                raise NotImplementedError(
+                    "heat_capacity requires proposal='dlmc' without a rejection step"
+                )
+            if (
+                local_mixture is not None
+                and local_mixture.mixing_scheme != "mean_energy"
+            ):
+                raise NotImplementedError(
+                    "heat_capacity with local transition mixing is supported only "
+                    "for mixing_scheme='mean_energy'"
+                )
+            calibration_cfg = temperature_schedule_cfg.get(
+                "heat_capacity_calibration", {}
+            )
+            num_probe_sequences = int(calibration_cfg.get("num_sequences", 16))
+            anneal_temperature = float(
+                calibration_cfg.get("anneal_temperature", 1.0)
+            )
+            anneal_steps = int(calibration_cfg.get("anneal_steps", 50))
+            calibration_seed = int(calibration_cfg.get("seed", 0))
+            fork_devices = []
+            if logits_init.is_cuda:
+                device_index = logits_init.device.index
+                fork_devices = [
+                    torch.cuda.current_device() if device_index is None else device_index
+                ]
+            with torch.random.fork_rng(devices=fork_devices):
+                torch.manual_seed(calibration_seed)
+                if logits_init.is_cuda:
+                    with torch.cuda.device(logits_init.device):
+                        torch.cuda.manual_seed(calibration_seed)
+                probe_sequences = _sample_initial_sequence_probes(
+                    logits_init=logits_init,
+                    finalized_mask_sample=mask_sample,
+                    sampling_sequence=sampling_sequence,
+                    first_sequence=S_init,
+                    num_sequences=num_probe_sequences,
+                )
+                annealed_probe_sequences = []
+                for probe_sequence in probe_sequences:
+                    probe_sample_kwargs = {}
+                    if local_mixture is not None:
+                        probe_sample_kwargs["local_mixture"] = local_mixture
+                    annealed_probe, _ = potts.sample_potts(
+                        potts_decoder_aux["h"],
+                        potts_decoder_aux["J"],
+                        potts_decoder_aux["edge_idx"],
+                        potts_decoder_aux["mask_i"],
+                        potts_decoder_aux["mask_ij"],
+                        S=probe_sequence,
+                        mask_sample=mask_sample,
+                        num_sweeps=anneal_steps,
+                        temperature=anneal_temperature,
+                        temperature_init=anneal_temperature,
+                        penalty_func=penalty_func,
+                        proposal="dlmc",
+                        dlmc_dt=dlmc_dt,
+                        rejection_step=False,
+                        verbose=False,
+                        **probe_sample_kwargs,
+                    )
+                    annealed_probe_sequences.append(annealed_probe)
+                annealed_probe_sequences = torch.stack(
+                    annealed_probe_sequences, dim=0
+                )
+
+            annealed_local_energy = []
+            for annealed_probe in annealed_probe_sequences:
+                if local_mixture is None:
+                    _, local_energy = potts._compute_dlmc_local_energy(
+                        annealed_probe,
+                        potts_decoder_aux["h"],
+                        potts_decoder_aux["J"],
+                        potts_decoder_aux["edge_idx"],
+                        penalty_func=penalty_func,
+                    )
+                else:
+                    _, local_energy = potts._compute_mean_energy_local_energy(
+                        annealed_probe,
+                        potts_decoder_aux["h"],
+                        potts_decoder_aux["J"],
+                        potts_decoder_aux["edge_idx"],
+                        local_mixture,
+                        penalty_func=penalty_func,
+                    )
+                annealed_local_energy.append(local_energy.detach())
+            annealed_local_energy = torch.stack(annealed_local_energy, dim=0)
+            scheduled_site_mask = (
+                (mask_sample.sum(dim=-1) > 1) & (potts_decoder_aux["mask_i"] > 0)
+            )
+            precomputed_temperature_schedule_trace = (
+                build_heat_capacity_schedule_trace(
+                    annealed_local_energy=annealed_local_energy,
+                    legal_state_mask=mask_sample > 0,
+                    site_mask=scheduled_site_mask,
+                    initial_probe_sequences=probe_sequences.detach(),
+                    annealed_probe_sequences=annealed_probe_sequences.detach(),
+                    start_temperature=float(
+                        temperature_schedule_cfg.get("start_temperature", 3.0)
+                    ),
+                    end_temperature=float(potts_temperature),
+                    total_steps=int(potts_sweeps),
+                    end_hold_steps=int(
+                        temperature_schedule_cfg.get("end_hold_steps", 50)
+                    ),
+                    curve_points=int(calibration_cfg.get("curve_points", 200)),
+                    heat_capacity_floor=float(
+                        calibration_cfg.get("heat_capacity_floor", 0.1)
+                    ),
+                    bisection_iterations=int(
+                        calibration_cfg.get("alpha_bisection_iterations", 64)
+                    ),
+                    calibration_anneal_temperature=anneal_temperature,
+                    calibration_anneal_steps=anneal_steps,
+                )
+            )
+        elif endpoint_mode != "fixed":
+            if endpoint_mode != "initial_random_mean_total_U_per_residue":
+                raise ValueError(f"Unknown temperature endpoint_mode={endpoint_mode!r}")
+            calibration_cfg = temperature_schedule_cfg.get("energy_calibration", {})
+            num_probe_sequences = int(calibration_cfg.get("num_sequences", 16))
+            probe_sequences = _sample_initial_sequence_probes(
+                logits_init=logits_init,
+                finalized_mask_sample=mask_sample,
+                sampling_sequence=sampling_sequence,
+                first_sequence=S_init,
+                num_sequences=num_probe_sequences,
+            )
+            with torch.no_grad():
+                probe_total_energies = torch.stack(
+                    [
+                        potts.compute_potts_energy(
+                            probe_sequence,
+                            potts_decoder_aux["h"],
+                            potts_decoder_aux["J"],
+                            potts_decoder_aux["edge_idx"],
+                        )[0]
+                        for probe_sequence in probe_sequences
+                    ],
+                    dim=0,
+                )
+            _, frozen_local_energy = potts._compute_dlmc_local_energy(
+                S_init,
+                potts_decoder_aux["h"],
+                potts_decoder_aux["J"],
+                potts_decoder_aux["edge_idx"],
+                penalty_func=penalty_func,
+            )
+            scheduled_site_mask = (
+                (mask_sample.sum(dim=-1) > 1) & (potts_decoder_aux["mask_i"] > 0)
+            )
+            precomputed_temperature_schedule_trace = (
+                build_energy_density_schedule_trace(
+                    str(temperature_schedule_cfg["name"]),
+                    probe_total_energies=probe_total_energies.detach(),
+                    probe_sequences=probe_sequences.detach(),
+                    lengths=potts_decoder_aux["mask_i"].sum(dim=-1),
+                    local_energy=frozen_local_energy.detach(),
+                    legal_state_mask=mask_sample > 0,
+                    site_mask=scheduled_site_mask,
+                    start_reduced_energy=float(
+                        calibration_cfg.get("start_reduced_energy", 0.01)
+                    ),
+                    end_reduced_energy=float(
+                        calibration_cfg.get("end_reduced_energy", 10.0)
+                    ),
+                    total_steps=int(potts_sweeps),
+                    end_hold_steps=int(
+                        temperature_schedule_cfg.get("end_hold_steps", 50)
+                    ),
+                    variance_floor=float(
+                        temperature_schedule_cfg.get("variance_floor", 1e-12)
+                    ),
+                )
+            )
 
         S = []  # keep track of sequences for each sample
         per_sample_aux: list[dict[str, Any]] = []
@@ -803,7 +1099,17 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
             sched_gamma_max = sched["gamma_max"]
             sched_cfg = None if sched["type"] == "constant" else sched
             desc = f"schedule={sched_label}"
-            for _ in tqdm(range(num_seqs_per_pdb), desc=f"Sampling sequences ({desc})", leave=False):
+            if precomputed_temperature_schedule_trace is None:
+                shared_temperature_schedule = None
+            else:
+                shared_temperature_schedule = (
+                    precomputed_temperature_schedule_trace.temperatures.detach()
+                )
+            for sequence_index in tqdm(
+                range(num_seqs_per_pdb),
+                desc=f"Sampling sequences ({desc})",
+                leave=False,
+            ):
 
                 sample_kwargs = dict(
                     S=S_init,
@@ -812,11 +1118,23 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
                     num_sweeps=potts_sweeps,
                     penalty_func=penalty_func,
                     proposal=potts_proposal,
+                    dlmc_dt=dlmc_dt,
                     rejection_step=rejection_step,
                     verbose=False,
                     edge_idx_coloring=edge_idx_coloring,
                     mask_ij_coloring=mask_ij_coloring,
                 )
+                if use_temperature_schedule:
+                    sample_kwargs.update(
+                        temperature_init=float(
+                            temperature_schedule_cfg.get("start_temperature", 1.0)
+                        ),
+                        temperature_schedule_cfg=temperature_schedule_cfg,
+                        temperature_schedule_override=shared_temperature_schedule,
+                        return_temperature_schedule=(
+                            shared_temperature_schedule is None
+                        ),
+                    )
                 if use_guidance:
                     sample_kwargs.update(
                         h_uncond=potts_decoder_aux_negative["h"],
@@ -825,7 +1143,11 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
                         gamma=sched_gamma_max,
                         gamma_schedule_cfg=sched_cfg,
                     )
-                S_sample, U_sample = self.elix_mpnn.decoder_S_potts.sample(
+                if local_mixture is not None:
+                    sample_kwargs["local_mixture"] = local_mixture
+                    if local_mixture.mixing_scheme == "pcebm":
+                        sample_kwargs["return_mixing_diagnostics"] = True
+                sample_output = self.elix_mpnn.decoder_S_potts.sample(
                     potts_decoder_aux["h"],
                     potts_decoder_aux["J"],
                     potts_decoder_aux["edge_idx"],
@@ -833,6 +1155,28 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
                     potts_decoder_aux["mask_ij"],
                     **sample_kwargs,
                 )
+                temperature_schedule_trace = (
+                    precomputed_temperature_schedule_trace
+                    if sequence_index == 0
+                    else None
+                )
+                mixing_diagnostics = None
+                if use_temperature_schedule and shared_temperature_schedule is None:
+                    (
+                        S_sample,
+                        U_sample,
+                        temperature_schedule_trace,
+                    ) = sample_output
+                    shared_temperature_schedule = (
+                        temperature_schedule_trace.temperatures.detach()
+                    )
+                elif (
+                    local_mixture is not None
+                    and local_mixture.mixing_scheme == "pcebm"
+                ):
+                    S_sample, U_sample, mixing_diagnostics = sample_output
+                else:
+                    S_sample, U_sample = sample_output
 
                 # Set all tokens that don't exist in the graph to unknown
                 S_sample = self._set_non_protein_tokens(S_sample, batch)
@@ -871,6 +1215,48 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
                     "U_negative_pocket_per_res": energies["U_uncond_pocket_per_res"],
                     **{key: energies[key] for key in energy_keys},
                 }
+                if use_temperature_schedule:
+                    sample_entry["temperature_schedule_trace"] = (
+                        temperature_schedule_trace
+                    )
+                if local_mixture is not None:
+                    sample_entry["transition_mixing_scheme"] = (
+                        local_mixture.mixing_scheme
+                    )
+                    if local_mixture.alpha is not None:
+                        alpha = local_mixture.alpha[..., 0]
+                        alpha_mask = batch["protein_residue_node_mask"].bool()
+                        alpha_count = alpha_mask.sum(dim=-1).clamp(min=1)
+                        sample_entry.update(
+                            transition_alpha_min=torch.where(
+                                alpha_mask,
+                                alpha,
+                                torch.full_like(alpha, torch.inf),
+                            ).min(dim=-1).values.detach().cpu(),
+                            transition_alpha_max=torch.where(
+                                alpha_mask,
+                                alpha,
+                                torch.full_like(alpha, -torch.inf),
+                            ).max(dim=-1).values.detach().cpu(),
+                            transition_alpha_mean=(
+                                (alpha * alpha_mask).sum(dim=-1) / alpha_count
+                            ).detach().cpu(),
+                        )
+                    if mixing_diagnostics is not None:
+                        sample_entry.update(
+                            transition_lambda_pocket_final=(
+                                mixing_diagnostics.lambda_pocket_final.cpu()
+                            ),
+                            transition_lambda_pocket_min=(
+                                mixing_diagnostics.lambda_pocket_min.cpu()
+                            ),
+                            transition_lambda_pocket_max=(
+                                mixing_diagnostics.lambda_pocket_max.cpu()
+                            ),
+                            transition_lambda_pocket_mean=(
+                                mixing_diagnostics.lambda_pocket_mean.cpu()
+                            ),
+                        )
                 per_sample_aux.append(sample_entry)
                 S.append(S_sample.cpu())
 
@@ -994,7 +1380,13 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
 
                 example_id = batch["example_id"][bi]
                 atom_array = atom_arrays[bi]
-                seq_cond_mask = batch["seq_cond_mask"][bi][token_pad_mask]
+                # ``seq_cond_mask`` may have been cleared for model-only
+                # conditioning.  Output threading must preserve the original
+                # fixed-position contract used by the Potts sampler.
+                seq_cond_mask = batch.get(
+                    "seq_cond_mask_potts",
+                    batch["seq_cond_mask"],
+                )[bi][token_pad_mask]
                 atom_cond_mask = batch["atom_cond_mask"][bi][atom_pad_mask]
                 atom_resolved_mask = batch["atom_resolved_mask"][bi][atom_pad_mask]
 
@@ -1036,7 +1428,12 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
                         sample_aux["gamma"] = aux_si["gamma"]  # scalar or None
                     if "guidance_scale" in aux_si:
                         sample_aux["guidance_scale"] = aux_si["guidance_scale"]  # scalar or None
-                    for key in ("guidance_mode", "positive_branch_label", "negative_branch_label"):
+                    for key in (
+                        "guidance_mode",
+                        "positive_branch_label",
+                        "negative_branch_label",
+                        "transition_mixing_scheme",
+                    ):
                         if key in aux_si:
                             sample_aux[key] = aux_si[key]
                     if "schedule_label" in aux_si:
@@ -1059,9 +1456,21 @@ class ElixMPNNDenoiser(BaseSeqDenoiser):
                         "U_cond_pocket_per_res",
                         "U_uncond_pocket_per_res",
                         "N_pocket",
+                        "transition_alpha_min",
+                        "transition_alpha_max",
+                        "transition_alpha_mean",
+                        "transition_lambda_pocket_final",
+                        "transition_lambda_pocket_min",
+                        "transition_lambda_pocket_max",
+                        "transition_lambda_pocket_mean",
                     ):
                         if key in aux_si:
                             sample_aux[key] = _extract_scalar(aux_si.get(key), bi)
+                    temperature_trace = aux_si.get("temperature_schedule_trace")
+                    if temperature_trace is not None:
+                        sample_aux["temperature_schedule_trace"] = (
+                            temperature_trace.batch_dict(bi)
+                        )
                 else:
                     sample_aux["U"] = float("nan")
                 id_to_aux[example_id].append(sample_aux)
@@ -1154,7 +1563,12 @@ def _aggregate_potts_params(potts_decoder_aux: dict[str, TensorType["b ..."]],
     if reduce not in {"sum", "mean", "sqrt", "weighted_mean"}:
         raise ValueError(f"Unknown Potts aggregation reduce: {reduce!r}")
 
-    h, J, edge_idx, mask_i, mask_ij = potts_decoder_aux["h"], potts_decoder_aux["J"], potts_decoder_aux["edge_idx"], potts_decoder_aux["mask_i"], potts_decoder_aux["mask_ij"]
+    h = potts_decoder_aux["h"]
+    J = potts_decoder_aux["J"]
+    edge_idx = potts_decoder_aux["edge_idx"]
+    mask_i = potts_decoder_aux["mask_i"]
+    mask_ij = potts_decoder_aux["mask_ij"]
+    coupling_mask = potts_decoder_aux["coupling_mask"]
     inverse, unique_ids = tied_sampling_inputs["inverse"], tied_sampling_inputs["unique_ids"]
     B = h.shape[0]
 
@@ -1192,6 +1606,7 @@ def _aggregate_potts_params(potts_decoder_aux: dict[str, TensorType["b ..."]],
     _, N, K = edge_idx.shape
     C = J.shape[-1]
     edge_counts = mask_ij.new_zeros(n_grp, N, N)
+    coupling_counts = coupling_mask.new_zeros(n_grp, N, N)
     J_new = J.new_zeros(n_grp, N, N, C, C)
     for bi in range(B):
         g = inverse[bi]
@@ -1199,9 +1614,22 @@ def _aggregate_potts_params(potts_decoder_aux: dict[str, TensorType["b ..."]],
 
         edge_indices_flat = (edge_idx[bi] + torch.arange(N, device=edge_idx.device)[:, None] * N).reshape(-1)
         edge_counts[g].view(-1).index_add_(0, edge_indices_flat, mask_ij[bi].view(-1))  # count number of edges between each pair of nodes
+        coupling_support = coupling_mask[bi]
+        if weights is not None:
+            coupling_support = coupling_support * (weights[bi] > 0).to(
+                dtype=coupling_support.dtype
+            )
+        coupling_counts[g].view(-1).index_add_(
+            0,
+            edge_indices_flat,
+            coupling_support.reshape(-1),
+        )
         J_new[g].view(-1, C, C).index_add_(0, edge_indices_flat, J_source.view(-1, C, C))  # add in the pairwise interactions for this graph
 
     mask_ij_new = (edge_counts > 0) * (mask_i_new[:, :, None] * mask_i_new[:, None, :])  # edge i,j is present only if both nodes are present and there exists some edge between them
+    coupling_mask_new = (coupling_counts > 0) * (
+        mask_i_new[:, :, None] * mask_i_new[:, None, :]
+    )
     edge_idx_new = torch.arange(N, device=edge_idx.device).expand(1, 1, -1).repeat(n_grp, N, 1)  # new edge indices are given in the full NxN grid
 
     if reduce == "mean":
@@ -1221,6 +1649,7 @@ def _aggregate_potts_params(potts_decoder_aux: dict[str, TensorType["b ..."]],
         "edge_idx": edge_idx_new,
         "mask_i": mask_i_new,
         "mask_ij": mask_ij_new,
+        "coupling_mask": coupling_mask_new,
     }
 
     return potts_decoder_aux_new
