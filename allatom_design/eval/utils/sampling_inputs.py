@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
@@ -131,8 +132,86 @@ def role_context_pn_unit_iids_from_sampling_row(row: pd.Series) -> list[str]:
     return parse_pn_unit_iids(row["context_pn_unit_iids"])
 
 
-def role_frame_pn_unit_iids_from_sampling_row(row: pd.Series) -> list[str]:
-    return parse_pn_unit_iids(row["frame_pn_unit_iids"])
+def normalize_pn_unit_roles(
+    roles: Mapping[str, Any],
+    *,
+    label: str = "pn_unit_roles",
+) -> dict[str, list[str]]:
+    """Normalize and validate the four orthogonal PN-unit role lists.
+
+    ``binder`` and ``context`` form the disjoint composition partition.  ``frame``
+    and ``template`` are tags on members of that partition.  Molecular-type
+    constraints (protein-only binder/frame) are validated after structure parsing,
+    where chain types are available.
+    """
+    missing = [column for column in ROLE_LIST_COLUMNS if column not in roles]
+    if missing:
+        raise ValueError(f"{label} is missing role keys {missing}")
+
+    normalized = {
+        column: parse_pn_unit_iids(roles[column])
+        for column in ROLE_LIST_COLUMNS
+    }
+    errors: list[str] = []
+    for column, values in normalized.items():
+        duplicates = [
+            value
+            for index, value in enumerate(values)
+            if value in values[:index]
+        ]
+        if duplicates:
+            errors.append(f"{column} contains duplicates {duplicates}")
+
+    binder = normalized["binder_pn_unit_iids"]
+    context = normalized["context_pn_unit_iids"]
+    frame = normalized["frame_pn_unit_iids"]
+    template = normalized["template_pn_unit_iids"]
+    if not binder:
+        errors.append("binder_pn_unit_iids is empty")
+    if not frame:
+        errors.append("frame_pn_unit_iids is empty")
+    if len(template) > 1:
+        errors.append(
+            "template_pn_unit_iids supports at most one protein PN unit; "
+            f"got {template}"
+        )
+
+    binder_context_overlap = sorted(set(binder) & set(context))
+    if binder_context_overlap:
+        errors.append(
+            "binder_pn_unit_iids and context_pn_unit_iids overlap at "
+            f"{binder_context_overlap}"
+        )
+
+    query = set(binder) | set(context)
+    frame_outside_query = [pn_unit_iid for pn_unit_iid in frame if pn_unit_iid not in query]
+    if frame_outside_query:
+        errors.append(
+            "frame_pn_unit_iids must be a subset of binder/context; outside units: "
+            f"{frame_outside_query}"
+        )
+    template_outside_query = [
+        pn_unit_iid for pn_unit_iid in template if pn_unit_iid not in query
+    ]
+    if template_outside_query:
+        errors.append(
+            "template_pn_unit_iids must be a subset of binder/context; outside units: "
+            f"{template_outside_query}"
+        )
+
+    if errors:
+        raise ValueError(f"Invalid {label}: " + "; ".join(errors))
+    return normalized
+
+
+def role_pn_unit_roles_from_sampling_row(row: pd.Series) -> dict[str, list[str]]:
+    """Return the normalized role snapshot that must survive into metric retries."""
+    if not is_role_sampling_inputs(row):
+        raise ValueError("sampling row does not use the role schema")
+    return normalize_pn_unit_roles(
+        {column: row[column] for column in ROLE_LIST_COLUMNS},
+        label="sampling_inputs role row",
+    )
 
 
 def derive_role_sample_id(
@@ -183,9 +262,17 @@ def normalize_role_sampling_inputs_df(
 
     for row_index, row in out.iterrows():
         pdb_key = _text_cell(row["pdb_key"])
-        binder_iids = list(row["binder_pn_unit_iids"])
-        context_iids = list(row["context_pn_unit_iids"])
-        frame_iids = list(row["frame_pn_unit_iids"])
+        try:
+            roles = normalize_pn_unit_roles(
+                {column: row[column] for column in ROLE_LIST_COLUMNS},
+                label=f"{label} row {row_index} ({pdb_key})",
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
+            roles = {column: list(row[column]) for column in ROLE_LIST_COLUMNS}
+        binder_iids = roles["binder_pn_unit_iids"]
+        context_iids = roles["context_pn_unit_iids"]
+        frame_iids = roles["frame_pn_unit_iids"]
         required_values = {
             "pdb_key": pdb_key,
             "binder_pn_unit_iids": binder_iids,

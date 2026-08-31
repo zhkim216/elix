@@ -8,22 +8,24 @@ task: ${model.task}
 mpnn:
   hidden_dim: 128
   k_neighbors: 32
-  num_encoder_layers: 3
-  num_decoder_layers: 3
-  use_mpnn_decoder: true
+  num_protein_encoder_layers: 3
+  num_mixing_encoder_layers: 3
+  use_mixing_encoder: true
+  mixing_encoder_input_mode: "node_add"
+  update_final_protein_encoder_edge: false
   dropout_p: 0.1
   ligand_conditioning: true
 
   # ligand conditioning options
   use_context_skip_connection: false
-  lmpnn_module:
-    # ContextModule processor, aggregator, and final residual dropout.
-    # Following the global value preserves legacy behavior unless explicitly overridden.
+  context_conditioner:
     dropout_p: ${denoiser.mpnn.dropout_p}
-    num_context_feature_processor_layers: 2
-    num_context_feature_aggregator_layers: 2
-    # Controls edge update inside ContextModule (ligand context branch).
-    context_edge_update: false
+    num_context_encoder_layers: 2
+    num_context_to_protein_layers: 2
+    update_context_edges: false
+    update_protein_context_edges: false
+    update_final_context_edge: true
+    update_final_protein_context_edge: false
 
   token_features:
     num_rbf: 16

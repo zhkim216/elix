@@ -250,6 +250,9 @@ featurizer_cfg:
 ######### Structure prediction model configuration (AF3) #########
 struct_pred_cfg:
   model_name: "af3"
+  # Role-driven mode: no template -> SS, exactly one template -> TC.
+  evaluate_structure_prediction: false
+  # Legacy forced-mode switches; leave both false when using the role-driven mode.
   evaluate_self_consistency: false
   evaluate_docking_consistency: false
   calculate_metrics_only: false
@@ -259,6 +262,7 @@ struct_pred_cfg:
     json_config:
       model_seeds: [42]
       version: 2
+      ss_preserve_residue_index_gaps: true  # (JH) fixed: gap-filled SS is opt-in.
     inference_config:
       base:
         model_dir: /scratch/users/zhkim216/model_params/af3
@@ -266,7 +270,7 @@ struct_pred_cfg:
         flash_attention_implementation: "triton"
       ss:  # Single-sequence prediction config
         overwrite: false
-        strict_input_fingerprint: false
+        strict_input_fingerprint: true
         num_recycles: 1
         num_diffusion_samples: 1
         max_templates: 0
@@ -276,7 +280,7 @@ struct_pred_cfg:
         mask_template_sequence: true
       tc:  # Template-conditioned prediction config
         overwrite: false
-        strict_input_fingerprint: false
+        strict_input_fingerprint: true
         num_recycles: 1
         num_diffusion_samples: 1
         max_templates: 1

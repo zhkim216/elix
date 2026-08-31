@@ -38,11 +38,10 @@ from allatom_design.data.transform.preprocess import AtomizeByCCDName
 # Import custom transforms and constants from custom_transforms
 from allatom_design.data.transform.bonds import AddAF3TokenBondFeatures, AddLigandBondOrderFeatures
 from allatom_design.data.transform.custom_transforms import (
-    # Constants
-    FEAT_TO_TOKEN_DIM,
-    FEAT_TO_ATOM_DIM,
     INFERENCE_ONLY_KEYS,
     # Transform classes
+    AddAtomNameFeatures,
+    AddStandardAAChiTargets,
     CheckCoordinatesAreNan,
     FeaturizeCoordsAndMasks,
     PadSDFeats,
@@ -83,6 +82,7 @@ def InferenceRoute(transform):
 def sd_featurizer(
     # Model type and inference flag
     is_inference: bool = False,
+    is_validation: bool = False,
     # Occupancy thresholds for sidechain and backbone atoms
     # occupancy_threshold_sidechain: float = 0.5,
     occupancy_threshold_protein_backbone: float = 0.8,
@@ -167,34 +167,63 @@ def sd_featurizer(
     ]
 
     # Cropping
-    cropping_transform = ConditionalRoute(
-        condition_func=lambda data: data.get("data_category"),
-                transform_map={
-                    "protein_monomer_chain": RandomRoute(
-                        transforms = [
-                            CropContiguousLikeAF3(
-                                crop_size=max_tokens,
-                                keep_uncropped_atom_array=True,
-                                max_atoms_in_crop=max_atoms,
-                            ),
-                            CropSpatialLikeAF3(
-                                crop_size=max_tokens,
-                                crop_center_cutoff_distance=crop_center_cutoff_distance,
-                                keep_uncropped_atom_array=True,
-                                max_atoms_in_crop=max_atoms,
-                            )
-                        ],
-                        probs = [1.0 - crop_spatial_p_protein_monomer_chain, crop_spatial_p_protein_monomer_chain]
-                    ),
-                    "interface": CropSpatialLikeAF3(
-                                crop_size=max_tokens,
-                                crop_center_cutoff_distance=crop_center_cutoff_distance,
-                                keep_uncropped_atom_array=True,
-                                max_atoms_in_crop=max_atoms,
-                            )
-                }
-            )
+    cropping_transform = (
+        # Downstream cleanup always removes ``crop_info``. Validation keeps the
+        # full structure, but still provides the key expected by that contract.
+        AddData({"crop_info": None})
+        if is_validation
+        else ConditionalRoute(
+            condition_func=lambda data: data.get("data_category"),
+            transform_map={
+                "protein_monomer_chain": RandomRoute(
+                    transforms=[
+                        CropContiguousLikeAF3(
+                            crop_size=max_tokens,
+                            keep_uncropped_atom_array=True,
+                            max_atoms_in_crop=max_atoms,
+                        ),
+                        CropSpatialLikeAF3(
+                            crop_size=max_tokens,
+                            crop_center_cutoff_distance=crop_center_cutoff_distance,
+                            keep_uncropped_atom_array=True,
+                            max_atoms_in_crop=max_atoms,
+                        ),
+                    ],
+                    probs=[
+                        1.0 - crop_spatial_p_protein_monomer_chain,
+                        crop_spatial_p_protein_monomer_chain,
+                    ],
+                ),
+                "interface": CropSpatialLikeAF3(
+                    crop_size=max_tokens,
+                    crop_center_cutoff_distance=crop_center_cutoff_distance,
+                    keep_uncropped_atom_array=True,
+                    max_atoms_in_crop=max_atoms,
+                ),
+            },
+        )
+    )
 
+    if is_validation:
+        structure_augmentation = CenterRandomAugmentation(
+            apply_random_augmentation=False,
+            translation_scale=translation_scale,
+        )
+        structure_noise = AddTrainingRandomNoise(
+            noise_scale=0.0,
+            asymmetric_noise=False,
+        )
+    else:
+        structure_augmentation = CenterRandomAugmentation(
+            apply_random_augmentation=apply_random_augmentation,
+            translation_scale=translation_scale,
+        )
+        structure_noise = AddTrainingRandomNoise(
+            noise_scale=training_structure_noise,
+            asymmetric_noise=asymmetric_noise,
+            protein_noise_scale=protein_noise_scale,
+            context_noise_scale=context_noise_scale,
+        )
 
 
     # Featurization
@@ -222,19 +251,15 @@ def sd_featurizer(
         AddAF3TokenBondFeatures(distance_cutoff=2.4),
         cached_rdkit_features,
         AddLigandBondOrderFeatures() if use_ligand_bond_order else Identity(),
-        TrainingRoute(CenterRandomAugmentation(apply_random_augmentation=apply_random_augmentation,
-                            translation_scale=translation_scale)),
-        TrainingRoute(AddTrainingRandomNoise(
-            noise_scale=training_structure_noise,
-            asymmetric_noise=asymmetric_noise,
-            protein_noise_scale=protein_noise_scale,
-            context_noise_scale=context_noise_scale,
-        )),
+        TrainingRoute(structure_augmentation),
+        TrainingRoute(structure_noise),
         # Handle missing atoms and tokens
         # PlaceUnresolvedTokenAtomsOnRepresentativeAtom(annotation_to_update="coord"),
         # PlaceUnresolvedTokenOnClosestResolvedTokenInSequence(annotation_to_update="coord", annotation_to_copy="coord"),
         # Add features from the atom_array
         FeaturizeCoordsAndMasks(pseudo_ligand_occupancy_threshold=pseudo_ligand_occupancy_threshold),  # JH Changed 260416
+        AddAtomNameFeatures(),
+        AddStandardAAChiTargets(),
         GetNCACOAndPseudoCBCoords(),
     ]
 
@@ -249,6 +274,39 @@ def sd_featurizer(
     ]
 
     return Compose(transforms)
+
+
+def sd_design_structure_preparer(
+    *,
+    is_inference: bool,
+    add_hydrogenbond_feature: bool,
+    remove_unresolved_tokens: bool,
+    sample_is_designed: bool,
+) -> Transform:
+    """Build the structural prefix shared by native sequence-design consumers."""
+    return Compose(
+        [
+            AddData({"is_inference": is_inference}),
+            AnnotateNonPolymerCovalentBondEndpoints()
+            if add_hydrogenbond_feature
+            else Identity(),
+            FilterToQueryPNUnits(),
+            AnnotateChainTypes(),
+            MaskResiduesWithSpecificUnresolvedAtoms(
+                chain_type_to_atom_names={
+                    aw_enums.ChainTypeInfo.PROTEINS: aw_const.PROTEIN_BACKBONE_ATOM_NAMES,
+                    aw_enums.ChainTypeInfo.NUCLEIC_ACIDS: aw_const.NUCLEIC_ACID_BACKBONE_ATOM_NAMES,
+                }
+            )
+            if not sample_is_designed
+            else Identity(),
+            RemoveUnresolvedTokens()
+            if remove_unresolved_tokens and not sample_is_designed
+            else Identity(),
+            ErrIfAllUnresolved(),
+        ]
+    )
+
 
 def sd_featurizer_for_design(
     # cropping
@@ -312,21 +370,12 @@ def sd_featurizer_for_design(
         if use_ligand_cached_rdkit_chirality or add_hydrogenbond_feature
         else Identity()
     )
-    # Featurization that must be done before cropping
-    featurization_transforms_pre_crop = [
-        AddData({"is_inference": is_inference}),
-        AnnotateNonPolymerCovalentBondEndpoints()
-        if add_hydrogenbond_feature
-        else Identity(),
-        FilterToQueryPNUnits(),
-        AnnotateChainTypes(),
-        MaskResiduesWithSpecificUnresolvedAtoms(chain_type_to_atom_names={
-            aw_enums.ChainTypeInfo.PROTEINS: aw_const.PROTEIN_BACKBONE_ATOM_NAMES, #! fixed
-            aw_enums.ChainTypeInfo.NUCLEIC_ACIDS: aw_const.NUCLEIC_ACID_BACKBONE_ATOM_NAMES, #! fixed
-        }) if not sample_is_designed else Identity(),
-        RemoveUnresolvedTokens() if remove_unresolved_tokens and not sample_is_designed else Identity(),
-        ErrIfAllUnresolved(),
-    ]
+    structure_preparer = sd_design_structure_preparer(
+        is_inference=is_inference,
+        add_hydrogenbond_feature=add_hydrogenbond_feature,
+        remove_unresolved_tokens=remove_unresolved_tokens,
+        sample_is_designed=sample_is_designed,
+    )
 
 
 
@@ -356,11 +405,13 @@ def sd_featurizer_for_design(
         cached_rdkit_features,
         AddLigandBondOrderFeatures() if use_ligand_bond_order else Identity(),
         FeaturizeCoordsAndMasks(pseudo_ligand_occupancy_threshold=pseudo_ligand_occupancy_threshold),  # JH Changed 260416
+        AddAtomNameFeatures(),
+        AddStandardAAChiTargets(),
         GetNCACOAndPseudoCBCoords(),
     ]
 
     transforms = [
-        *featurization_transforms_pre_crop,
+        structure_preparer,
         *featurization_transforms_post_crop,
         PadSDFeats(max_tokens=max_tokens, max_atoms=max_atoms),
         SubsetToKeys(keys=["example_id", "feats", *INFERENCE_ONLY_KEYS]),

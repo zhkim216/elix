@@ -33,7 +33,9 @@ from allatom_design.data.datasets.atomworks_sd.bml_context import (
 )
 from allatom_design.data.datasets.atomworks_sd.clustering import (
     GROUPING_MAXIMAL_CENTER_CLIQUE,
+    PRECOMPUTED_LIGAND_GROUP_COLUMN,
     build_interface_df_for_clustering,
+    validate_precomputed_ligand_grouping_metadata,
 )
 from allatom_design.data.datasets.atomworks_sd.selectors import (
     nucleic_acid_ligand_center_mask,
@@ -229,6 +231,9 @@ def process_train_metadata_df(
 ) -> tuple[pd.DataFrame, list]:
     BMLPolicy.from_cfg(cfg)
     metadata_df = read_parquet_with_metadata(metadata_path)
+    has_precomputed_grouping = PRECOMPUTED_LIGAND_GROUP_COLUMN in metadata_df.columns
+    if has_precomputed_grouping:
+        validate_precomputed_ligand_grouping_metadata(metadata_df, cfg)
     metadata_df = ensure_example_id_column(metadata_df)
     metadata_df = add_cluster_id_columns(metadata_df, cfg)
     metadata_df = add_derived_pn_unit_flags(metadata_df, cfg)
@@ -236,7 +241,14 @@ def process_train_metadata_df(
     metadata_df, val_cluster_ids = add_phase_split(metadata_df, cfg)
     metadata_df = metadata_df[metadata_df["phase"] == phase]
     metadata_df = apply_filters(cfg.train_filters.metadata_filter, metadata_df)
-    metadata_df = annotate_bml_context(metadata_df, cfg)
+    if has_precomputed_grouping:
+        metadata_df = ensure_bml_context_annotations(metadata_df, cfg)
+        logger.info(
+            "Using precomputed BML/context annotations from metadata column %s.",
+            PRECOMPUTED_LIGAND_GROUP_COLUMN,
+        )
+    else:
+        metadata_df = annotate_bml_context(metadata_df, cfg)
     if cfg.query_pn_unit_iids_only:
         metadata_df = filter_metadata_to_query_pn_unit_iids_only(metadata_df, cfg)
     return metadata_df, val_cluster_ids
@@ -398,6 +410,17 @@ def build_train_interface_df(
         dataset_name=dataset_name,
         cfg=cfg,
     )
+    return finalize_train_interface_df(interface_df, cfg, val_cluster_ids)
+
+
+def finalize_train_interface_df(
+    interface_df: pd.DataFrame,
+    cfg: DictConfig,
+    val_cluster_ids: list,
+) -> pd.DataFrame:
+    """Apply post-grouping validation exclusion and train interface filters."""
+
+    interface_filters = cfg.train_filters.get("interface_filter", {}) or {}
     if cfg.exclude_val_cluster and val_cluster_ids and not interface_df.empty:
         val_clusters = set(val_cluster_ids)
         before = len(interface_df)
@@ -423,6 +446,12 @@ def parse_train_dfs(
     interface_df: pd.DataFrame,
     cfg: dict | DictConfig,
 ) -> pd.DataFrame:
+    monomer_df = monomer_df.drop(
+        columns=[PRECOMPUTED_LIGAND_GROUP_COLUMN], errors="ignore"
+    )
+    interface_df = interface_df.drop(
+        columns=[PRECOMPUTED_LIGAND_GROUP_COLUMN], errors="ignore"
+    )
     chain_parser = GenericDFParser(pn_unit_iid_colnames=["q_pn_unit_iid"])
     interface_parser = GenericDFParser(pn_unit_iid_colnames=[])
 
@@ -449,13 +478,10 @@ def parse_train_dfs(
             parsed["extra_info"].pop(key, None)
         return parsed
 
-    parsed_df = pd.concat(
-        [
-            monomer_df.apply(chain_parser.parse, axis=1),
-            interface_df.apply(parse_interface_row, axis=1),
-        ],
-        axis=0,
-    )
+    parsed_parts = [monomer_df.apply(chain_parser.parse, axis=1)]
+    if not interface_df.empty:
+        parsed_parts.append(interface_df.apply(parse_interface_row, axis=1))
+    parsed_df = pd.concat(parsed_parts, axis=0)
     logger.info(
         "Final train dataset has %d monomer rows and %d interface rows.",
         len(monomer_df),

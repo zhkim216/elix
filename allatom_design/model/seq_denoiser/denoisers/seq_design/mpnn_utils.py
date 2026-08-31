@@ -1,4 +1,38 @@
 import torch
+from torch import nn
+from torch.nn import functional as F
+
+
+def factorized_triplet_linear(
+    linear: nn.Linear,
+    source_features: torch.Tensor,
+    pair_features: torch.Tensor,
+    target_features: torch.Tensor,
+) -> torch.Tensor:
+    """Apply ``linear([source, pair, target])`` without materializing concat.
+
+    The three inputs must already have broadcast-compatible leading shapes.
+    Keeping axis insertion at the caller supports both dense context pairs and
+    sparse protein-neighbor pairs without embedding topology assumptions here.
+    """
+    source_dim = source_features.shape[-1]
+    pair_dim = pair_features.shape[-1]
+    target_dim = target_features.shape[-1]
+    expected_in_features = source_dim + pair_dim + target_dim
+    if linear.in_features != expected_in_features:
+        raise ValueError(
+            "factorized triplet linear expected "
+            f"{expected_in_features} input features, got {linear.in_features}"
+        )
+
+    source_weight, pair_weight, target_weight = linear.weight.split(
+        (source_dim, pair_dim, target_dim),
+        dim=-1,
+    )
+    hidden = F.linear(pair_features, pair_weight, linear.bias)
+    hidden = hidden + F.linear(source_features, source_weight, bias=None)
+    hidden = hidden + F.linear(target_features, target_weight, bias=None)
+    return hidden
 
 #### PROTEIN-MPNN UTILS ####
 

@@ -23,6 +23,98 @@ from allatom_design.utils.checkpoint_utils import (
 logger = logging.getLogger(__name__)
 
 
+_MULTI_HEAD_LATEST_STATS = {
+    "head_exp_log_scale",
+    "field_head_exp_log_scale",
+}
+
+
+def _merge_multi_head_stats(
+    accumulated: dict[str, torch.Tensor],
+    update: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    for name, value in update.items():
+        value = value.detach().float()
+        if name in _MULTI_HEAD_LATEST_STATS or name not in accumulated:
+            accumulated[name] = value.clone()
+        else:
+            accumulated[name] = accumulated[name] + value
+    return accumulated
+
+
+def _reduce_multi_head_stats(
+    local_stats: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    if not local_stats:
+        return {}
+    names = sorted(local_stats)
+    shapes = {name: local_stats[name].shape for name in names}
+    sizes = {name: local_stats[name].numel() for name in names}
+    packed = torch.cat([local_stats[name].reshape(-1) for name in names])
+
+    world_size = 1
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(packed)
+        world_size = torch.distributed.get_world_size()
+
+    reduced = {}
+    offset = 0
+    for name in names:
+        value = packed[offset:offset + sizes[name]].view(shapes[name])
+        if name in _MULTI_HEAD_LATEST_STATS:
+            value = value / world_size
+        reduced[name] = value
+        offset += sizes[name]
+    return reduced
+
+
+def _multi_head_metrics(
+    stats: dict[str, torch.Tensor],
+    phase: str,
+) -> dict[str, torch.Tensor]:
+    metrics = {}
+    exp_log_scale = stats["head_exp_log_scale"]
+    field_exp_log_scale = stats.get("field_head_exp_log_scale")
+    h_count = stats["head_h_count"]
+    J_count = stats["head_J_count"]
+    for head_idx in range(exp_log_scale.numel()):
+        head_prefix = f"{phase}/head_{head_idx}"
+        metrics[f"{head_prefix}/exp_log_scale"] = exp_log_scale[head_idx]
+        if field_exp_log_scale is not None:
+            metrics[f"{head_prefix}/field_exp_log_scale"] = (
+                field_exp_log_scale[head_idx]
+            )
+        if h_count > 0:
+            metrics[f"{head_prefix}/gated_h_rms"] = torch.sqrt(
+                stats["head_gated_h_sq_sum"][head_idx] / h_count
+            )
+        if J_count > 0:
+            metrics[f"{head_prefix}/gated_J_rms"] = torch.sqrt(
+                stats["head_gated_J_sq_sum"][head_idx] / J_count
+            )
+
+    for gate_name in ("node_gate", "edge_gate"):
+        count_name = f"{gate_name}_count"
+        if count_name not in stats or stats[count_name] <= 0:
+            continue
+        count = stats[count_name]
+        gate_prefix = f"{phase}/{gate_name}"
+        for head_idx in range(exp_log_scale.numel()):
+            metrics[
+                f"{gate_prefix}/head_{head_idx}/mean_weight"
+            ] = stats[f"{gate_name}_weight_sum"][head_idx] / count
+            metrics[
+                f"{gate_prefix}/head_{head_idx}/argmax_fraction"
+            ] = stats[f"{gate_name}_argmax_count"][head_idx] / count
+        metrics[f"{gate_prefix}/normalized_entropy"] = (
+            stats[f"{gate_name}_entropy_sum"] / count
+        )
+        metrics[f"{gate_prefix}/tie_fraction"] = (
+            stats[f"{gate_name}_tie_count"] / count
+        )
+    return metrics
+
+
 class LitSeqDenoiser(L.LightningModule):
     def __init__(self, cfg: DictConfig):
         super().__init__()
@@ -45,6 +137,9 @@ class LitSeqDenoiser(L.LightningModule):
 
         # Set up loss
         self.loss = SDLoss(cfg.loss)
+        self._multi_head_train_stats: dict[str, torch.Tensor] = {}
+        self._multi_head_val_stats: dict[str, torch.Tensor] = {}
+        self._multi_head_last_optimizer_step = 0
         self.save_hyperparameters()
 
     def on_load_checkpoint(self, checkpoint: dict) -> None:
@@ -70,6 +165,7 @@ class LitSeqDenoiser(L.LightningModule):
         # Initialize EMA trackers at the start of training (if using phema)
         if self.use_phema:
             self.ema_tracker.reset()
+        self._multi_head_last_optimizer_step = int(self.trainer.global_step)
 
     @staticmethod
     def _pop_non_tensor_fields(batch: dict) -> dict:
@@ -93,6 +189,11 @@ class LitSeqDenoiser(L.LightningModule):
 
         loss, aux, aux_sum_count = self.loss(outputs, batch, return_aux=True)
 
+        self._accumulate_multi_head_output(
+            self._multi_head_train_stats,
+            outputs,
+        )
+
         # Logging
         self._log(batch, outputs, aux, batch_idx, phase="train", aux_sum_count=aux_sum_count)
 
@@ -103,6 +204,27 @@ class LitSeqDenoiser(L.LightningModule):
             if self.use_phema:
                 # Update EMA tracker
                 self.ema_tracker.update(t=self.trainer.global_step)
+
+        optimizer_step = int(self.trainer.global_step)
+        if optimizer_step <= self._multi_head_last_optimizer_step:
+            return
+        self._multi_head_last_optimizer_step = optimizer_step
+        log_interval = int(self.cfg.logging.log_every_n_steps)
+        if (
+            log_interval > 0
+            and optimizer_step % log_interval == 0
+            and self._multi_head_train_stats
+        ):
+            reduced_stats = _reduce_multi_head_stats(self._multi_head_train_stats)
+            self.log_dict(
+                _multi_head_metrics(reduced_stats, "train_multihead_potts"),
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+                logger=True,
+                sync_dist=False,
+            )
+            self._multi_head_train_stats = {}
 
     def on_train_epoch_end(self):
         # Report non-standard AA token violations accumulated by SDLoss
@@ -119,6 +241,52 @@ class LitSeqDenoiser(L.LightningModule):
         return self.loss._nonstd_aa_violation_count
 
     @staticmethod
+    def _multi_head_stats_from_outputs(outputs: dict | None) -> dict[str, torch.Tensor] | None:
+        if not outputs:
+            return None
+        potts_aux = outputs.get("potts_decoder_aux")
+        if not potts_aux:
+            return None
+        return potts_aux.get("multi_head_stats")
+
+    @classmethod
+    def _accumulate_multi_head_output(
+        cls,
+        accumulator: dict[str, torch.Tensor],
+        outputs: dict | None,
+    ) -> None:
+        stats = cls._multi_head_stats_from_outputs(outputs)
+        if stats is not None:
+            _merge_multi_head_stats(accumulator, stats)
+
+    def _accumulate_multi_head_validation_output(
+        self,
+        outputs: dict | None,
+    ) -> None:
+        self._accumulate_multi_head_output(self._multi_head_val_stats, outputs)
+
+    def on_validation_epoch_start(self) -> None:
+        self._multi_head_val_stats = {}
+
+    def on_validation_epoch_end(self) -> None:
+        if not self._multi_head_val_stats:
+            return
+
+        reduced_stats = _reduce_multi_head_stats(self._multi_head_val_stats)
+        metrics = _multi_head_metrics(
+            reduced_stats,
+            "val_multihead_potts",
+        )
+        self.log_dict(
+            metrics,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            logger=True,
+            sync_dist=False,
+        )
+
+    @staticmethod
     def _validation_metric_phase(metric_name: str) -> str:
         if metric_name.startswith(("seq_", "ligand_pocket_seq_")):
             return "val_seq"
@@ -128,17 +296,30 @@ class LitSeqDenoiser(L.LightningModule):
             return "val_potts"
         return "val"
 
+    def _validation_forward(self, batch: dict, **kwargs):
+        """Run validation eagerly when the training model is compiled.
+
+        Keep the static compiled training model, but use its shared-parameter
+        eager module for variable-shape validation.
+        """
+        validation_model = getattr(self.model, "_orig_mod", self.model)
+        return validation_model(batch, **kwargs)
+
 
     def validation_step(self, batch: dict[str, TensorType["b ..."]], batch_idx: int, dataloader_idx: int = 0):
         # Lightning automatically disables grads + sets model to eval mode
         phase_suffix = ""
+        validation_scn_context_ratio = self.cfg.eval.get("scn_context_ratio", 0.0)
 
         # Strip non-tensor fields once for the whole step; self._log needs
         # them back (e.g. batch["example_id"] for batch size), so restore
         # before any logging call.
         meta_fields = self._pop_non_tensor_fields(batch)
-
-        outputs = self(batch)
+        outputs = self._validation_forward(
+            batch,
+            scn_context_ratio=validation_scn_context_ratio,
+        )
+        self._accumulate_multi_head_validation_output(outputs)
         _, aux, aux_sum_count = self.loss(outputs, batch, return_aux=True)
 
         # restore non-tensor fields
@@ -155,16 +336,21 @@ class LitSeqDenoiser(L.LightningModule):
             t_seq = torch.full((B, ), fill_value=eval_t).to(self.device)
 
             meta_fields = self._pop_non_tensor_fields(batch)
-            outputs = self(batch, t=t_seq)
+            outputs = self._validation_forward(
+                batch,
+                t=t_seq,
+                scn_context_ratio=validation_scn_context_ratio,
+            )
             _, aux, aux_sum_count = self.loss(outputs, batch, eval_total = False, return_aux=True)
             batch.update(meta_fields)
 
+            key_suffix = f"_t{eval_t}"
             aux = {
                 k: v
                 for k, v in aux.items()
                 if ("seq" in k) or ("potts" in k) or ("sidechain" in k)
             }
-            self._log(batch, outputs, aux, batch_idx, phase="val", phase_suffix=phase_suffix, key_suffix=f"_t{eval_t}", aux_sum_count=aux_sum_count)
+            self._log(batch, outputs, aux, batch_idx, phase="val", phase_suffix=phase_suffix, key_suffix=key_suffix, aux_sum_count=aux_sum_count)
 
             # aggregate across timesteps
             for k, v in aux.items():

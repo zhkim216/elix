@@ -44,7 +44,6 @@ class SDLoss(nn.Module):
             self.loss_keys = {
                 "seq_loss",
                 "potts_composite_loss",
-                "potts_pseudolikelihood_loss",
                 "sidechain_chi_loss",
                 "sidechain_chi_offset_loss",
             }
@@ -52,7 +51,6 @@ class SDLoss(nn.Module):
             self.loss_keys = {
                 "seq_loss",
                 "potts_composite_loss",
-                "potts_pseudolikelihood_loss",
                 "sidechain_chi_loss",
                 "sidechain_chi_offset_loss",
             }
@@ -83,11 +81,8 @@ class SDLoss(nn.Module):
 
         if self.use_seq_pred and eval_seq:
             # compute sequence loss from sequence design module
-            if "target_restype" in outputs:
-                target_restype = outputs["target_restype"]
-            else:
-                target_restype = batch["restype"].argmax(dim=-1)
-            seq_loss_mask = outputs["protein_residue_node_mask"] * (1 - outputs["seq_cond_mask"])  # compute loss only on masked tokens. protein_residue_node_mask is already for standard AA only.                        
+            target_restype = outputs["target_restype"]
+            seq_loss_mask = outputs["sequence_target_mask"] * (1 - outputs["seq_cond_mask"])
             main_seq_loss_mask = seq_loss_mask
             pocket_mask = batch.get("token_is_ligand_pocket", None) if self.task == "lc_seq_des" else None
 
@@ -102,7 +97,7 @@ class SDLoss(nn.Module):
             # The accumulator is inspected (and zeroed) at epoch end by the
             # LightningModule.
             violation = (
-                (~outputs["protein_residue_node_mask"].bool()) & main_seq_loss_mask.bool()
+                (~outputs["sequence_target_mask"].bool()) & main_seq_loss_mask.bool()
             ).sum()
             self._nonstd_aa_violation_count = (
                 self._nonstd_aa_violation_count + violation.detach()
@@ -153,11 +148,6 @@ class SDLoss(nn.Module):
                 if self.main_potts_loss_pocket_only and self.task == "lc_seq_des" and pocket_mask is not None:
                     main_potts_seq_loss_mask = ligand_pocket_seq_loss_mask
 
-                # Composite and pseudolikelihood Potts losses are independently
-                # toggleable via loss_weights. Gating mirrors the same ``weight > 0``
-                # pattern for both so default configs (composite=1.0, pseudolikelihood=0.0)
-                # remain bit-identical while a pseudolikelihood-only run skips the
-                # composite path entirely.
                 if self.loss_weights.get("potts_composite_loss", 0.0) > 0.0:
                     potts_loss, ligand_pocket_potts_loss = potts_composite_loss(S = target_restype,
                                                                        potts_decoder_aux = potts_decoder_aux,
@@ -171,23 +161,6 @@ class SDLoss(nn.Module):
                     if self.task == "lc_seq_des" and ligand_pocket_potts_loss is not None:
                         aux_sum_count["ligand_pocket_potts_composite_loss"] = (
                             (ligand_pocket_potts_loss * has_close_ligands_f).sum().detach(),
-                            pocket_count,
-                        )
-
-                if self.loss_weights.get("potts_pseudolikelihood_loss", 0.0) > 0.0:
-                    pl_loss, pl_ligand_pocket_loss = potts_pseudolikelihood_loss(
-                        S=target_restype,
-                        potts_decoder_aux=potts_decoder_aux,
-                        label_smoothing=self.cfg.potts.label_smoothing,
-                        per_token_avg=self.cfg.potts.per_token_avg,
-                        main_seq_loss_mask=main_potts_seq_loss_mask,
-                        compute_ligand_pocket_loss=self.task == "lc_seq_des",
-                        ligand_pocket_seq_loss_mask=ligand_pocket_seq_loss_mask,
-                    )
-                    aux["potts_pseudolikelihood_loss"] = pl_loss
-                    if self.task == "lc_seq_des" and pl_ligand_pocket_loss is not None:
-                        aux_sum_count["ligand_pocket_potts_pseudolikelihood_loss"] = (
-                            (pl_ligand_pocket_loss * has_close_ligands_f).sum().detach(),
                             pocket_count,
                         )
 

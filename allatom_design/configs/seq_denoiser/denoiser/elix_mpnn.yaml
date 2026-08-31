@@ -8,23 +8,33 @@ task: ${model.task}
 mpnn:
   hidden_dim: 128
   k_neighbors: 32
-  num_encoder_layers: 3
-  num_decoder_layers: 3
-  use_mpnn_decoder: true
-  use_potts_encoding: false  # false preserves legacy AF3-width sequence logits/checkpoints.
+  num_protein_encoder_layers: 3
+  num_mixing_encoder_layers: 3
+  use_mixing_encoder: true
+  mixing_encoder_input_mode: "node_add"
+  update_final_protein_encoder_edge: false
   dropout_p: 0.1
   ligand_conditioning: true
 
   # ligand conditioning options
   use_context_skip_connection: false
-  lmpnn_module:
-    # ContextModule processor, aggregator, and final residual dropout.
-    # Following the global value preserves legacy behavior unless explicitly overridden.
+  context_conditioner:
     dropout_p: ${denoiser.mpnn.dropout_p}
-    num_context_feature_processor_layers: 2
-    num_context_feature_aggregator_layers: 2
-    # Controls edge update inside ContextModule (ligand context branch).
-    context_edge_update: false
+    num_context_encoder_layers: 2
+    num_context_to_protein_layers: 2
+    update_context_edges: false
+    update_protein_context_edges: false
+    update_final_context_edge: true
+    update_final_protein_context_edge: false
+  shared_atom_triangle:
+    hidden_dim: 128
+    edge_chunk_size: 4
+    mixing_encoder_layers: []
+
+  protein_pair_triangle:
+    hidden_dim: 128
+    target_chunk_size: 4
+    mixing_encoder_layers: []
 
   token_features:
     num_rbf: 16
@@ -43,7 +53,6 @@ mpnn:
     # Ligand atom/context features; omitted optional flags stay disabled in saved legacy configs.
     use_ligand_aromatic_atom_feature: false
     use_ligand_aromatic_edge_feature: false
-    use_ligand_chirality_tag: false
     use_ligand_f_block_features: false
     use_ligand_asinh_formal_charge: true
     use_ligand_cached_rdkit_chirality: false
@@ -59,12 +68,12 @@ mpnn:
     use_potts: true
     norm_potts_inputs: false  # LayerNorm h_V/h_E before the Potts head
     parameterization: "factor"
-    num_factors: null
     symmetric_J: true
     multi_head:
-      dim_multi_head: 128 # dimension of the multi-head factor Potts model, must be divisible by num_heads
-      reduce: "mean" # "mean", "sqrt"
+      reduce: "mean"
       num_heads: 4
+      adapter_hidden_dim: 640
+      shared_edge_dim: null
 
   sidechain_prediction:
     enabled: false
@@ -74,4 +83,5 @@ mpnn:
     dropout_p: ${denoiser.mpnn.dropout_p}
     use_node_norm: true
 
-  expansion_mode: "node_concat" # null, node_concat, node_concat_context_skip, multi_head_factor, node_concat_multi_head
+  # `null` is reserved for `caliby_concat`.
+  expansion_mode: "node_concat" # node_concat or edge_node_context_concat_multi_head_gate_nonlinear

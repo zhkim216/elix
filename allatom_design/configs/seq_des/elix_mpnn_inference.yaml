@@ -15,6 +15,7 @@ save_potts_params: false
 omit_aas: null  # exclude certain aatypes globally, e.g. ["C", "G"]. "X" is always excluded.
 
 potts_sampling_cfg:
+  allow_unk_redesign: false
   regularization: "LCP"
   potts_sweeps: 500
   potts_proposal: "dlmc"

@@ -20,6 +20,7 @@ from allatom_design.model.seq_denoiser.lit_sd_model import LitSeqDenoiser
 from allatom_design.utils.checkpoint_utils import (
     migrate_elix_feature_projection_state_dict,
     repair_state_dict,
+    select_latest_training_checkpoint,
 )
 
 
@@ -48,6 +49,22 @@ def main(cfg: DictConfig):
     """
     # Get resume checkpoint path if provided
     resume_ckpt_path = cfg.resume.ckpt_path
+    if resume_ckpt_path == "auto":
+        if not cfg.exp_name:
+            raise ValueError("resume.ckpt_path=auto requires a non-empty exp_name")
+        checkpoint_dir = Path(
+            cfg.out_dir,
+            cfg.wandb.project,
+            cfg.exp_name,
+            "checkpoints",
+        )
+        selected_checkpoint = select_latest_training_checkpoint(checkpoint_dir)
+        resume_ckpt_path = str(selected_checkpoint) if selected_checkpoint else None
+        cfg.resume.ckpt_path = resume_ckpt_path
+        if resume_ckpt_path is None:
+            print(f"No training checkpoint found in {checkpoint_dir}; starting fresh")
+        else:
+            print(f"Selected latest valid training checkpoint: {resume_ckpt_path}")
     resume_run_name = None  # Will be set if resuming
     if resume_ckpt_path is not None:
         assert Path(resume_ckpt_path).exists(), f"Resume checkpoint not found: {resume_ckpt_path}"
@@ -71,7 +88,7 @@ def main(cfg: DictConfig):
     os.environ["WANDB_CACHE_DIR"] = wandb_cache_dir
 
     # Set seeds
-    L.seed_everything(cfg.train.seed)
+    L.seed_everything(cfg.train.seed, workers=True)
     torch.backends.cudnn.deterministic = True  # nonrandom CUDNN convolution algo, maybe slower
     torch.backends.cudnn.benchmark = False  # nonrandom selection of CUDNN convolution, maybe slower
 
@@ -92,6 +109,11 @@ def main(cfg: DictConfig):
             # If none, then we are either on node rank 0 or not using DDP
             # Use resume_run_name if resuming, otherwise use exp_name (wandb will auto-generate if None)
             run_name = resume_run_name if resume_run_name else cfg.exp_name
+            wandb_init_kwargs = {}
+            wandb_run_id = cfg.wandb.get("run_id")
+            if wandb_run_id:
+                wandb_init_kwargs["id"] = wandb_run_id
+                wandb_init_kwargs["resume"] = cfg.wandb.get("resume", "allow")
             wandb.init(
                 project=cfg.wandb.project,
                 entity=cfg.wandb.wandb_id,
@@ -99,6 +121,7 @@ def main(cfg: DictConfig):
                 group=cfg.wandb.group,
                 config=cfg_dict,
                 dir=wandb_dir,
+                **wandb_init_kwargs,
             )
             os.environ["WANDB_RUN_NAME"] = wandb.run.name
 
@@ -216,6 +239,7 @@ class SamplerEpochCallback(Callback):
         dm = trainer.datamodule
         if hasattr(dm, "_train_sampler"):
             set_sampler_epoch(dm._train_sampler, trainer.current_epoch)
+
 
 def load_resume_config(cfg: DictConfig, resume_ckpt_path: str) -> DictConfig:
     """

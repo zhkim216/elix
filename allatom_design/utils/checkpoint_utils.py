@@ -1,4 +1,7 @@
 import copy
+import re
+import warnings
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -14,6 +17,21 @@ _ELIX_MPNN_CONFIG_RENAMES = (
     ("lc_atom_mpnn", "elix_mpnn"),
     ("atom_mpnn", "elix_mpnn"),
 )
+
+_STEP_TRAINING_CHECKPOINT_PATTERN = re.compile(
+    r"^sd-step(?P<step>\d+)-epoch(?P<epoch>\d+)(?:-v(?P<version>\d+))?\.ckpt$"
+)
+_EPOCH_TRAINING_CHECKPOINT_PATTERN = re.compile(
+    r"^sd-epoch(?P<epoch>\d+)(?:-v(?P<version>\d+))?\.ckpt$"
+)
+_FULL_TRAINING_CHECKPOINT_KEYS = {
+    "epoch",
+    "global_step",
+    "loops",
+    "lr_schedulers",
+    "optimizer_states",
+    "state_dict",
+}
 
 _NEW_ELIX_FEATURE_PROJECTION_KEYS = frozenset(
     {
@@ -84,6 +102,100 @@ def get_cfg_from_ckpt(
     if return_as_dict:
         return cfg_dict, ckpt
     return cfg, ckpt
+
+
+def _checkpoint_sort_key(path: Path, pattern: re.Pattern[str]) -> tuple[int, int, int]:
+    match = pattern.fullmatch(path.name)
+    if match is None:
+        return (-1, -1, path.stat().st_mtime_ns)
+    primary = int(match.groupdict().get("step") or match.group("epoch"))
+    version = int(match.groupdict().get("version") or 0)
+    return (primary, version, path.stat().st_mtime_ns)
+
+
+def _latest_valid_training_checkpoint(
+    candidates: list[Path],
+    pattern: re.Pattern[str],
+) -> tuple[Path, int] | None:
+    for candidate in sorted(
+        candidates,
+        key=lambda path: _checkpoint_sort_key(path, pattern),
+        reverse=True,
+    ):
+        try:
+            match = pattern.fullmatch(candidate.name)
+            if match is None:
+                raise ValueError("filename does not match a full-training checkpoint pattern")
+
+            checkpoint = torch.load(candidate, map_location="cpu", weights_only=False)
+            if not isinstance(checkpoint, dict):
+                raise TypeError(f"expected a checkpoint dict, got {type(checkpoint).__name__}")
+
+            missing_keys = sorted(_FULL_TRAINING_CHECKPOINT_KEYS - checkpoint.keys())
+            if missing_keys:
+                raise ValueError(f"missing full-training keys: {missing_keys}")
+
+            global_step = checkpoint["global_step"]
+            if isinstance(global_step, bool) or not isinstance(global_step, int):
+                raise TypeError(f"global_step must be an int, got {global_step!r}")
+
+            filename_step = match.groupdict().get("step")
+            if filename_step is not None and int(filename_step) != global_step:
+                raise ValueError(
+                    f"filename step {filename_step} does not match global_step {global_step}"
+                )
+        except Exception as exc:
+            warnings.warn(
+                f"Skipping invalid training checkpoint {candidate}: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            continue
+
+        return candidate, global_step
+
+    return None
+
+
+def select_latest_training_checkpoint(checkpoint_dir: str | Path) -> Path | None:
+    """Return the latest valid non-EMA checkpoint that can resume training.
+
+    Step checkpoints and the epoch checkpoint are validated as full Lightning
+    training checkpoints. Invalid newest files are skipped so an interrupted
+    write can fall back to the previous valid checkpoint. EMA and Lightning HPC
+    checkpoints are intentionally outside the accepted filename patterns.
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+    step_candidates = list(checkpoint_dir.glob("sd-step*-epoch*.ckpt"))
+    epoch_candidates = list(checkpoint_dir.glob("sd-epoch*.ckpt"))
+    if not step_candidates and not epoch_candidates:
+        return None
+
+    valid_candidates = [
+        candidate
+        for candidate in (
+            _latest_valid_training_checkpoint(
+                step_candidates,
+                _STEP_TRAINING_CHECKPOINT_PATTERN,
+            ),
+            _latest_valid_training_checkpoint(
+                epoch_candidates,
+                _EPOCH_TRAINING_CHECKPOINT_PATTERN,
+            ),
+        )
+        if candidate is not None
+    ]
+    if not valid_candidates:
+        raise RuntimeError(
+            f"No valid full-training checkpoint found in {checkpoint_dir}; "
+            "refusing to start fresh over an existing failed run"
+        )
+
+    selected_path, _ = max(
+        valid_candidates,
+        key=lambda candidate: (candidate[1], candidate[0].stat().st_mtime_ns),
+    )
+    return selected_path
 
 
 def repair_state_dict(state_dict: dict[str, Any]) -> dict[str, Any]:

@@ -1,0 +1,22 @@
+# Positive allostery: motif absent in apo state, formed when ligand binds.
+# State 0: apo — motif geometry penalized
+# State 1: holo — motif geometry enforced, ligand contact enforced
+
+num_states: 2
+
+motifs:
+  - 1prw  # PDB stem under motifs/
+
+states:
+  - []              # state 0: apo, no ligand
+  - ["ccd:OQO"]    # state 1: holo; replace with your ligand
+
+losses:
+  - type: AntiMotifLoss
+    motif: 0
+    state: 0
+  - type: MotifLoss
+    motif: 0
+    state: 1
+  - type: LigandContactLoss
+    state: 1

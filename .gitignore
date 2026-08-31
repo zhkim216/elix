@@ -5,9 +5,7 @@ out_dir
 cutlass
 
 # Codex local harness files
-.agents/
 .codex/
-AGENTS.md
 CLAUDE.md
 PLANS.md
 code_review.md
@@ -257,9 +255,7 @@ claude-code-best-practice/
 # .claude/tests/{date}/{task_name}/ — see project CLAUDE.md.
 
 # Local Codex/agent harness files
-AGENTS.md
 CLAUDE.md
 PLANS.md
 code_review.md
-.agents/
 .codex/

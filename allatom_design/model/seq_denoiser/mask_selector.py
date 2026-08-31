@@ -52,7 +52,9 @@ class MaskSelector:
 
 
     def sample_atom_cond_mask(
-        self, batch: dict[str, TensorType["b ..."]]
+        self,
+        batch: dict[str, TensorType["b ..."]],
+        scn_context_ratio: float | None = None,
     ) -> tuple[TensorType["b n_atoms", float], TensorType["b n_tokens", float], TensorType["b n_tokens", float]]:
         """
         Create atom-level conditioning and sidechain-context masks.
@@ -83,14 +85,34 @@ class MaskSelector:
         token_eligible = standard_aa_prot_token_mask * (token_has_sidechain > 0).float()
 
         # --- Select scn_context_ratio fraction from eligible tokens ---
-        target_count = (token_eligible.sum(dim=-1) * self.scn_context_ratio).long()
-        random_priority = torch.where(
-            token_eligible.bool(),
-            torch.rand_like(token_eligible),
-            torch.full_like(token_eligible, -float("inf"))
+        resolved_scn_context_ratio = float(
+            self.scn_context_ratio
+            if scn_context_ratio is None
+            else scn_context_ratio
         )
-        rank = random_priority.argsort(dim=-1, descending=True).argsort(dim=-1)
-        sidechain_context_token_mask = token_eligible * (rank < target_count.unsqueeze(-1)).float()
+        if not 0.0 <= resolved_scn_context_ratio <= 1.0:
+            raise ValueError(
+                "scn_context_ratio must be between 0.0 and 1.0, got "
+                f"{resolved_scn_context_ratio}"
+            )
+
+        if resolved_scn_context_ratio == 0.0:
+            # Validation disables sidechain-context sampling without consuming
+            # RNG, while sequence token masking remains independently active.
+            sidechain_context_token_mask = torch.zeros_like(token_eligible)
+        else:
+            target_count = (
+                token_eligible.sum(dim=-1) * resolved_scn_context_ratio
+            ).long()
+            random_priority = torch.where(
+                token_eligible.bool(),
+                torch.rand_like(token_eligible),
+                torch.full_like(token_eligible, -float("inf")),
+            )
+            rank = random_priority.argsort(dim=-1, descending=True).argsort(dim=-1)
+            sidechain_context_token_mask = token_eligible * (
+                rank < target_count.unsqueeze(-1)
+            ).float()
 
         # --- Build atom_cond_mask ---
         atomwise_sidechain_context_token_mask = (

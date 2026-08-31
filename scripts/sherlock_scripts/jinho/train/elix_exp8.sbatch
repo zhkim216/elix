@@ -9,11 +9,7 @@
 # with EXP_NAME_BASE manually.
 #SBATCH --job-name=elix_exp8
 #SBATCH -p possu
-<<<<<<< HEAD
-#SBATCH --array=4
-=======
 #SBATCH --array=0-4
->>>>>>> refs/remotes/origin/main
 #SBATCH --gres=gpu:2
 #SBATCH --mem=96G
 #SBATCH --cpus-per-task=8
@@ -62,6 +58,8 @@ CONFIGS=(
   "no_bml_context|data.query_pn_unit_iids_only=true data.bml_context.enabled=false"
   "bml_context|data.query_pn_unit_iids_only=true data.bml_context.enabled=true"
   "bml_context_crop30|data.query_pn_unit_iids_only=true data.bml_context.enabled=true data.featurizer_cfg.crop_center_cutoff_distance=30.0"
+  "bml_context_maxtok768|data.query_pn_unit_iids_only=true data.bml_context.enabled=true data.featurizer_cfg.max_tokens=768"  
+  "bml_context_dropout02|data.query_pn_unit_iids_only=true data.bml_context.enabled=true denoiser.mpnn.dropout_p=0.2"
   "bml_context_maxtok768|data.query_pn_unit_iids_only=true data.bml_context.enabled=true data.featurizer_cfg.max_tokens=768"  
   "bml_context_dropout02|data.query_pn_unit_iids_only=true data.bml_context.enabled=true denoiser.mpnn.dropout_p=0.2"
 )
@@ -124,13 +122,10 @@ python3 allatom_design/train_seq_denoiser.py \
     out_dir="${OUT_DIR}" \
     exp_name="${EXP_NAME}" \
     train.debug=false \
-<<<<<<< HEAD
     train.batch_size=16 \
     trainer.accumulate_grad_batches=1 \
-=======
     train.batch_size=8 \
     trainer.accumulate_grad_batches=2 \
->>>>>>> refs/remotes/origin/main
     train.compile.compile_model=true \
     trainer.strategy="ddp_find_unused_parameters_true" \
     denoiser.name="${DENOISER_TYPE}" \

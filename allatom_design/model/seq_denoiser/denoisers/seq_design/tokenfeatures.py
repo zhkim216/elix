@@ -9,6 +9,7 @@ from torchtyping import TensorType
 from allatom_design.data.const import PERIODIC_TABLE_FEATURES
 from allatom_design.model.seq_denoiser.denoisers.seq_design.mpnn_utils import (
     gather_edges,
+    gather_nodes,
 )
 
 
@@ -92,6 +93,9 @@ class TokenFeatures(nn.Module):
         self.num_positional_embeddings = cfg.num_positional_embeddings
 
         self.hidden_dim = cfg.hidden_dim
+        self.context_pair_hidden_dim = int(
+            cfg.get("context_pair_hidden_dim", self.hidden_dim)
+        )
 
         # Positional embeddings
         self.positional_embeddings = PositionalEncodings(self.num_positional_embeddings)
@@ -103,8 +107,15 @@ class TokenFeatures(nn.Module):
 
         # Protein graph-related parameters
         self.protein_graph_rbf_type = cfg.protein_graph_rbf_type
+        self.add_protein_local_frame_orientation = bool(
+            cfg.get("add_protein_local_frame_orientation", False)
+        )
         num_pairwise_dists = self._num_pairwise_distances_for_rbf_type(self.protein_graph_rbf_type)
         protein_graph_edge_in = self.num_positional_embeddings + self.num_rbf * num_pairwise_dists
+        if self.add_protein_local_frame_orientation:
+            # Directed source-frame direction (3) plus the flattened relative
+            # N-CA-C frame rotation (9).
+            protein_graph_edge_in += 12
         self.protein_edge_embedding = nn.Linear(protein_graph_edge_in, self.hidden_dim, bias=False)
         self.norm_protein_edges = nn.LayerNorm(self.hidden_dim)
 
@@ -112,12 +123,14 @@ class TokenFeatures(nn.Module):
         self.ligand_conditioning = cfg.ligand_conditioning
         self.use_ligand_context = cfg.get("use_ligand_context", True)
         self.ligand_atom_context_num = cfg.get("ligand_atom_context_num", 16)
+        self.build_legacy_ligand_interaction = bool(
+            cfg.get("build_legacy_ligand_interaction", True)
+        )
 
         # Ligand conditioning-related layers
         if self.ligand_conditioning:
             self.use_ligand_aromatic_atom_feature = cfg.get("use_ligand_aromatic_atom_feature", False)
             self.use_ligand_aromatic_edge_feature = cfg.get("use_ligand_aromatic_edge_feature", False)
-            self.use_ligand_chirality_tag = cfg.get("use_ligand_chirality_tag", False)
             self.use_ligand_f_block_features = cfg.get("use_ligand_f_block_features", False)
             self.use_ligand_asinh_formal_charge = cfg.get("use_ligand_asinh_formal_charge", False)
             self.use_ligand_cached_rdkit_chirality = cfg.get("use_ligand_cached_rdkit_chirality", False)
@@ -126,7 +139,6 @@ class TokenFeatures(nn.Module):
             self.add_hydrogenbond_feature = cfg.get("add_hydrogenbond_feature", False)
 
             self.ligand_atom_base_feature_dim = 147
-            self.ligand_chirality_feature_dim = 3
             self.ligand_cached_rdkit_chirality_feature_dim = 4
             self.ligand_f_block_feature_dim = 32
             self.ligand_bond_order_feature_dim = 5
@@ -138,30 +150,46 @@ class TokenFeatures(nn.Module):
                 num_prot_anchor_atoms = 5
 
             # Linear layer for atom type information embedding
-            self.type_linear = torch.nn.Linear(self.ligand_atom_base_feature_dim, 64)
+            self.type_linear = (
+                torch.nn.Linear(self.ligand_atom_base_feature_dim, 64)
+                if self.build_legacy_ligand_interaction
+                else None
+            )
             self.ligand_f_block_interaction_linear = None
-            if self.use_ligand_f_block_features:
+            if (
+                self.build_legacy_ligand_interaction
+                and self.use_ligand_f_block_features
+            ):
                 self.ligand_f_block_interaction_linear = torch.nn.Linear(
                     self.ligand_f_block_feature_dim,
                     64,
                     bias=False,
                 )
             self.ligand_asinh_formal_charge_interaction_linear = None
-            if self.use_ligand_asinh_formal_charge:
+            if (
+                self.build_legacy_ligand_interaction
+                and self.use_ligand_asinh_formal_charge
+            ):
                 self.ligand_asinh_formal_charge_interaction_linear = torch.nn.Linear(
                     1,
                     64,
                     bias=False,
                 )
             self.ligand_cached_rdkit_chirality_v2_interaction_linear = None
-            if self.use_ligand_cached_rdkit_chirality:
+            if (
+                self.build_legacy_ligand_interaction
+                and self.use_ligand_cached_rdkit_chirality
+            ):
                 self.ligand_cached_rdkit_chirality_v2_interaction_linear = torch.nn.Linear(
                     self.ligand_cached_rdkit_chirality_feature_dim,
                     64,
                     bias=False,
                 )
             self.ligand_hydrogenbond_interaction_linear = None
-            if self.add_hydrogenbond_feature:
+            if (
+                self.build_legacy_ligand_interaction
+                and self.add_hydrogenbond_feature
+            ):
                 self.ligand_hydrogenbond_interaction_linear = torch.nn.Linear(
                     3,
                     64,
@@ -172,15 +200,23 @@ class TokenFeatures(nn.Module):
             self.add_angle_features = cfg.get("add_angle_features", True)
             num_angle_features = 4 if self.add_angle_features else 0
 
-            self.node_project_down = torch.nn.Linear(
-                self.num_rbf * num_prot_anchor_atoms + 64 + num_angle_features,
-                self.hidden_dim,
-                bias=True,
+            self.node_project_down = (
+                torch.nn.Linear(
+                    self.num_rbf * num_prot_anchor_atoms + 64 + num_angle_features,
+                    self.hidden_dim,
+                    bias=True,
+                )
+                if self.build_legacy_ligand_interaction
+                else None
             )
             self.token_bond_interaction_linear = None
-            if self.use_token_bonds:
+            if self.build_legacy_ligand_interaction and self.use_token_bonds:
                 self.token_bond_interaction_linear = torch.nn.Linear(1, self.hidden_dim, bias=False)
-            self.norm_nodes = torch.nn.LayerNorm(self.hidden_dim)
+            self.norm_nodes = (
+                torch.nn.LayerNorm(self.hidden_dim)
+                if self.build_legacy_ligand_interaction
+                else None
+            )
 
             # Parameters for Ligand subgraph
             # ligand subgraph nodes
@@ -191,13 +227,6 @@ class TokenFeatures(nn.Module):
             self.ligand_aromatic_atom_linear = None
             if self.use_ligand_aromatic_atom_feature:
                 self.ligand_aromatic_atom_linear = torch.nn.Linear(1, self.hidden_dim, bias=False)
-            self.ligand_chirality_tag_linear = None
-            if self.use_ligand_chirality_tag:
-                self.ligand_chirality_tag_linear = torch.nn.Linear(
-                    self.ligand_chirality_feature_dim,
-                    self.hidden_dim,
-                    bias=False,
-                )
             self.ligand_cached_rdkit_chirality_v2_node_linear = None
             if self.use_ligand_cached_rdkit_chirality:
                 self.ligand_cached_rdkit_chirality_v2_node_linear = torch.nn.Linear(
@@ -222,22 +251,39 @@ class TokenFeatures(nn.Module):
             self.norm_y_nodes = torch.nn.LayerNorm(self.hidden_dim)
 
             # ligand subgraph edges
-            self.y_edges = torch.nn.Linear(self.num_rbf, self.hidden_dim, bias=False)
+            self.y_edges = torch.nn.Linear(
+                self.num_rbf,
+                self.context_pair_hidden_dim,
+                bias=False,
+            )
             self.ligand_aromatic_edge_linear = None
             if self.use_ligand_aromatic_edge_feature:
-                self.ligand_aromatic_edge_linear = torch.nn.Linear(1, self.hidden_dim, bias=False)
+                self.ligand_aromatic_edge_linear = torch.nn.Linear(
+                    1,
+                    self.context_pair_hidden_dim,
+                    bias=False,
+                )
             self.ligand_bond_order_linear = None
             if self.use_ligand_bond_order:
                 self.ligand_bond_order_linear = torch.nn.Linear(
                     self.ligand_bond_order_feature_dim,
-                    self.hidden_dim,
+                    self.context_pair_hidden_dim,
                     bias=False,
                 )
             self.token_bond_edge_linear = None
             if self.use_token_bonds:
-                self.token_bond_edge_linear = torch.nn.Linear(1, self.hidden_dim, bias=False)
-            self.norm_y_edges = torch.nn.LayerNorm(self.hidden_dim)
-    def forward(self, batch: dict[str, TensorType["b ..."]]):
+                self.token_bond_edge_linear = torch.nn.Linear(
+                    1,
+                    self.context_pair_hidden_dim,
+                    bias=False,
+                )
+            self.norm_y_edges = torch.nn.LayerNorm(self.context_pair_hidden_dim)
+    def forward(
+        self,
+        batch: dict[str, TensorType["b ..."]],
+        *,
+        return_context_metadata: bool = False,
+    ):
         """
         Extract token-level edge features and build KNN graph.
         """
@@ -246,15 +292,26 @@ class TokenFeatures(nn.Module):
         D_neighbors, E_idx = self._dist(X = X, mask = batch["protein_residue_node_mask"])
         E = self._embed_protein_edges(batch=batch, D_neighbors=D_neighbors, E_idx=E_idx)
 
+        context_metadata = None
         if self.ligand_conditioning:
-            V, Y_nodes, Y_edges, Y_m = self._build_ligand_context_features(batch)
+            context_features = self._build_ligand_context_features(
+                batch,
+                return_metadata=return_context_metadata,
+            )
+            if return_context_metadata:
+                V, Y_nodes, Y_edges, Y_m, context_metadata = context_features
+            else:
+                V, Y_nodes, Y_edges, Y_m = context_features
         else:
             V = None
             Y_nodes = None
             Y_edges = None
             Y_m = None
 
-        return E, E_idx, V, Y_nodes, Y_edges, Y_m, D_neighbors
+        outputs = (E, E_idx, V, Y_nodes, Y_edges, Y_m, D_neighbors)
+        if return_context_metadata:
+            return (*outputs, context_metadata)
+        return outputs
 
     @staticmethod
     def _num_pairwise_distances_for_rbf_type(rbf_type: str) -> int:
@@ -269,9 +326,101 @@ class TokenFeatures(nn.Module):
     def _embed_protein_edges(self, batch, D_neighbors, E_idx):
         RBF_backbone = self._get_protein_graph_rbf(batch=batch, D_neighbors=D_neighbors, E_idx=E_idx)
         E_positional = self._get_positional_edge_features(batch=batch, E_idx=E_idx)
-        E = torch.cat((E_positional, RBF_backbone), -1)
+        edge_features = [E_positional, RBF_backbone]
+        if self.add_protein_local_frame_orientation:
+            edge_features.append(
+                self._get_protein_local_frame_orientation(batch, E_idx)
+            )
+        E = torch.cat(edge_features, -1)
         E = self.protein_edge_embedding(E)
         return self.norm_protein_edges(E)
+
+    def _get_protein_local_frame_orientation(self, batch, E_idx):
+        """Return invariant directed PP orientation features ``[u_ij, Q_ij]``.
+
+        Each residue frame uses ``CA`` as origin, normalized ``CA -> C`` as
+        its first axis, the orthogonalized ``CA -> N`` direction as its second
+        axis, and their cross product as its third axis.  For edge ``i -> j``
+        the returned twelve scalars are
+
+        ``R_i^T normalize(CA_j - CA_i)`` and ``vec(R_i^T R_j)``.
+        """
+        n_coords = batch["noised_n_coords"]
+        ca_coords = batch["noised_ca_coords"]
+        c_coords = batch["noised_c_coords"]
+
+        first_raw = c_coords - ca_coords
+        first_norm = torch.linalg.vector_norm(
+            first_raw,
+            dim=-1,
+            keepdim=True,
+        )
+        first = F.normalize(first_raw, dim=-1)
+
+        second_seed = n_coords - ca_coords
+        second_raw = second_seed - (
+            second_seed * first
+        ).sum(dim=-1, keepdim=True) * first
+        second_norm = torch.linalg.vector_norm(
+            second_raw,
+            dim=-1,
+            keepdim=True,
+        )
+        second = F.normalize(second_raw, dim=-1)
+        third = torch.cross(first, second, dim=-1)
+        frames = torch.stack((first, second, third), dim=-1)
+
+        batch_size, num_residues, _, _ = frames.shape
+        neighbor_frames = gather_nodes(
+            frames.flatten(start_dim=-2),
+            E_idx,
+        ).reshape(batch_size, num_residues, E_idx.shape[-1], 3, 3)
+        neighbor_ca = gather_nodes(ca_coords, E_idx)
+
+        displacement = neighbor_ca - ca_coords.unsqueeze(-2)
+        displacement_norm = torch.linalg.vector_norm(
+            displacement,
+            dim=-1,
+            keepdim=True,
+        )
+        unit_displacement = F.normalize(displacement, dim=-1)
+
+        # Frames store basis vectors as columns.  Contracting their world
+        # coordinate axis therefore applies R_i^T.
+        source_direction = torch.einsum(
+            "bnca,bnkc->bnka",
+            frames,
+            unit_displacement,
+        )
+        relative_rotation = torch.einsum(
+            "bnca,bnkcd->bnkad",
+            frames,
+            neighbor_frames,
+        )
+        orientation = torch.cat(
+            (
+                source_direction,
+                relative_rotation.flatten(start_dim=-2),
+            ),
+            dim=-1,
+        )
+
+        protein_mask = batch["protein_residue_node_mask"].bool()
+        frame_valid = (
+            (first_norm.squeeze(-1) > 1e-6)
+            & (second_norm.squeeze(-1) > 1e-6)
+            & protein_mask
+        )
+        neighbor_frame_valid = gather_nodes(
+            frame_valid.unsqueeze(-1),
+            E_idx,
+        ).squeeze(-1)
+        edge_valid = (
+            frame_valid.unsqueeze(-1)
+            & neighbor_frame_valid
+            & (displacement_norm.squeeze(-1) > 1e-6)
+        )
+        return orientation * edge_valid.unsqueeze(-1).to(orientation.dtype)
 
     def _get_protein_graph_rbf(self, batch, D_neighbors, E_idx):
         if self.protein_graph_rbf_type == "ca":
@@ -292,7 +441,7 @@ class TokenFeatures(nn.Module):
         E_chains = gather_edges(same_chain[:, :, :, None], E_idx)[:, :, :, 0]
         return self.positional_embeddings(offset.long(), E_chains)
 
-    def _build_ligand_context_features(self, batch):
+    def _build_ligand_context_features(self, batch, *, return_metadata=False):
         B, N = batch["token_pad_mask"].shape
         device = batch["coords"].device
 
@@ -344,14 +493,16 @@ class TokenFeatures(nn.Module):
             Y_m=Y_m,
             protein_residue_node_mask=protein_residue_node_mask,
         )
-        V = self._embed_ligand_interaction_features(
-            Y=Y,
-            Y_t_embedded=Y_t_embedded,
-            Y_f_block_features=Y_f_block_features,
-            Y_atom_features=Y_atom_features,
-            Y_token_bond_interactions=Y_token_bond_interactions,
-            noised_backbone_pseudo_cb_coords=noised_backbone_pseudo_cb_coords,
-        )
+        V = None
+        if self.build_legacy_ligand_interaction:
+            V = self._embed_ligand_interaction_features(
+                Y=Y,
+                Y_t_embedded=Y_t_embedded,
+                Y_f_block_features=Y_f_block_features,
+                Y_atom_features=Y_atom_features,
+                Y_token_bond_interactions=Y_token_bond_interactions,
+                noised_backbone_pseudo_cb_coords=noised_backbone_pseudo_cb_coords,
+            )
         Y_nodes, Y_edges = self._embed_ligand_subgraph_features(
             Y=Y,
             Y_m=Y_m,
@@ -362,7 +513,108 @@ class TokenFeatures(nn.Module):
             Y_bond_order=Y_bond_order,
             Y_token_bond_edges=Y_token_bond_edges,
         )
-        return V, Y_nodes, Y_edges, Y_m
+        if not return_metadata:
+            return V, Y_nodes, Y_edges, Y_m
+
+        atom_name_chars = batch.get("atom_name_chars")
+        if atom_name_chars is None:
+            context_atom_name_chars = torch.zeros(
+                (*Y_idx.shape, 4),
+                dtype=torch.long,
+                device=Y_idx.device,
+            )
+        else:
+            context_atom_name_chars = self._gather_context_atom_axis(
+                atom_name_chars,
+                Y_idx,
+            )
+
+        molecule_class_features = []
+        for feature_name in (
+            "atom_is_protein_chain",
+            "atom_is_peptide_chain",
+            "atom_is_nucleic_acid_chain",
+            "atom_is_metal_chain",
+            "atom_is_small_molecule_chain",
+        ):
+            atom_feature = batch.get(feature_name)
+            if atom_feature is None:
+                gathered_feature = torch.zeros_like(Y_m, dtype=torch.float32)
+            else:
+                gathered_feature = self._gather_context_atom_axis(
+                    atom_feature,
+                    Y_idx,
+                ).float()
+            molecule_class_features.append(gathered_feature)
+        context_molecule_class = torch.stack(molecule_class_features, dim=-1)
+
+        context_parent_token_idx = self._gather_context_atom_axis(
+            batch["atom_to_token_map"].long(),
+            Y_idx,
+        )
+        flat_context_token_idx = context_parent_token_idx.reshape(B, -1)
+        context_asym_id = torch.gather(
+            batch["asym_id"].long(),
+            dim=1,
+            index=flat_context_token_idx,
+        ).reshape_as(context_parent_token_idx)
+
+        atom_bond_order = batch.get("atom_ligand_bond_order")
+        if atom_bond_order is None:
+            context_bond_exists = torch.zeros(
+                (*Y_idx.shape, Y_idx.shape[-1]),
+                dtype=torch.float32,
+                device=Y_idx.device,
+            )
+        else:
+            gathered_bond_order = gather_dense_pair_features(
+                atom_bond_order.long(),
+                Y_idx,
+            )
+            context_bond_exists = (
+                (gathered_bond_order >= 1) & (gathered_bond_order <= 5)
+            ).float()
+        context_pair_mask = Y_m[..., :, None] * Y_m[..., None, :]
+        context_bond_exists = context_bond_exists * context_pair_mask
+
+        context_metadata = {
+            "context_coords": Y,
+            "context_atom_idx": Y_idx,
+            "context_atom_name_chars": context_atom_name_chars,
+            "context_molecule_class": context_molecule_class,
+            "context_parent_token_idx": context_parent_token_idx,
+            "context_asym_id": context_asym_id,
+            "context_bond_exists": context_bond_exists,
+            "token_bond_interactions": Y_token_bond_interactions,
+            "backbone_anchor_coords": noised_backbone_pseudo_cb_coords,
+        }
+        return V, Y_nodes, Y_edges, Y_m, context_metadata
+
+    @staticmethod
+    def _gather_context_atom_axis(
+        atom_feature: torch.Tensor,
+        context_atom_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gather an atom-axis feature at packed local-context indices."""
+
+        batch_size = context_atom_idx.shape[0]
+        flat_idx = context_atom_idx.reshape(batch_size, -1)
+        if atom_feature.dim() == 2:
+            return torch.gather(atom_feature, 1, flat_idx).reshape_as(
+                context_atom_idx
+            )
+        if atom_feature.dim() == 3:
+            feature_dim = atom_feature.shape[-1]
+            gathered = torch.gather(
+                atom_feature,
+                1,
+                flat_idx[..., None].expand(-1, -1, feature_dim),
+            )
+            return gathered.reshape(*context_atom_idx.shape, feature_dim)
+        raise ValueError(
+            "atom_feature must have shape [B,A] or [B,A,C], got "
+            f"{tuple(atom_feature.shape)}"
+        )
 
     def _get_noised_backbone_pseudocb_coords(self, batch):
         return torch.cat(
@@ -410,10 +662,6 @@ class TokenFeatures(nn.Module):
             ligand_aromatic = batch["atom_is_aromatic"].float() * ligand_mask
             if self.use_ligand_aromatic_atom_feature:
                 ligand_atom_features["aromatic_atom"] = ligand_aromatic.unsqueeze(-1)
-        if self.use_ligand_chirality_tag:
-            ligand_chirality = batch["atom_chirality_tag"].long().clamp(min=0, max=2)
-            ligand_chirality = F.one_hot(ligand_chirality, num_classes=3).float()
-            ligand_atom_features["chirality_tag"] = ligand_chirality * ligand_mask.unsqueeze(-1)
         if self.use_ligand_cached_rdkit_chirality:
             ligand_chirality_tag = self._require_batch_feature(
                 batch,
@@ -466,7 +714,6 @@ class TokenFeatures(nn.Module):
         feature_specs = (
             ("asinh_formal_charge", self.ligand_asinh_formal_charge_linear, 1),
             ("aromatic_atom", self.ligand_aromatic_atom_linear, 1),
-            ("chirality_tag", self.ligand_chirality_tag_linear, self.ligand_chirality_feature_dim),
             (
                 "cached_rdkit_chirality",
                 self.ligand_cached_rdkit_chirality_v2_node_linear,
@@ -524,7 +771,11 @@ class TokenFeatures(nn.Module):
         Y_t_p_1hot_ = torch.nn.functional.one_hot(Y_t_p, 8)
         Y_t_1hot_ = torch.nn.functional.one_hot(Y_t, 120)
         Y_t_features = torch.cat([Y_t_1hot_, Y_t_g_1hot_, Y_t_p_1hot_], -1).float()
-        Y_t_embedded = self.type_linear(Y_t_features)
+        Y_t_embedded = (
+            self.type_linear(Y_t_features)
+            if self.type_linear is not None
+            else None
+        )
         Y_f_block_features = build_f_block_features(Y_t)
         return Y_t_features, Y_t_embedded, Y_f_block_features
 
@@ -612,8 +863,6 @@ class TokenFeatures(nn.Module):
             )
         if self.ligand_aromatic_atom_linear is not None:
             Y_nodes = Y_nodes + self.ligand_aromatic_atom_linear(Y_atom_features["aromatic_atom"].float())
-        if self.ligand_chirality_tag_linear is not None:
-            Y_nodes = Y_nodes + self.ligand_chirality_tag_linear(Y_atom_features["chirality_tag"].float())
         if self.ligand_cached_rdkit_chirality_v2_node_linear is not None:
             chirality_features = Y_atom_features["cached_rdkit_chirality"].float()
             Y_nodes = Y_nodes + (
@@ -929,17 +1178,12 @@ class TokenFeatures(nn.Module):
         L2_AB_nn = torch.gather(L2_AB, -1, nn_idx)
         D_AB_closest = torch.sqrt(L2_AB_nn[:, :, 0])
 
-        Y_r = Y.unsqueeze(1).repeat(1, CB.shape[1], 1, 1)
-        Y_t_r = Y_t.unsqueeze(1).repeat(1, CB.shape[1], 1)
-        Y_m_r = Y_m.unsqueeze(1).repeat(1, CB.shape[1], 1)
-
-        # Y_r = Y[None, :, :].repeat(CB.shape[0], 1, 1)
-        # Y_t_r = Y_t[None, :].repeat(CB.shape[0], 1)
-        # Y_m_r = Y_m[None, :].repeat(CB.shape[0], 1)
-
-        Y_tmp = torch.gather(Y_r, 2, nn_idx[:, :, :, None].repeat(1, 1, 1, 3))
-        Y_t_tmp = torch.gather(Y_t_r, 2, nn_idx)
-        Y_m_tmp = torch.gather(Y_m_r, 2, nn_idx)
+        # Gather directly from the atom axis.  Repeating the full atom tensor
+        # over every protein residue creates an avoidable [B,N,A,...] copy.
+        batch_idx = torch.arange(Y.shape[0], device=Y.device)[:, None, None]
+        Y_tmp = Y[batch_idx, nn_idx]
+        Y_t_tmp = Y_t[batch_idx, nn_idx]
+        Y_m_tmp = Y_m[batch_idx, nn_idx] * mask[:, :, None]
 
         Y = torch.zeros(
             [CB.shape[0], CB.shape[1], number_of_ligand_atoms, 3], dtype=torch.float32, device=device
@@ -972,12 +1216,11 @@ class TokenFeatures(nn.Module):
         if atom_features.dim() == 2:
             atom_features = atom_features.unsqueeze(-1)
         feature_dim = atom_features.shape[-1]
-        atom_features_r = atom_features.unsqueeze(1).repeat(1, nn_idx.shape[1], 1, 1)
-        gathered_tmp = torch.gather(
-            atom_features_r,
-            2,
-            nn_idx[:, :, :, None].repeat(1, 1, 1, feature_dim),
-        )
+        batch_idx = torch.arange(
+            atom_features.shape[0],
+            device=atom_features.device,
+        )[:, None, None]
+        gathered_tmp = atom_features[batch_idx, nn_idx]
         gathered = torch.zeros(
             [nn_idx.shape[0], nn_idx.shape[1], number_of_ligand_atoms, feature_dim],
             dtype=atom_features.dtype,

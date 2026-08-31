@@ -37,7 +37,8 @@ class SeqDenoiser(nn.Module):
 
     def forward(self,
                 batch: dict[str, TensorType["b ..."]],
-                t: TensorType["b", float] | None = None
+                t: TensorType["b", float] | None = None,
+                scn_context_ratio: float | None = None,
                 ) -> dict[str, TensorType["b ..."]]:
         outputs = {}
 
@@ -47,7 +48,10 @@ class SeqDenoiser(nn.Module):
         with torch.no_grad():
             # Sample sequence and atom conditioning masks
             batch["seq_cond_mask"] = self.mask_selector.sample_seq_cond_mask(batch, t)  # 1 if we should condition on the restype, 0 otherwise
-            batch["atom_cond_mask"], scn_token_mask, scn_atom_mask = self.mask_selector.sample_atom_cond_mask(batch)
+            batch["atom_cond_mask"], scn_token_mask, scn_atom_mask = self.mask_selector.sample_atom_cond_mask(
+                batch,
+                scn_context_ratio=scn_context_ratio,
+            )
             batch["sidechain_context_token_mask"] = scn_token_mask
             batch["sidechain_context_atom_mask"] = scn_atom_mask
             batch["seq_cond_mask"] = (batch["seq_cond_mask"] + scn_token_mask).clamp(max=1.0)
@@ -65,6 +69,9 @@ class SeqDenoiser(nn.Module):
                batch: dict[str, TensorType["b ..."]],
                sampling_inputs: dict[str, Any],
                potts_aux_provider: Callable | None = None,
+               potts_mixing_provider: Callable | None = None,
+               mixing_scaffold_batch: dict[str, TensorType["b ..."]] | None = None,
+               mixing_scaffold_sampling_inputs: dict[str, Any] | None = None,
                ) -> tuple[dict[str, list[AtomArray]], dict[str, Any]]:
 
         # Handle inference noise labels
@@ -83,6 +90,9 @@ class SeqDenoiser(nn.Module):
                 batch,
                 sampling_inputs,
                 potts_aux_provider=potts_aux_provider,
+                potts_mixing_provider=potts_mixing_provider,
+                mixing_scaffold_batch=mixing_scaffold_batch,
+                mixing_scaffold_sampling_inputs=mixing_scaffold_sampling_inputs,
             )
         else:
             raise ValueError("No sampling method specified. Set use_potts_sampling=True.")

@@ -1,9 +1,28 @@
 import json
+from functools import lru_cache
+from pathlib import Path
 
 import numpy as np
 import torch
 from biotite.structure import AtomArray
 from torchtyping import TensorType
+
+
+@lru_cache(maxsize=16)
+def _load_confidence_json_cached(
+    confidence_file_path: str,
+    mtime_ns: int,
+    size: int,
+) -> dict:
+    del mtime_ns, size
+    with open(confidence_file_path, "r") as f:
+        return json.load(f)
+
+
+def _load_confidence_json(confidence_file_path: str) -> dict:
+    path = Path(confidence_file_path)
+    stat = path.stat()
+    return _load_confidence_json_cached(str(path), stat.st_mtime_ns, stat.st_size)
 
 
 def extract_af3_confidence_metrics(confidence_file_path: str = None,
@@ -17,12 +36,10 @@ def extract_af3_confidence_metrics(confidence_file_path: str = None,
     Note: aw_parse adds unresolved residues with NaN coordinates, so atom_array may have
     more atoms than the confidence file. We filter to only valid (non-NaN) coordinates.
     """
-    with open(confidence_file_path, "r") as f:
-        confidence_data = json.load(f)
-
+    confidence_data = _load_confidence_json(confidence_file_path)
 
     if metrics_to_extract == "atom_plddts":
-        metric = torch.tensor(confidence_data["atom_plddts"], dtype=torch.float16)
+        metric = torch.tensor(confidence_data["atom_plddts"], dtype=torch.float32)
 
         # Filter out NaN coordinate atoms: aw_parse with add_missing_atoms=True
         # adds unresolved atoms with NaN coordinates that don't exist in AF3 output.

@@ -118,6 +118,7 @@ struct_pred_cfg:
     json_config:
       model_seeds: [42]
       version: 2
+      ss_preserve_residue_index_gaps: true  # (JH) fixed: gap-filled SS is opt-in.
     inference_config:
       base:
         model_dir: /scratch/users/zhkim216/model_params/af3
