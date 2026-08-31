@@ -20,8 +20,8 @@ from allatom_design.eval.benchmarking.cofolding_physics_tc_benchmark.prepared_da
     select_run_plan_rows,
     write_csv,
 )
-from allatom_design.eval.structure_prediction.inputs import prepare_af3_prediction
-from allatom_design.eval.structure_prediction.af3_runner import (
+from allatom_design.eval.structure_prediction.AF3.inputs import prepare_af3_prediction
+from allatom_design.eval.structure_prediction.AF3.af3_runner import (
     find_pred_sample_path_af3,
     run_af3_single_sequence,
     run_af3_template_conditioned,

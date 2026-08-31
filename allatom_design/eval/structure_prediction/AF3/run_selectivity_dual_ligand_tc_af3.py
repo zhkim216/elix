@@ -12,18 +12,26 @@ import yaml
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
-from allatom_design.eval.structure_prediction.af3_input_utils import (
+from allatom_design.eval.structure_prediction.AF3.af3_input_utils import (
     extract_pdb_chain_info,
     load_af3_eval_sample,
     load_sampling_inputs_csv,
     prepare_tc_template_cif,
 )
-from allatom_design.eval.structure_prediction.inputs import prepare_af3_prediction
-from allatom_design.eval.structure_prediction.af3_runner import (
+from allatom_design.eval.structure_prediction.AF3.af3_evaluation import (
+    _restore_af3_prediction_pn_unit_iids,
+    _restore_af3_prediction_protein_res_ids,
+)
+from allatom_design.eval.structure_prediction.AF3.inputs import prepare_af3_prediction
+from allatom_design.eval.structure_prediction.AF3.af3_runner import (
     find_pred_sample_path_af3,
+    inference_config_with_residue_index_by_chain,
     run_af3_template_conditioned,
 )
-from allatom_design.eval.structure_prediction.af3_json import make_af3_json
+from allatom_design.eval.structure_prediction.AF3.af3_json import (
+    build_af3_chain_id_to_pn_unit_iid,
+    make_af3_json,
+)
 from allatom_design.eval.utils.input_files import get_pdb_files
 from allatom_design.eval.run_logging import wandb_setup
 from allatom_design.eval.utils.sampling_inputs import parse_query_pn_unit_iids
@@ -424,7 +432,6 @@ def run_selectivity_dual_ligand_tc_af3(cfg: DictConfig) -> Path:
         af3_ss_input_dir=af3_ss_input_dir,
         af3_tc_input_dir=af3_tc_input_dir,
         sample_dict=sample_dict,
-        metadata=None,
         json_config=cfg.struct_pred_cfg.af3.json_config,
         make_tc_input=True,
     )
@@ -442,6 +449,10 @@ def run_selectivity_dual_ligand_tc_af3(cfg: DictConfig) -> Path:
         protein_pn_unit_iids = pdb_chain_info["protein_pn_unit_iids"]
         ligand_pn_unit_iids = pdb_chain_info["ligand_pn_unit_iids"]
         ligand_ccd_codes = pdb_chain_info["ligand_ccd_codes"]
+        af3_chain_id_to_pn_unit_iid = build_af3_chain_id_to_pn_unit_iid(
+            protein_pn_unit_iids=protein_pn_unit_iids,
+            ligand_pn_unit_iids=ligand_pn_unit_iids,
+        )
 
         for dsidx, designed_sample_id in enumerate(subsample_dict["designed_sample_id"]):
             designed_sample_atom_array = subsample_dict["designed_sample_atom_array"][dsidx]
@@ -463,11 +474,16 @@ def run_selectivity_dual_ligand_tc_af3(cfg: DictConfig) -> Path:
                 continue
 
             if not cfg.struct_pred_cfg.calculate_metrics_only:
+                job_inference_config = inference_config_with_residue_index_by_chain(
+                    cfg.struct_pred_cfg.af3.inference_config,
+                    subsample_dict["af3_tc_residue_index_by_chain"][dsidx],
+                    mode="tc",
+                )
                 run_af3_template_conditioned(
                     str(tc_json_path),
                     str(af3_tc_pred_dir),
                     runner_path=cfg.struct_pred_cfg.af3.runner_path,
-                    inference_config=cfg.struct_pred_cfg.af3.inference_config,
+                    inference_config=job_inference_config,
                 )
                 gc.collect()
 
@@ -485,9 +501,23 @@ def run_selectivity_dual_ligand_tc_af3(cfg: DictConfig) -> Path:
                     preprocess_cfg=cfg.preprocess_cfg.af3_predictions,
                     featurizer_cfg=cfg.featurizer_cfg.prepare_af3_predictions,
                 )
+                pred_atom_array = _restore_af3_prediction_pn_unit_iids(
+                    pred_example["atom_array"],
+                    af3_chain_id_to_pn_unit_iid=af3_chain_id_to_pn_unit_iid,
+                )
+                pred_atom_array = _restore_af3_prediction_protein_res_ids(
+                    pred_atom_array,
+                    designed_sample_atom_array=designed_sample_atom_array,
+                    protein_pn_unit_iids=protein_pn_unit_iids,
+                    af3_chain_id_to_pn_unit_iid=af3_chain_id_to_pn_unit_iid,
+                    json_path=tc_json_path,
+                    residue_id_layout=subsample_dict[
+                        "af3_tc_residue_id_layout"
+                    ][dsidx],
+                )
                 metric_rows.extend(
                     compute_per_ligand_docking_metric_rows(
-                        pred_atom_array=pred_example["atom_array"],
+                        pred_atom_array=pred_atom_array,
                         sample_atom_array=designed_sample_atom_array,
                         pred_sample_path=pred_tc_sample_path,
                         input_sample_id=input_sample_id,
@@ -513,7 +543,7 @@ def run_selectivity_dual_ligand_tc_af3(cfg: DictConfig) -> Path:
 
 
 @hydra.main(
-    config_path="../../configs/eval/structure_prediction",
+    config_path="../../../configs/eval/structure_prediction",
     config_name="run_tc_eval_af3",
     version_base="1.3.2",
 )

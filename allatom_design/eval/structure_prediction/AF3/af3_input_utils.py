@@ -15,7 +15,6 @@ from allatom_design.eval.utils.sampling_inputs import (
     is_role_sampling_inputs,
     resolve_query_pn_unit_iids,
 )
-from allatom_design.utils.atom_array_utils import insert_unk_residues_for_gaps_in_atom_array
 from allatom_design.utils.sample_io_utils import load_example_with_parse, save_cif_file
 
 
@@ -72,7 +71,7 @@ def prepare_tc_template_cif(
     Prepare a template CIF file for AF3 template-conditioned prediction.
 
     1. Separate protein and ligand atom arrays.
-    2. Insert UNK CA atoms for gaps in protein backbone.
+    2. Keep only observed protein residues and existing ligands.
     3. Add dummy b_factor if missing.
     4. Save to CIF and fix formal charges through the repo CIF writer.
     """
@@ -81,10 +80,11 @@ def prepare_tc_template_cif(
 
     prot_atom_array = atom_array[prot_mask]
     ligand_atom_array = atom_array[ligand_mask]
-    prot_atom_array_with_gaps = insert_unk_residues_for_gaps_in_atom_array(prot_atom_array)
-
-    tc_atom_array = prot_atom_array_with_gaps + ligand_atom_array
-    tc_atom_array.atom_id = np.arange(1, len(tc_atom_array) + 1)
+    tc_atom_array = prot_atom_array + ligand_atom_array
+    tc_atom_array.set_annotation(
+        "atom_id",
+        np.arange(1, len(tc_atom_array) + 1),
+    )
 
     if "b_factor" not in tc_atom_array.get_annotation_categories():
         tc_atom_array.set_annotation("b_factor", np.zeros(len(tc_atom_array)))

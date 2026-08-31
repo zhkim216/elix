@@ -39,6 +39,30 @@ NATIVE_REFERENCE_POCKET_DISTANCE = 10.0
 DESIGNED_REFERENCE_POCKET_DISTANCE = 12.0
 
 
+def resolve_role_aware_reference_pocket_distance(value: Any) -> float | None:
+    """Normalize an optional role-aware pocket cutoff."""
+    if value is None:
+        return None
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(
+            "reference_pocket_distance must be None or a positive finite float; "
+            f"got {value!r}"
+        )
+    try:
+        distance = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "reference_pocket_distance must be None or a positive finite float; "
+            f"got {value!r}"
+        ) from exc
+    if not np.isfinite(distance) or distance <= 0:
+        raise ValueError(
+            "reference_pocket_distance must be None or a positive finite float; "
+            f"got {value!r}"
+        )
+    return distance
+
+
 ROLE_METRIC_ID_COLUMNS = (
     "input_sample_id",
     "designed_sample_id",
@@ -70,6 +94,7 @@ ROLE_METRIC_VALUE_COLUMNS = (
     "pocket_distance",
     "aligned_path",
     "frame_ca_rmsd",
+    "frame_interface_ca_rmsd",
     "frame_matched_ca_count",
     "frame_reference_ca_count",
     "frame_designed_ca_count",
@@ -491,6 +516,7 @@ def _ligand_alignment_residue_keys(
     pn_unit_roles: Mapping[str, Sequence[str]],
     ligand_pn_unit_iid: str,
     reference_is_designed: bool,
+    reference_pocket_distance: float | None,
 ) -> tuple[list[ResidueKey], list[str], str, str | None, float | None]:
     template_iids = [str(iid) for iid in pn_unit_roles["template_pn_unit_iids"]]
     if template_iids:
@@ -516,11 +542,13 @@ def _ligand_alignment_residue_keys(
     ]
     if not receptor_iids:
         raise ValueError(f"No selected protein PN units are available around ligand {ligand_pn_unit_iid}")
-    pocket_distance = (
-        DESIGNED_REFERENCE_POCKET_DISTANCE
-        if reference_is_designed
-        else NATIVE_REFERENCE_POCKET_DISTANCE
-    )
+    pocket_distance = reference_pocket_distance
+    if pocket_distance is None:
+        pocket_distance = (
+            DESIGNED_REFERENCE_POCKET_DISTANCE
+            if reference_is_designed
+            else NATIVE_REFERENCE_POCKET_DISTANCE
+        )
     pocket_annotation_method = "calpha" if reference_is_designed else "all_atom"
     return (
         _reference_pocket_residue_keys(
@@ -540,10 +568,14 @@ def _ligand_alignment_residue_keys(
 def _pocket_aligned_path(
     pred_sample_path: str | Path,
     ligand_pn_unit_iid: str,
+    aligned_output_dir: str | Path | None = None,
 ) -> Path:
     path = Path(pred_sample_path)
     safe_iid = re.sub(r"[^A-Za-z0-9_.-]+", "_", ligand_pn_unit_iid)
-    return path.with_name(f"{path.stem}_{safe_iid}_pocket_aligned.cif")
+    filename = f"{path.stem}_{safe_iid}_pocket_aligned.cif"
+    if aligned_output_dir is None:
+        return path.with_name(filename)
+    return Path(aligned_output_dir) / filename
 
 
 def _set_status_from_plddt_error(row: dict[str, Any], plddt_error: str) -> None:
@@ -635,7 +667,9 @@ def _compute_ligand_placement_row(
     target_kind: str,
     ligand_smiles: str | None,
     reference_is_designed: bool,
+    reference_pocket_distance: float | None,
     save_aligned: bool,
+    aligned_output_dir: str | Path | None,
 ) -> dict[str, Any]:
     target = str(operation.target_pn_unit_iid)
     reference_heavy_mask = (
@@ -671,6 +705,7 @@ def _compute_ligand_placement_row(
             pn_unit_roles=pn_unit_roles,
             ligand_pn_unit_iid=target,
             reference_is_designed=reference_is_designed,
+            reference_pocket_distance=reference_pocket_distance,
         )
         match = match_reference_designed_predicted_ca(
             reference_atom_array=reference_atom_array,
@@ -684,6 +719,10 @@ def _compute_ligand_placement_row(
             match=match,
         )
         frame_metadata = _three_way_frame_metadata(match, frame_ca_rmsd)
+        if alignment_mode.endswith("_pocket_ca"):
+            frame_metadata["frame_interface_ca_rmsd"] = frame_metadata.pop(
+                "frame_ca_rmsd"
+            )
 
         if target_kind == "metal":
             reference_mask, pred_mask, _, error = _matched_metal_atom_masks(
@@ -716,7 +755,12 @@ def _compute_ligand_placement_row(
 
         aligned_path = None
         if save_aligned and pred_sample_path is not None:
-            aligned_path = _pocket_aligned_path(pred_sample_path, target)
+            aligned_path = _pocket_aligned_path(
+                pred_sample_path,
+                target,
+                aligned_output_dir=aligned_output_dir,
+            )
+            aligned_path.parent.mkdir(parents=True, exist_ok=True)
             save_cif_file(aligned_pred_atom_array, aligned_path)
         ligand_plddt, plddt_error = _plddt_or_error(
             pred_sample_path=pred_sample_path,
@@ -761,17 +805,23 @@ def compute_role_aware_metrics_atomarray(
     pn_unit_roles: Mapping[str, Any],
     reference_atom_array: AtomArray | None = None,
     reference_is_designed: bool = False,
+    reference_pocket_distance: float | None = None,
     pred_sample_path: str | Path | None = None,
     ligand_smiles_by_iid: Mapping[str, str | None] | None = None,
     save_aligned: bool = True,
+    aligned_output_dir: str | Path | None = None,
 ) -> list[dict[str, Any]]:
     """Compute role-derived protein and per-ligand placement metrics.
 
     Protein metrics use designed/predicted exact-residue CA correspondence.
     Every non-protein target gets an independent reference-defined alignment:
     full template-chain CA when a template role exists, otherwise a 10 A native
-    all-atom pocket or 12 A designed-reference CA pocket.
+    all-atom pocket or 12 A designed-reference CA pocket. A positive finite
+    ``reference_pocket_distance`` overrides those non-template defaults.
     """
+    reference_pocket_distance = resolve_role_aware_reference_pocket_distance(
+        reference_pocket_distance
+    )
     roles = normalize_pn_unit_roles(pn_unit_roles)
     operations = build_role_metric_plan(roles)
     if reference_atom_array is None:
@@ -1011,7 +1061,9 @@ def compute_role_aware_metrics_atomarray(
                 target_kind=sample_kind,
                 ligand_smiles=(ligand_smiles_by_iid or {}).get(target),
                 reference_is_designed=reference_is_designed,
+                reference_pocket_distance=reference_pocket_distance,
                 save_aligned=save_aligned,
+                aligned_output_dir=aligned_output_dir,
             )
         )
     return rows

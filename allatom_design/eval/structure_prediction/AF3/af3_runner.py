@@ -340,6 +340,19 @@ def _af3_overwrite_enabled(mode_config: dict | DictConfig | None) -> bool:
     return config_value_as_bool(get_config_value(mode_config, "overwrite", False))
 
 
+def _af3_existing_output_policy(mode_config: dict | DictConfig | None) -> str:
+    # (JH) fixed: callers may preserve a stale attempt instead of deleting it.
+    policy = str(
+        get_config_value(mode_config, "existing_output_policy", "replace_incomplete")
+    )
+    if policy not in {"replace_incomplete", "error"}:
+        raise ValueError(
+            "existing_output_policy must be 'replace_incomplete' or 'error'; "
+            f"got {policy!r}"
+        )
+    return policy
+
+
 def _residue_index_by_chain(
     mode_config: dict | DictConfig | None,
 ) -> dict[str, tuple[int, ...]] | None:
@@ -380,16 +393,21 @@ def _residue_index_by_chain(
 def inference_config_with_residue_index_by_chain(
     inference_config: dict | DictConfig,
     residue_index_by_chain: Mapping[str, Sequence[int]] | None,
+    *,
+    mode: str = "ss",
 ) -> DictConfig:
-    """Clone an AF3 config and attach one SS job's sparse residue indices."""
+    """Clone an AF3 config and attach one job's sparse residue indices."""
+    if mode not in {"ss", "tc"}:
+        raise ValueError(f"Unsupported AF3 mode: {mode!r}")
     config = OmegaConf.create(
         OmegaConf.to_container(inference_config, resolve=True)
         if isinstance(inference_config, DictConfig)
         else inference_config
     )
     if not residue_index_by_chain:
-        if OmegaConf.select(config, "ss.residue_index_by_chain", default=None) is not None:
-            OmegaConf.update(config, "ss.residue_index_by_chain", None)
+        mapping_key = f"{mode}.residue_index_by_chain"
+        if OmegaConf.select(config, mapping_key, default=None) is not None:
+            OmegaConf.update(config, mapping_key, None)
         return config
 
     validated = _residue_index_by_chain(
@@ -399,9 +417,10 @@ def inference_config_with_residue_index_by_chain(
     # (JH) fixed: isolate the per-job sparse mapping from the shared base config.
     OmegaConf.update(
         config,
-        "ss.residue_index_by_chain",
+        f"{mode}.residue_index_by_chain",
         {chain_id: list(indices) for chain_id, indices in validated.items()},
         force_add=True,
+        merge=False,
     )
     return config
 
@@ -500,29 +519,6 @@ class _ResidueIndexOverrideModelRunner:
         return getattr(self._model_runner, name)
 
 
-def _prepare_af3_sample_dir(
-    *,
-    json_path: str,
-    out_dir: str,
-    mode_config: dict | DictConfig | None,
-) -> bool:
-    """Return True when an existing prediction should be reused."""
-    sample_name = Path(json_path).stem
-    sample_dir = Path(out_dir) / sample_name
-    overwrite = _af3_overwrite_enabled(mode_config)
-
-    sample_cif_files = list(sample_dir.rglob("*.cif")) if sample_dir.exists() else []
-    if sample_cif_files and not overwrite:
-        print(f"AF3 prediction already exists for {sample_name}")
-        return True
-
-    if overwrite and sample_dir.exists():
-        print(f"Overwriting AF3 prediction for {sample_name}: removing {sample_dir}")
-        shutil.rmtree(sample_dir)
-
-    return False
-
-
 def _prepare_af3_prediction_run(
     *,
     json_path: str,
@@ -535,6 +531,7 @@ def _prepare_af3_prediction_run(
     prediction_dir = Path(out_dir) / sample_name
     mode_config = get_config_value(inference_config, mode, {})
     overwrite = _af3_overwrite_enabled(mode_config)
+    existing_output_policy = _af3_existing_output_policy(mode_config)
     strict_input_fingerprint = _af3_strict_input_fingerprint_enabled(mode_config)
 
     if overwrite:
@@ -561,6 +558,11 @@ def _prepare_af3_prediction_run(
         reason = "incomplete_or_surplus_predictions"
         if strict_input_fingerprint and summary["input_fingerprint_ok"] is False:
             reason = f"stale_predictions:{summary['input_fingerprint_error']}"
+        if existing_output_policy == "error":
+            raise FileExistsError(
+                f"Refusing to replace {reason} for {sample_name}: {prediction_dir}. "
+                "Use a new attempt output directory."
+            )
         print(f"Removing {reason} for {sample_name}: {prediction_dir}")
         shutil.rmtree(prediction_dir)
     return False
@@ -804,6 +806,76 @@ def _run_af3_inprocess(
     )
 
 
+def _run_af3_subprocess(
+    *,
+    json_path: str,
+    out_dir: str,
+    runner_path: str,
+    inference_config: dict | DictConfig,
+    mode: str,
+) -> None:
+    if mode not in {"ss", "tc"}:
+        raise ValueError(f"Unsupported AF3 mode: {mode!r}")
+    mode_config = get_config_value(inference_config, mode, {})
+    if _residue_index_by_chain(mode_config) is not None:
+        raise ValueError(
+            "residue_index_by_chain is supported only by in-process AF3 inference"
+        )
+    if _prepare_af3_prediction_run(
+        json_path=json_path,
+        out_dir=out_dir,
+        inference_config=inference_config,
+        mode=mode,
+    ):
+        return
+
+    base_config = get_config_value(inference_config, "base", {})
+    default_max_templates = 0 if mode == "ss" else 1
+    default_conditioning_mode = 0 if mode == "ss" else 1
+    cmd = [
+        sys.executable,
+        runner_path,
+        f"--json_path={json_path}",
+        f"--output_dir={out_dir}",
+        f"--model_dir={get_config_value(base_config, 'model_dir', None)}",
+        "--run_data_pipeline=True",
+        "--run_inference=True",
+        f"--db_dir={get_config_value(base_config, 'db_dir', None)}",
+        "--flash_attention_implementation="
+        f"{get_config_value(base_config, 'flash_attention_implementation', 'triton')}",
+        f"--num_recycles={get_config_value(mode_config, 'num_recycles', 3)}",
+        "--num_diffusion_samples="
+        f"{get_config_value(mode_config, 'num_diffusion_samples', 5)}",
+        "--max_templates="
+        f"{get_config_value(mode_config, 'max_templates', default_max_templates)}",
+        f"--max_template_date={_resolve_max_template_date(mode_config)}",
+        "--ligand_protein_template_conditioning_mode="
+        f"{get_config_value(mode_config, 'ligand_protein_template_conditioning_mode', default_conditioning_mode)}",
+        f"--template_pair_scale={get_config_value(mode_config, 'template_pair_scale', 1.0)}",
+    ]
+    if mode == "tc":
+        cmd.extend(
+            [
+                "--mask_template_sidechains="
+                f"{get_config_value(mode_config, 'mask_template_sidechains', True)}",
+                "--mask_template_sequence="
+                f"{get_config_value(mode_config, 'mask_template_sequence', True)}",
+            ]
+        )
+    if _af3_overwrite_enabled(mode_config):
+        cmd.append("--force_output_dir=True")
+    if _json_needs_fix_standalone_glycans(json_path, mode_config):
+        cmd.append("--fix_standalone_glycans=True")
+
+    subprocess.run(cmd, check=True, env=os.environ.copy())
+    _write_af3_input_fingerprint(
+        json_path=json_path,
+        out_dir=out_dir,
+        inference_config=inference_config,
+        mode=mode,
+    )
+
+
 def run_af3_single_sequence(
     json_path: str,
     out_dir: str,
@@ -812,46 +884,11 @@ def run_af3_single_sequence(
     use_subprocess: bool = False,
 ) -> None:
     """Run AF3 single-sequence inference."""
-    ss_config = inference_config.ss
     if use_subprocess:
-        if _residue_index_by_chain(ss_config) is not None:
-            raise ValueError(
-                "residue_index_by_chain is supported only by in-process AF3 inference"
-            )
-        if _prepare_af3_prediction_run(
+        _run_af3_subprocess(
             json_path=json_path,
             out_dir=out_dir,
-            inference_config=inference_config,
-            mode="ss",
-        ):
-            return
-
-        cmd = [
-            sys.executable,
-            runner_path,
-            f"--json_path={json_path}",
-            f"--output_dir={out_dir}",
-            f"--model_dir={inference_config.base.get('model_dir', None)}",
-            "--run_data_pipeline=True",
-            "--run_inference=True",
-            f"--db_dir={inference_config.base.get('db_dir', None)}",
-            f"--flash_attention_implementation={inference_config.base.get('flash_attention_implementation', 'triton')}",
-            f"--num_recycles={ss_config.get('num_recycles', 3)}",
-            f"--num_diffusion_samples={ss_config.get('num_diffusion_samples', 5)}",
-            f"--max_templates={ss_config.get('max_templates', 0)}",
-            f"--max_template_date={_resolve_max_template_date(ss_config)}",
-            f"--ligand_protein_template_conditioning_mode={ss_config.get('ligand_protein_template_conditioning_mode', 0)}",
-            f"--template_pair_scale={ss_config.get('template_pair_scale', 1.0)}",
-        ]
-        if _af3_overwrite_enabled(ss_config):
-            cmd.append("--force_output_dir=True")
-        if _json_needs_fix_standalone_glycans(json_path, ss_config):
-            cmd.append("--fix_standalone_glycans=True")
-        env = os.environ.copy()
-        subprocess.run(cmd, check=True, env=env)
-        _write_af3_input_fingerprint(
-            json_path=json_path,
-            out_dir=out_dir,
+            runner_path=runner_path,
             inference_config=inference_config,
             mode="ss",
         )
@@ -874,44 +911,11 @@ def run_af3_template_conditioned(
     use_subprocess: bool = False,
 ) -> None:
     """Run AF3 template-conditioned inference."""
-    tc_config = inference_config.tc
     if use_subprocess:
-        if _prepare_af3_prediction_run(
+        _run_af3_subprocess(
             json_path=json_path,
             out_dir=out_dir,
-            inference_config=inference_config,
-            mode="tc",
-        ):
-            return
-
-        cmd = [
-            sys.executable,
-            runner_path,
-            f"--json_path={json_path}",
-            f"--output_dir={out_dir}",
-            f"--model_dir={inference_config.base.get('model_dir', None)}",
-            "--run_data_pipeline=True",
-            "--run_inference=True",
-            f"--db_dir={inference_config.base.get('db_dir', None)}",
-            f"--flash_attention_implementation={inference_config.base.get('flash_attention_implementation', 'triton')}",
-            f"--num_recycles={tc_config.get('num_recycles', 3)}",
-            f"--num_diffusion_samples={tc_config.get('num_diffusion_samples', 5)}",
-            f"--max_templates={tc_config.get('max_templates', 1)}",
-            f"--ligand_protein_template_conditioning_mode={tc_config.get('ligand_protein_template_conditioning_mode', 1)}",
-            f"--mask_template_sidechains={tc_config.get('mask_template_sidechains', True)}",
-            f"--mask_template_sequence={tc_config.get('mask_template_sequence', True)}",
-            f"--template_pair_scale={tc_config.get('template_pair_scale', 1.0)}",
-            f"--max_template_date={_resolve_max_template_date(tc_config)}",
-        ]
-        if _af3_overwrite_enabled(tc_config):
-            cmd.append("--force_output_dir=True")
-        if _json_needs_fix_standalone_glycans(json_path, tc_config):
-            cmd.append("--fix_standalone_glycans=True")
-        env = os.environ.copy()
-        subprocess.run(cmd, check=True, env=env)
-        _write_af3_input_fingerprint(
-            json_path=json_path,
-            out_dir=out_dir,
+            runner_path=runner_path,
             inference_config=inference_config,
             mode="tc",
         )

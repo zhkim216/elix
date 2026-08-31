@@ -5,7 +5,7 @@ from pathlib import Path
 from omegaconf import DictConfig
 
 from allatom_design.eval.config import config_value_as_bool
-from allatom_design.eval.structure_prediction.af3_evaluation import (
+from allatom_design.eval.structure_prediction.AF3.af3_evaluation import (
     evaluate_af3_docking_consistency,
     evaluate_af3_self_consistency,
     evaluate_af3_structure_prediction,

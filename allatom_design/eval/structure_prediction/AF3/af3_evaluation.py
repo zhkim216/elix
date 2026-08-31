@@ -2,7 +2,7 @@ import gc
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import atomworks.enums as aw_enums
 import numpy as np
@@ -14,11 +14,11 @@ from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 from allatom_design.eval.config import config_value_as_bool
-from allatom_design.eval.structure_prediction.af3_json import (
+from allatom_design.eval.structure_prediction.AF3.af3_json import (
     build_af3_chain_id_to_pn_unit_iid,
     make_af3_json,
 )
-from allatom_design.eval.structure_prediction.af3_runner import (
+from allatom_design.eval.structure_prediction.AF3.af3_runner import (
     expected_prediction_count_from_json,
     inference_config_with_residue_index_by_chain,
     run_af3_single_sequence,
@@ -26,6 +26,33 @@ from allatom_design.eval.structure_prediction.af3_runner import (
     summarize_af3_prediction_outputs,
 )
 from allatom_design.eval.utils.sampling_inputs import normalize_pn_unit_roles
+
+
+ResidueIdLayout = Literal["sparse", "full_span"]
+
+
+@dataclass(frozen=True)
+class CachedAF3Prediction:
+    """Inputs needed to evaluate one existing AF3 model CIF."""
+
+    input_sample_id: str
+    designed_sample_id: str
+    prediction_id: str
+    prediction_path: Path
+    json_path: Path
+    residue_id_layout: ResidueIdLayout
+    pdb_chain_info: dict[str, Any]
+    pn_unit_roles: dict[str, Any] | None
+    af3_chain_id_to_pn_unit_iid: dict[str, str]
+
+
+@dataclass(frozen=True)
+class AF3PredictionMetrics:
+    """Role and self-consistency outcomes for one AF3 prediction."""
+
+    role_metric_rows: list[dict[str, Any]]
+    self_consistency_metrics: dict[str, Any] | None
+    self_consistency_error: str
 
 
 def _ligand_metric_values_from_chain_info(
@@ -176,6 +203,9 @@ def _compute_role_metric_rows_for_prediction(
     pred_atom_array: Any,
     pred_sample_path: str | Path,
     input_sample_is_designed: bool,
+    reference_pocket_distance: float | None,
+    save_pocket_aligned: bool = True,
+    pocket_aligned_output_dir: str | Path | None = None,
 ) -> list[dict[str, Any]]:
     pn_unit_roles = subsample_dict.get("pn_unit_roles")
     if pn_unit_roles is None:
@@ -208,10 +238,12 @@ def _compute_role_metric_rows_for_prediction(
             sample_atom_array=designed_sample_atom_array,
             reference_atom_array=reference_sample_atom_array,
             reference_is_designed=input_sample_is_designed,
+            reference_pocket_distance=reference_pocket_distance,
             pn_unit_roles=pn_unit_roles,
             pred_sample_path=pred_sample_path,
             ligand_smiles_by_iid=ligand_smiles_by_iid,
-            save_aligned=True,
+            save_aligned=save_pocket_aligned,
+            aligned_output_dir=pocket_aligned_output_dir,
         )
         if not metric_rows:
             raise RuntimeError("Role-aware metric computation returned no operation rows")
@@ -306,6 +338,8 @@ class _Af3EvaluationMode:
     input_dirname: str
     prediction_dirname: str
     json_paths_key: str
+    residue_index_by_chain_key: str
+    residue_id_layout_key: str
     csv_prefix: str
     title: str
 
@@ -316,6 +350,8 @@ _AF3_EVALUATION_MODES = {
         input_dirname="af3_ss_inputs",
         prediction_dirname="af3_ss_preds",
         json_paths_key="af3_ss_json_paths",
+        residue_index_by_chain_key="af3_ss_residue_index_by_chain",
+        residue_id_layout_key="af3_ss_residue_id_layout",
         csv_prefix="",
         title="AF3 Self-Consistency Evaluation",
     ),
@@ -324,6 +360,8 @@ _AF3_EVALUATION_MODES = {
         input_dirname="af3_tc_inputs",
         prediction_dirname="af3_tc_preds",
         json_paths_key="af3_tc_json_paths",
+        residue_index_by_chain_key="af3_tc_residue_index_by_chain",
+        residue_id_layout_key="af3_tc_residue_id_layout",
         csv_prefix="tc_",
         title="AF3 Docking Consistency Evaluation (Template-Conditioned)",
     ),
@@ -376,6 +414,70 @@ def _partition_sample_dict_by_af3_mode(sample_dict: dict) -> dict[str, dict]:
     for input_sample_id, subsample_dict, mode in resolved_modes:
         partitions[mode][input_sample_id] = subsample_dict
     return partitions
+
+
+def _af3_include_ligand(struct_pred_cfg: DictConfig | dict | None) -> bool:
+    if struct_pred_cfg is None:
+        return True
+    selectable_cfg = (
+        struct_pred_cfg
+        if isinstance(struct_pred_cfg, DictConfig)
+        else OmegaConf.create(struct_pred_cfg)
+    )
+    value = OmegaConf.select(
+        selectable_cfg,
+        "af3.include_ligand",
+        default=True,
+    )
+    return config_value_as_bool(value)
+
+
+def _sample_dict_for_af3_ligand_condition(
+    sample_dict: dict,
+    *,
+    include_ligand: bool,
+) -> dict:
+    """Return a shallow runtime view with ligand AF3 inputs/metrics disabled."""
+    if include_ligand:
+        return sample_dict
+
+    conditioned: dict = {}
+    for input_sample_id, source_entry in sample_dict.items():
+        entry = dict(source_entry)
+        source_chain_info = source_entry.get("pdb_chain_info")
+        if source_chain_info is None:
+            raise ValueError(
+                "AF3 ligand-free evaluation requires pdb_chain_info for "
+                f"{input_sample_id!r}"
+            )
+        ligand_pn_unit_iids = {
+            str(value)
+            for value in source_chain_info.get("ligand_pn_unit_iids", [])
+        }
+        chain_info = dict(source_chain_info)
+        chain_info["ligand_pn_unit_iids"] = []
+        chain_info["ligand_ccd_codes"] = []
+        if "af3_ligand_ccd_codes" in chain_info:
+            chain_info["af3_ligand_ccd_codes"] = []
+        entry["pdb_chain_info"] = chain_info
+
+        source_roles = source_entry.get("pn_unit_roles")
+        if source_roles is not None:
+            roles = normalize_pn_unit_roles(source_roles)
+            entry["pn_unit_roles"] = {
+                role_name: [
+                    pn_unit_iid
+                    for pn_unit_iid in role_pn_unit_iids
+                    if pn_unit_iid not in ligand_pn_unit_iids
+                ]
+                for role_name, role_pn_unit_iids in roles.items()
+            }
+            normalize_pn_unit_roles(
+                entry["pn_unit_roles"],
+                label=f"ligand-free pn_unit_roles for {input_sample_id}",
+            )
+        conditioned[input_sample_id] = entry
+    return conditioned
 
 
 def _run_af3_prediction_for_mode(
@@ -440,14 +542,19 @@ def _restore_af3_prediction_protein_res_ids(
     protein_pn_unit_iids: list[str],
     af3_chain_id_to_pn_unit_iid: dict[str, str],
     json_path: str | Path,
+    residue_id_layout: ResidueIdLayout,
 ) -> Any:
     """Restore source label-sequence IDs lost at the AF3 JSON boundary.
 
-    AF3 numbers each serialized protein from one. ``make_af3_json()`` emits either
-    observed residues with sparse source label IDs (the SS default), or the
-    inclusive source label-ID span for TC and explicitly requested gap-filled SS.
-    Validate the exact JSON CCD sequence, then invert the applicable writer mapping.
+    AF3 numbers each serialized protein from one. The producer explicitly records
+    whether positions represent observed residues or the inclusive source label-ID
+    span. Validate that layout and the exact JSON CCD sequence before restoring IDs.
     """
+    if residue_id_layout not in {"sparse", "full_span"}:
+        raise ValueError(
+            "residue_id_layout must be 'sparse' or 'full_span'; "
+            f"got {residue_id_layout!r}"
+        )
     required_annotations = {"pn_unit_iid", "atom_name", "res_name", "res_id"}
     for label, atom_array in (
         ("designed", designed_sample_atom_array),
@@ -527,17 +634,15 @@ def _restore_af3_prediction_protein_res_ids(
         min_res_id = int(np.min(designed_res_ids))
         max_res_id = int(np.max(designed_res_ids))
         full_span_res_ids = np.arange(min_res_id, max_res_id + 1, dtype=int)
-        # (JH) fixed: invert both the sparse default and explicit gap-filled form.
-        if len(expected_res_names) == len(designed_res_ids):
+        if residue_id_layout == "sparse":
             source_res_ids = designed_res_ids
-        elif len(expected_res_names) == len(full_span_res_ids):
-            source_res_ids = full_span_res_ids
         else:
+            source_res_ids = full_span_res_ids
+        if len(expected_res_names) != len(source_res_ids):
             raise ValueError(
-                "AF3 JSON protein length matches neither observed designed residues "
-                f"nor their source label-ID span for {pn_unit_iid}: "
-                f"json={len(expected_res_names)}, observed={len(designed_res_ids)}, "
-                f"source_span={len(full_span_res_ids)} ({min_res_id}..{max_res_id})"
+                "AF3 JSON protein length does not match residue_id_layout "
+                f"{residue_id_layout!r} for {pn_unit_iid}: "
+                f"json={len(expected_res_names)}, expected={len(source_res_ids)}"
             )
         if len(pred_residue_starts) != len(expected_res_names):
             raise ValueError(
@@ -574,6 +679,98 @@ def _restore_af3_prediction_protein_res_ids(
     return pred_atom_array
 
 
+def evaluate_cached_af3_prediction(
+    prediction: CachedAF3Prediction,
+    *,
+    designed_sample_atom_array: Any,
+    reference_sample_atom_array: Any,
+    cif_parse_cfg: DictConfig | dict[str, Any],
+    preprocess_cfg: DictConfig | dict[str, Any],
+    featurizer_cfg: DictConfig | dict[str, Any],
+    reference_is_designed: bool,
+    reference_pocket_distance: float | None,
+    save_pocket_aligned: bool = True,
+    pocket_aligned_output_dir: str | Path | None = None,
+    save_ca_aligned: bool = True,
+    compute_tmalign: bool = True,
+    save_tmaligned: bool = True,
+) -> AF3PredictionMetrics:
+    """Evaluate one existing AF3 model CIF without running AF3.
+
+    Parsing and source-identity restoration fail closed. Role-metric rows retain
+    their existing row-local error contract, while self-consistency failures are
+    returned separately so callers can persist partial metric results.
+    """
+    from allatom_design.eval.metrics import compute_self_consistency_metrics_atomarray
+    from allatom_design.eval.structure_prediction.AF3.inputs import prepare_af3_prediction
+
+    pred_example = prepare_af3_prediction(
+        pdb_path=str(prediction.prediction_path),
+        cif_parse_cfg=cif_parse_cfg,
+        preprocess_cfg=preprocess_cfg,
+        featurizer_cfg=featurizer_cfg,
+    )
+    pred_atom_array = _restore_af3_prediction_pn_unit_iids(
+        pred_example["atom_array"],
+        af3_chain_id_to_pn_unit_iid=prediction.af3_chain_id_to_pn_unit_iid,
+    )
+    protein_pn_unit_iids = [
+        str(value)
+        for value in prediction.pdb_chain_info.get("protein_pn_unit_iids", [])
+    ]
+    ligand_pn_unit_iids = [
+        str(value)
+        for value in prediction.pdb_chain_info.get("ligand_pn_unit_iids", [])
+    ]
+    pred_atom_array = _restore_af3_prediction_protein_res_ids(
+        pred_atom_array,
+        designed_sample_atom_array=designed_sample_atom_array,
+        protein_pn_unit_iids=protein_pn_unit_iids,
+        af3_chain_id_to_pn_unit_iid=prediction.af3_chain_id_to_pn_unit_iid,
+        json_path=prediction.json_path,
+        residue_id_layout=prediction.residue_id_layout,
+    )
+
+    role_metric_rows: list[dict[str, Any]] = []
+    if prediction.pn_unit_roles is not None:
+        role_metric_rows = _compute_role_metric_rows_for_prediction(
+            input_sample_id=prediction.input_sample_id,
+            designed_sample_id=prediction.designed_sample_id,
+            prediction_id=prediction.prediction_id,
+            subsample_dict={"pn_unit_roles": prediction.pn_unit_roles},
+            pdb_chain_info=prediction.pdb_chain_info,
+            reference_sample_atom_array=reference_sample_atom_array,
+            designed_sample_atom_array=designed_sample_atom_array,
+            pred_atom_array=pred_atom_array,
+            pred_sample_path=prediction.prediction_path,
+            input_sample_is_designed=reference_is_designed,
+            reference_pocket_distance=reference_pocket_distance,
+            save_pocket_aligned=save_pocket_aligned,
+            pocket_aligned_output_dir=pocket_aligned_output_dir,
+        )
+
+    self_consistency_metrics = None
+    self_consistency_error = ""
+    try:
+        self_consistency_metrics = compute_self_consistency_metrics_atomarray(
+            pred_atom_array=pred_atom_array,
+            sample_atom_array=designed_sample_atom_array,
+            pred_sample_path=prediction.prediction_path,
+            save_aligned=save_ca_aligned,
+            compute_tmalign=compute_tmalign,
+            save_tmaligned=save_tmaligned,
+            ligand_pn_unit_iids=ligand_pn_unit_iids,
+        )
+    except Exception as exc:
+        self_consistency_error = str(exc)
+
+    return AF3PredictionMetrics(
+        role_metric_rows=role_metric_rows,
+        self_consistency_metrics=self_consistency_metrics,
+        self_consistency_error=self_consistency_error,
+    )
+
+
 def _evaluate_af3_mode(
     *,
     mode: str,
@@ -589,15 +786,35 @@ def _evaluate_af3_mode(
     input_sample_is_designed: bool,
     free_atom_arrays_progressively: bool,
     enforce_require_complete_predictions: bool,
+    save_pocket_aligned: bool = True,
+    save_ca_aligned: bool = True,
+    compute_tmalign: bool = True,
+    save_tmaligned: bool = True,
 ) -> list[dict[str, Any]]:
     """Run one SS or TC batch through the shared prediction/metric lifecycle."""
     try:
         mode_spec = _AF3_EVALUATION_MODES[mode]
     except KeyError as exc:
         raise ValueError(f"Unsupported AF3 evaluation mode: {mode!r}") from exc
+    sample_dict = _sample_dict_for_af3_ligand_condition(
+        sample_dict,
+        include_ligand=_af3_include_ligand(struct_pred_cfg),
+    )
 
-    from allatom_design.eval.structure_prediction.inputs import prepare_af3_prediction
-    from allatom_design.eval.metrics import compute_self_consistency_metrics_atomarray
+    from allatom_design.eval.metrics.role_aware import (
+        resolve_role_aware_reference_pocket_distance,
+    )
+
+    role_aware_reference_pocket_distance = (
+        pocket_cfg.get("role_aware_reference_pocket_distance", None)
+        if pocket_cfg is not None
+        else None
+    )
+    role_aware_reference_pocket_distance = (
+        resolve_role_aware_reference_pocket_distance(
+            role_aware_reference_pocket_distance
+        )
+    )
 
     out_dir = Path(out_dir)
     input_dir = out_dir / mode_spec.input_dirname
@@ -619,7 +836,6 @@ def _evaluate_af3_mode(
     af3_inference_config = struct_pred_cfg.af3.inference_config
     strict_input_fingerprint = _strict_af3_input_fingerprint(struct_pred_cfg, mode)
     require_complete_predictions = _require_complete_af3_predictions(struct_pred_cfg)
-
     per_sample_sc_metrics: dict[str, dict[str, Any]] = {}
     has_any_role_metrics = any(
         subsample_dict.get("pn_unit_roles") is not None
@@ -660,21 +876,23 @@ def _evaluate_af3_mode(
             has_role_metrics = subsample_dict.get("pn_unit_roles") is not None
 
             json_path = subsample_dict[mode_spec.json_paths_key][dsidx]
-            job_inference_config = af3_inference_config
-            if mode == "ss":
-                residue_index_mappings = subsample_dict.get(
-                    "af3_ss_residue_index_by_chain"
-                )
-                residue_index_by_chain = (
-                    residue_index_mappings[dsidx]
-                    if residue_index_mappings is not None
-                    else None
-                )
-                # (JH) fixed: each generated SS JSON carries only its own mapping.
-                job_inference_config = inference_config_with_residue_index_by_chain(
-                    af3_inference_config,
-                    residue_index_by_chain,
-                )
+            try:
+                residue_index_by_chain = subsample_dict[
+                    mode_spec.residue_index_by_chain_key
+                ][dsidx]
+                residue_id_layout = subsample_dict[
+                    mode_spec.residue_id_layout_key
+                ][dsidx]
+            except (KeyError, IndexError, TypeError) as exc:
+                raise ValueError(
+                    f"AF3 {mode.upper()} job {designed_sample_id!r} is missing "
+                    "per-job residue index/layout metadata"
+                ) from exc
+            job_inference_config = inference_config_with_residue_index_by_chain(
+                af3_inference_config,
+                residue_index_by_chain,
+                mode=mode,
+            )
             n_expected_predictions = expected_prediction_count_from_json(
                 json_path,
                 job_inference_config,
@@ -747,24 +965,33 @@ def _evaluate_af3_mode(
             for pred_idx, prediction_path in enumerate(prediction_paths):
                 prediction_id = f"diffusion_{pred_idx}"
                 try:
-                    pred_example = prepare_af3_prediction(
-                        pdb_path=prediction_path,
+                    prediction_metrics = evaluate_cached_af3_prediction(
+                        CachedAF3Prediction(
+                            input_sample_id=input_sample_id,
+                            designed_sample_id=designed_sample_id,
+                            prediction_id=prediction_id,
+                            prediction_path=Path(prediction_path),
+                            json_path=Path(json_path),
+                            residue_id_layout=residue_id_layout,
+                            pdb_chain_info=pdb_chain_info,
+                            pn_unit_roles=subsample_dict.get("pn_unit_roles"),
+                            af3_chain_id_to_pn_unit_iid=(
+                                af3_chain_id_to_pn_unit_iid
+                            ),
+                        ),
+                        designed_sample_atom_array=designed_sample_atom_array,
+                        reference_sample_atom_array=reference_sample_atom_array,
                         cif_parse_cfg=cif_parse_cfg,
                         preprocess_cfg=preprocess_cfg,
                         featurizer_cfg=featurizer_cfg,
-                    )
-                    pred_atom_array = _restore_af3_prediction_pn_unit_iids(
-                        pred_example["atom_array"],
-                        af3_chain_id_to_pn_unit_iid=(
-                            af3_chain_id_to_pn_unit_iid
+                        reference_is_designed=input_sample_is_designed,
+                        reference_pocket_distance=(
+                            role_aware_reference_pocket_distance
                         ),
-                    )
-                    pred_atom_array = _restore_af3_prediction_protein_res_ids(
-                        pred_atom_array,
-                        designed_sample_atom_array=designed_sample_atom_array,
-                        protein_pn_unit_iids=protein_pn_unit_iids,
-                        af3_chain_id_to_pn_unit_iid=af3_chain_id_to_pn_unit_iid,
-                        json_path=json_path,
+                        save_pocket_aligned=save_pocket_aligned,
+                        save_ca_aligned=save_ca_aligned and mode != "tc",
+                        compute_tmalign=compute_tmalign,
+                        save_tmaligned=save_tmaligned,
                     )
                 except Exception as exc:
                     parse_error = f"prediction parse failed: {exc}"
@@ -798,18 +1025,7 @@ def _evaluate_af3_mode(
                     continue
 
                 if has_role_metrics:
-                    prediction_role_rows = _compute_role_metric_rows_for_prediction(
-                        input_sample_id=input_sample_id,
-                        designed_sample_id=designed_sample_id,
-                        prediction_id=prediction_id,
-                        subsample_dict=subsample_dict,
-                        pdb_chain_info=pdb_chain_info,
-                        reference_sample_atom_array=reference_sample_atom_array,
-                        designed_sample_atom_array=designed_sample_atom_array,
-                        pred_atom_array=pred_atom_array,
-                        pred_sample_path=prediction_path,
-                        input_sample_is_designed=input_sample_is_designed,
-                    )
+                    prediction_role_rows = prediction_metrics.role_metric_rows
                     assert role_metric_rows is not None
                     role_metric_rows.extend(prediction_role_rows)
                     _record_role_metric_status(
@@ -818,36 +1034,27 @@ def _evaluate_af3_mode(
                         prediction_role_rows=prediction_role_rows,
                     )
 
-                try:
-                    sc_kwargs = {
-                        "pred_atom_array": pred_atom_array,
-                        "sample_atom_array": designed_sample_atom_array,
-                        "pred_sample_path": prediction_path,
-                    }
-                    if mode == "tc":
-                        sc_kwargs["save_aligned"] = False
-                    per_prediction_sc_metrics = compute_self_consistency_metrics_atomarray(
-                        **sc_kwargs
-                    )
-                except Exception as exc:
+                if prediction_metrics.self_consistency_error:
+                    error = prediction_metrics.self_consistency_error
                     print(
                         f"Self-consistency metrics computation failed for "
                         f"input_sample_id={input_sample_id}, "
                         f"designed_sample_id={designed_sample_id}, "
-                        f"prediction_id={prediction_id}: {exc}"
+                        f"prediction_id={prediction_id}: {error}"
                     )
                     _append_status_error(
                         status_row,
                         "sc_errors",
-                        f"{prediction_id}: {exc}",
+                        f"{prediction_id}: {error}",
                     )
                 else:
+                    assert prediction_metrics.self_consistency_metrics is not None
                     per_sample_sc_metrics[designed_sample_id][
                         prediction_id
-                    ] = per_prediction_sc_metrics
+                    ] = prediction_metrics.self_consistency_metrics
                     status_row["n_sc_success"] += 1
 
-                del pred_example, pred_atom_array
+                del prediction_metrics
 
             _finalize_prediction_status(
                 status_row,
@@ -894,8 +1101,14 @@ def evaluate_af3_self_consistency(
     csv_suffix: str = "",
     input_sample_is_designed: bool = True,
     free_atom_arrays_progressively: bool = False,
+    save_pocket_aligned: bool = True,
+    save_ca_aligned: bool = True,
+    compute_tmalign: bool = True,
+    save_tmaligned: bool = True,
 ) -> None:
     """Compatibility adapter for forced single-sequence AF3 evaluation."""
+    # (JH) fixed: metrics-only callers can suppress aligned structure artifacts
+    # while preserving the legacy defaults for existing evaluation callers.
     _evaluate_af3_mode(
         mode="ss",
         sample_dict=sample_dict,
@@ -910,6 +1123,10 @@ def evaluate_af3_self_consistency(
         input_sample_is_designed=input_sample_is_designed,
         free_atom_arrays_progressively=free_atom_arrays_progressively,
         enforce_require_complete_predictions=True,
+        save_pocket_aligned=save_pocket_aligned,
+        save_ca_aligned=save_ca_aligned,
+        compute_tmalign=compute_tmalign,
+        save_tmaligned=save_tmaligned,
     )
 
 
