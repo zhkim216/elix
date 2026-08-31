@@ -1,0 +1,20 @@
+# Induced binding: target ligand contact switched ON by effector ligand.
+# State 0: target only — protein does NOT contact target
+# State 1: target + effector — protein DOES contact target
+
+num_states: 2
+
+motifs: []
+
+length: 100  # required when no motifs are specified; set scaffold length here or pass --length
+
+states:
+  - ["ccd:OQO"]                  # state 0: target ligand only; replace with your target
+  - ["ccd:OQO", "ccd:FAD"]      # state 1: target + effector; replace effector as needed
+
+losses:
+  - type: AntiLigandContactLoss
+    state: 0
+    strength: 10
+  - type: LigandContactLoss
+    state: 1

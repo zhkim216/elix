@@ -1,0 +1,22 @@
+# Negative allostery: motif active in apo state, disrupted when ligand binds.
+# State 0: apo — motif geometry enforced
+# State 1: holo — motif geometry penalized, ligand contact enforced
+
+num_states: 2
+
+motifs:
+  - 1prw  # PDB stem under motifs/; scaffold length is inferred from this file
+
+states:
+  - []              # state 0: apo, no ligand
+  - ["ccd:OQO"]    # state 1: holo; replace with your ligand
+
+losses:
+  - type: MotifLoss
+    motif: 0   # index into motifs list
+    state: 0
+  - type: AntiMotifLoss
+    motif: 0
+    state: 1
+  - type: LigandContactLoss
+    state: 1

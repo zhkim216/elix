@@ -1,0 +1,30 @@
+# Ligand discrimination: protein binds ligand 1 but not ligand 2.
+# State 0: apo — conformationally distinct from both holo states
+# State 1: bound to ligand 1 — contact enforced
+# State 2: bound to ligand 2 — contact enforced (but conformation differs from state 1)
+
+num_states: 3
+
+motifs: []
+
+length: 100  # required when no motifs are specified; set scaffold length here or pass --length
+
+states:
+  - []                  # state 0: apo
+  - ["ccd:OQO"]         # state 1: ligand 1; replace with your first ligand
+  - ["ccd:FAD"]         # state 2: ligand 2; replace with your second ligand
+
+losses:
+  - type: LigandContactLoss
+    state: 1
+  - type: LigandContactLoss
+    state: 2
+  - type: ConfChangeLoss
+    state: [0, 1]
+    strength: 10
+  - type: ConfChangeLoss
+    state: [0, 2]
+    strength: 10
+  - type: ConfChangeLoss
+    state: [1, 2]
+    strength: 10
